@@ -393,12 +393,19 @@ enum FangUIBridge {
         if #available(iOS 13.0, *) {
             if let scene = (window?.windowScene ?? preferredWindowScene()) {
                 let o = scene.interfaceOrientation
-                if o != .unknown { return o }
+                let b = scene.coordinateSpace.bounds
+                // SpringBoard-hosted windows can report a stale portrait value
+                // while the physical scene is landscape. Trust the scene only
+                // when its orientation agrees with the actual coordinate-space
+                // aspect ratio.
+                let physicalLandscape = b.width > b.height
+                if o != .unknown && o.isLandscape == physicalLandscape { return o }
             }
         }
         let raw = FangUIOrientationBridge.activeOrientation()
         if let o = UIInterfaceOrientation(rawValue: raw), o != .unknown {
-            return o
+            let b = UIScreen.main.bounds
+            if o.isLandscape == (b.width > b.height) { return o }
         }
         switch UIDevice.current.orientation {
         case .landscapeLeft:       return .landscapeRight
