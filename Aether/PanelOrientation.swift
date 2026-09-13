@@ -77,8 +77,11 @@ enum PanelOrientation {
     static func autoTransform() -> CGAffineTransform {
         let half = CGFloat.pi / 2
         switch FangUIBridge.currentOrientation() {
-        case .landscapeLeft:      return CGAffineTransform(rotationAngle: -half)
-        case .landscapeRight:     return CGAffineTransform(rotationAngle: half)
+        // The SpringBoard-hosted context applies the opposite horizontal
+        // rotation from UIKit's scene orientation on this device family.
+        // Swap the signs so the single hosted surface remains upright.
+        case .landscapeLeft:      return CGAffineTransform(rotationAngle: half)
+        case .landscapeRight:     return CGAffineTransform(rotationAngle: -half)
         case .portraitUpsideDown: return CGAffineTransform(rotationAngle: .pi)
         default:                  return .identity
         }
