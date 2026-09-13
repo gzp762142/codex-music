@@ -319,11 +319,12 @@ enum FangUIBridge {
         panel?.view.frame = w.bounds
     }
 
-    /// 布局空间：把 scene / screen 两个来源归一化到**当前界面方向**。
+    /// 布局空间：使用 Scene 的实际坐标空间，不再依据方向缓存交换宽高。
     ///
-    /// `UIWindowScene.coordinateSpace` 与 `UIScreen.main.bounds` 谁跟旋转走，
-    /// 文档与实测都不一致，所以不赌：取一个来源的尺寸，再用界面方向把长边
-    /// 摆到宽上，横屏就一定是 width > height。
+    /// 某些 iPad/SpringBoard 托管场景会短暂返回错误的
+    /// `interfaceOrientation`（例如横屏画面返回 portrait）。如果再按这个值
+    /// 交换尺寸，面板会按竖屏计算并被放到左上角。coordinateSpace.bounds
+    /// 已经是当前显示空间，直接使用它才能保证居中。
     private static func layoutSpace() -> CGRect {
         var size = UIScreen.main.bounds.size
         var origin = CGPoint.zero
@@ -338,14 +339,7 @@ enum FangUIBridge {
             }
         }
 
-        let longSide = max(size.width, size.height)
-        let shortSide = min(size.width, size.height)
-        let landscape = currentOrientation().isLandscape
-        let normalized = landscape
-            ? CGSize(width: longSide, height: shortSide)
-            : CGSize(width: shortSide, height: longSide)
-
-        return CGRect(origin: origin, size: normalized)
+        return CGRect(origin: origin, size: size)
     }
 
     /// 面板几何快照，供诊断行显示。
