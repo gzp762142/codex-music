@@ -1,4 +1,5 @@
 import UIKit
+import SwiftUI
 
 final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     var window: UIWindow?
@@ -9,10 +10,9 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         options connectionOptions: UIScene.ConnectionOptions
     ) {
         guard let windowScene = scene as? UIWindowScene else { return }
-        // 极简版：宿主窗口是空的 —— 界面只有 FangUI 那一块菜单面板。
-        // 原来的 RootView / LoadingView / UnlockView / ControlView 流程全部退场。
+        let state = (UIApplication.shared.delegate as? AppDelegate)?.state ?? AppState()
         let window = UIWindow(windowScene: windowScene)
-        window.rootViewController = UIViewController()
+        window.rootViewController = UIHostingController(rootView: RootView(state: state))
         window.makeKeyAndVisible()
         self.window = window
     }

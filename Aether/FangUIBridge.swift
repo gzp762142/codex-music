@@ -130,11 +130,6 @@ enum FangUIBridge {
 
     // MARK: Show / hide
 
-    /// 公开入口：直接亮出面板（极简版没有电源开关与卡片密钥流程）。
-    static func presentPanel() {
-        setVisible(true)
-    }
-
     private static func show() {
         installLifecycleObserversIfNeeded()
         startOrientationObserver()
