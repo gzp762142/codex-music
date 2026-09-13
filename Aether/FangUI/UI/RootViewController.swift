@@ -330,6 +330,16 @@ final class RootViewController: UIViewController {
         // （它是 .byTruncatingTail，宁可整块隐藏也不要显示成 "UI THEME K…"）。
         let hasRoomForSubtitle = badgeX > clusterLeftLimit + 80
 
+        // 品牌区宽度按文字实测：旧代码写死 160pt，标题却硬编码从 x=168 起步，
+        // 标称间隔只有 8pt —— 真机字体下 "DsTool" 会占到 x159，标题只剩 9pt，
+        // 于是被挤成 "Over..."。改成实测宽度之后，标题起点由它推导。
+        brandLabel.sizeToFit()
+        let brandW = max(52, brandLabel.bounds.width)
+        let titleX: CGFloat = 72 + brandW + 22
+        /// 品牌超长时用缩放兜底，而不是让标题被挤没。
+        brandLabel.adjustsFontSizeToFitWidth = true
+        brandLabel.minimumScaleFactor = 0.7
+
         titleLabel.sizeToFit()
 
         // logo：原 ImGui 的圆底 + DS 纹理，圆心 min.x+28、半径 18
@@ -345,18 +355,22 @@ final class RootViewController: UIViewController {
             brandSub.frame = CGRect(x: 64, y: cy + 5, width: 160, height: 14)
             brandSub.isHidden = false
 
-            // 标题 x = min.x + 168（ui.cpp:614），字号 24，竖直居中于 cy。
+            // 标题起点由 logo + 品牌实测宽度推导（原 ImGui 的 min.x + 168 前提是
+            // 品牌文案短；真机字体下这个常数会把标题挤成 "Over..."）。
             // 宽度收在右栏集群之前，避免长标题（Effects）压到副标题或开关。
-            let titleMaxW = max(60, badgeX - clusterGap - 24 - 168)
-            titleLabel.frame = CGRect(x: 168, y: cy - 15,
+            let titleMaxW = max(60, badgeX - clusterGap - 24 - titleX)
+            titleLabel.frame = CGRect(x: titleX, y: cy - 15,
                                       width: min(titleLabel.bounds.width, titleMaxW),
                                       height: 30)
             let subX = titleLabel.frame.maxX + 16      // ui.cpp:622 scX + scW + 16
-            subtitleLabel.isHidden = !hasRoomForSubtitle
-            subtitleLabel.frame = CGRect(
-                x: subX, y: cy - 9,
-                width: max(0, badgeX - clusterGap - subX), height: 18
-            )
+            // 副标题只在放得下大半时才出现：放不下就整块隐掉，绝不显示成
+            // "Buttons, sliders &…" 这种半截货。
+            subtitleLabel.sizeToFit()
+            let subRoom = max(0, badgeX - clusterGap - subX)
+            subtitleLabel.isHidden = !(hasRoomForSubtitle
+                                       && subRoom >= subtitleLabel.bounds.width * 0.97)
+            subtitleLabel.frame = CGRect(x: subX, y: cy - 9,
+                                         width: max(0, subRoom), height: 18)
         } else {
             // 窄屏两行 header：上行 logo + 品牌 + 开关/关闭，下行标题
             brandLabel.frame = CGRect(x: 64, y: top + 14, width: 160, height: 26)

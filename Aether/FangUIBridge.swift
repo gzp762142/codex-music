@@ -274,7 +274,11 @@ enum FangUIBridge {
         // total margin and a 900x620 maximum. The previous proportional
         // 0.58/0.72 sizing compressed the wide layout into a narrow card,
         // stretching Exit and overlapping the title bar.
-        let panelW = min(max(longSide - 120, 560), 900)
+        // 下限从 560 提到 620：560 的卡片宽度下，顶栏要塞下 logo + 品牌 +
+        // 标题 + 副标题 + 开关 + 徽章 + 关闭共七件，实测必然把标题挤成
+        // "Over..."。620 是单行 header 能成立的最小宽度 —— RootViewController
+        // 的 wide 断点也是 620，两处必须一致。
+        let panelW = min(max(longSide - 120, 620), 900)
         let panelH = min(max(shortSide - 120, 420), 620)
         let winSize = CGSize(width: panelW + inset * 2, height: panelH + inset * 2)
 
