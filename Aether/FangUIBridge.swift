@@ -270,8 +270,12 @@ enum FangUIBridge {
         // 空间已归一化（横屏时长边 = 宽），这里再夹一次保证卡片宽 > 高。
         let longSide = max(space.width, space.height)
         let shortSide = min(space.width, space.height)
-        let panelW = min(max(longSide * 0.58, 420), 720)
-        let panelH = min(max(shortSide * 0.72, 320), 500)
+        // Match the original ImGui root window: centered card with 60pt
+        // total margin and a 900x620 maximum. The previous proportional
+        // 0.58/0.72 sizing compressed the wide layout into a narrow card,
+        // stretching Exit and overlapping the title bar.
+        let panelW = min(max(longSide - 120, 560), 900)
+        let panelH = min(max(shortSide - 120, 420), 620)
         let winSize = CGSize(width: panelW + inset * 2, height: panelH + inset * 2)
 
         let comp = PanelOrientation.transform()
