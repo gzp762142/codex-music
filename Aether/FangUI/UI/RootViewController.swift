@@ -101,7 +101,10 @@ final class RootViewController: UIViewController {
         diagLabel.font = .monospacedSystemFont(ofSize: 9, weight: .regular)
         diagLabel.numberOfLines = 1
         diagLabel.textAlignment = .center
-        diagLabel.alpha = 0.65
+        // Diagnostics are useful during development but overlap the original
+        // ImGui content when the hosted card is scaled. Keep them disabled in
+        // the production layout; geometry remains available in the bridge.
+        diagLabel.alpha = 0
         cardView.addSubview(diagLabel)
         badgeLabel.font = .systemFont(ofSize: 13, weight: .medium)
         badgeLabel.text = "  ● Ready  "
@@ -224,11 +227,11 @@ final class RootViewController: UIViewController {
 
         let W = cardView.bounds.width
         let H = cardView.bounds.height
-        let top = view.safeAreaInsets.top
+        let top: CGFloat = 0
         let bottom = view.safeAreaInsets.bottom
         let pad: CGFloat = 20
         let wide = W >= 620
-        let headerH: CGFloat = wide ? 72 : 104
+        let headerH: CGFloat = wide ? 64 : 104
 
         // 右上角自右向左：关闭 → Ready 徽章 → 主题开关
         let closeSide: CGFloat = 30
@@ -287,8 +290,10 @@ final class RootViewController: UIViewController {
         layoutNav()
 
         // 内容区：宽度由约束链锁定，高度由页面内容撑开，滚动交给 UIScrollView。
-        let contentTop = top + headerH
-        let contentBottom = navBar.frame.minY - 34
+        // Match ImGui: content begins immediately below the 64pt title bar
+        // and ends above the fixed bottom capsule.
+        let contentTop = top + headerH + 16
+        let contentBottom = navBar.frame.minY - 22
         scrollView.frame = CGRect(x: pad, y: contentTop,
                                   width: W - pad * 2,
                                   height: max(40, contentBottom - contentTop))
