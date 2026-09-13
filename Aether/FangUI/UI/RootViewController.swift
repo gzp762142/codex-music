@@ -28,7 +28,7 @@ final class RootViewController: UIViewController {
     /// 背景层：柔和的径向渐变，作为菜单的背景图。
     private let backdrop = CAGradientLayer()
     /// 底部分段控件（切换页面用），贴面板底边居中。
-    private let tabs = SegmentedTabs(titles: ["概览", "机制", "数据"])
+    private let tabs = SegmentedTabs(titles: ["透视", "追踪", "设置"])
     /// 控件距面板底边的距离。
     private let tabsBottomInset: CGFloat = 20
 

@@ -24,12 +24,15 @@ final class SegmentedTabs: UIView {
 
     private(set) var selectedIndex = 0
 
-    // 颜色：全部从面板底色（米白 #FBFAF7）推导
-    private let trackColor = UIColor.hex(0xFFFFFF, 0.72)      // 轨道：比面板更亮一点
-    private let gliderColor = UIColor.hex(0xE4E1D6)           // 滑块：比面板略深
-    private let gliderShadow = UIColor.hex(0x1A1A2E, 0.10)
-    private let selectedText = UIColor.hex(0x2A2A32)          // 选中：深墨
-    private let normalText = UIColor.hex(0x6E6A5E)            // 未选中：灰褐
+    // 配色：照参考 HTML 的蓝色系 —— 白色轨道 + 浅蓝滑块 + 蓝字。
+    // 数值直接取自原示例（#fff / #e6eef9 / #185ee0 / #5a6a82）。
+    private let trackColor = UIColor.hex(0xFFFFFF)            // 轨道：#fff 实心白
+    private let gliderColor = UIColor.hex(0xE6EEF9)           // 滑块：#e6eef9 浅蓝
+    private let gliderShadow = UIColor.hex(0x185EE0, 0.15)    // 滑块投影：蓝调
+    private let selectedText = UIColor.hex(0x185EE0)          // 选中文字：#185ee0
+    private let normalText = UIColor.hex(0x5A6A82)            // 未选中：#5a6a82
+    /// 轨道描边：原示例用蓝色淡影 0 0 1px rgba(24,94,224,.15)
+    private let trackBorder = UIColor.hex(0x185EE0, 0.15)
 
     init(titles: [String], cellWidth: CGFloat = 84, cellHeight: CGFloat = 30) {
         self.titles = titles
@@ -56,7 +59,7 @@ final class SegmentedTabs: UIView {
         track.layer.cornerRadius = bounds.height / 2
         track.layer.cornerCurve = .continuous
         track.layer.borderWidth = 1
-        track.layer.borderColor = UIColor.hex(0x1A1A2E, 0.06).cgColor
+        track.layer.borderColor = trackBorder.cgColor
         addSubview(track)
 
         // 滑块（glider）
