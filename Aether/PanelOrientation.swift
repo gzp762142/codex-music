@@ -73,18 +73,11 @@ enum PanelOrientation {
     static func transform() -> CGAffineTransform { active.transform }
 
     /// Best guess: cancel the interface rotation. Observed on iPad landscape the
-    /// system contributes +90°, so the auto value is the opposite sign.
+    /// system contributes the required orientation for a detached
+    /// SpringBoard-hosted window. Since this window is no longer attached to an
+    /// App UIWindowScene, adding a local rotation would rotate it a second time.
     static func autoTransform() -> CGAffineTransform {
-        let half = CGFloat.pi / 2
-        switch FangUIBridge.currentOrientation() {
-        // The SpringBoard-hosted context applies the opposite horizontal
-        // rotation from UIKit's scene orientation on this device family.
-        // Swap the signs so the single hosted surface remains upright.
-        case .landscapeLeft:      return CGAffineTransform(rotationAngle: half)
-        case .landscapeRight:     return CGAffineTransform(rotationAngle: -half)
-        case .portraitUpsideDown: return CGAffineTransform(rotationAngle: .pi)
-        default:                  return .identity
-        }
+        return .identity
     }
 
     @discardableResult
