@@ -296,6 +296,10 @@ final class RootViewController: UIViewController {
         // 诊断行贴在导航条上方：窗口 / 面板 / 内容尺寸，用来确认版本与几何。
         diagLabel.frame = CGRect(x: pad, y: navBar.frame.minY - 20,
                                  width: W - pad * 2, height: 14)
+        // The scroll view must stop below the diagnostic line; keep the
+        // navigation capsule above both layers like ImGui's BottomNav.
+        navBar.superview?.bringSubviewToFront(navBar)
+        navBar.superview?.bringSubviewToFront(diagLabel)
 
         // 拖拽把手覆盖顶栏左侧品牌区，右侧的开关 / 徽章 / 关闭不受影响。
         dragHandle.frame = CGRect(x: 0, y: 0,

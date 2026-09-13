@@ -52,10 +52,15 @@ final class OverviewPage: UIView, PageSizing {
         let btnRow = UIStackView(arrangedSubviews: [primaryBtn, ghostBtn, dangerBtn])
         btnRow.axis = .horizontal
         btnRow.spacing = 12
-        // ImGui uses intrinsic button widths. UIStackView's default fill
-        // distribution stretches the last button across the remaining page,
-        // which produced the oversized Exit button in the port.
-        btnRow.distribution = .fillProportionally
+        // ImGui uses compact intrinsic button widths. Give each control an
+        // explicit width so UIKit cannot stretch the last button to fill the
+        // whole row on wide cards.
+        btnRow.distribution = .fill
+        NSLayoutConstraint.activate([
+            primaryBtn.widthAnchor.constraint(equalToConstant: 94),
+            ghostBtn.widthAnchor.constraint(equalToConstant: 82),
+            dangerBtn.widthAnchor.constraint(equalToConstant: 58)
+        ])
 
         slider = FancySlider(value: state.fpsLimit, min: 30, max: 240, format: "%.0f FPS")
         slider.addTarget(self, action: #selector(onFps), for: .valueChanged)
