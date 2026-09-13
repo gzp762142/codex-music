@@ -437,3 +437,102 @@ final class DropdownRow: UIControl {
                                   width: vw, height: vh)
     }
 }
+
+
+/// 对应原 ImGui TitleBar 右侧的主题开关（ui.cpp:625-675）：
+/// 56x28 药丸，不填色、只描一圈 28% 的边；白色圆钮在浅色态停左侧、
+/// 深色态停右侧；钮内画紫色太阳 / 月牙，空的那一侧画一个暗色对位图标。
+/// UISwitch 表达不了这层结构（off 态是灰轨道 + 白钮，看着像被禁用）。
+final class ThemeSwitch: UIControl {
+    /// 逻辑上的「深色」目标态。
+    var isDark = false { didSet { setNeedsDisplay() } }
+    /// 0 浅 → 1 深，跟随主题过渡，对应 ImGui 的 st.themeT。
+    var knobT: CGFloat = 0 { didSet { setNeedsDisplay() } }
+    var palette: Palette = .light { didSet { setNeedsDisplay() } }
+
+    override init(frame: CGRect) {
+        super.init(frame: CGRect(x: 0, y: 0, width: 56, height: 28))
+        backgroundColor = .clear
+        isOpaque = false
+        addTarget(self, action: #selector(tap), for: .touchUpInside)
+        isAccessibilityElement = true
+        accessibilityTraits = .button
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    @objc private func tap() {
+        isDark.toggle()
+        sendActions(for: .valueChanged)
+    }
+
+    override var intrinsicContentSize: CGSize { CGSize(width: 56, height: 28) }
+
+    override func draw(_ rect: CGRect) {
+        guard let ctx = UIGraphicsGetCurrentContext() else { return }
+        let w = rect.width, h = rect.height
+        let r = h * 0.5
+
+        // 轨道：透明底 + 一圈细亮描边（照参考图，不填紫）
+        ctx.setStrokeColor(palette.text.withAlphaComponent(0.28).cgColor)
+        ctx.setLineWidth(1.3)
+        ctx.addPath(UIBezierPath(roundedRect: rect.insetBy(dx: 0.65, dy: 0.65),
+                                 cornerRadius: r - 0.65).cgPath)
+        ctx.strokePath()
+
+        // 空侧的暗图标：浅色态在右显暗月牙，深色态在左显暗太阳
+        if knobT > 0.5 {
+            drawSun(ctx, at: CGPoint(x: r, y: r), color: palette.textDim, radius: 3.2)
+        } else {
+            drawMoon(ctx, at: CGPoint(x: w - r, y: r), color: palette.textDim,
+                     mask: palette.card, radius: 5)
+        }
+
+        // 白色圆钮 + 柔和光晕 + 一点下方阴影
+        let knobC = CGPoint(x: r + (w - h) * knobT, y: r)
+        let knobR = r - 3
+        ctx.setFillColor(UIColor.white.withAlphaComponent(0.25).cgColor)
+        ctx.fillEllipse(in: CGRect(x: knobC.x - knobR - 3, y: knobC.y - knobR - 3,
+                                   width: (knobR + 3) * 2, height: (knobR + 3) * 2))
+        ctx.setFillColor(UIColor(white: 0, alpha: 0.14).cgColor)
+        ctx.fillEllipse(in: CGRect(x: knobC.x - knobR, y: knobC.y - knobR + 1,
+                                   width: knobR * 2, height: knobR * 2))
+        ctx.setFillColor(UIColor.white.cgColor)
+        ctx.fillEllipse(in: CGRect(x: knobC.x - knobR, y: knobC.y - knobR,
+                                   width: knobR * 2, height: knobR * 2))
+
+        // 钮内的紫色当前主题图标：浅色态太阳，深色态月牙
+        if knobT > 0.5 {
+            drawMoon(ctx, at: knobC, color: palette.accent, mask: .white, radius: 5)
+        } else {
+            drawSun(ctx, at: knobC, color: palette.accent, radius: 3.2)
+        }
+    }
+
+    private func drawSun(_ ctx: CGContext, at c: CGPoint, color: UIColor, radius: CGFloat) {
+        ctx.setFillColor(color.cgColor)
+        ctx.fillEllipse(in: CGRect(x: c.x - radius, y: c.y - radius,
+                                   width: radius * 2, height: radius * 2))
+        ctx.setStrokeColor(color.cgColor)
+        ctx.setLineWidth(1.3)
+        ctx.beginPath()
+        for i in 0..<8 {
+            let a = CGFloat(i) * CGFloat.pi / 4
+            ctx.move(to: CGPoint(x: c.x + cos(a) * (radius + 2), y: c.y + sin(a) * (radius + 2)))
+            ctx.addLine(to: CGPoint(x: c.x + cos(a) * (radius + 3.6),
+                                    y: c.y + sin(a) * (radius + 3.6)))
+        }
+        ctx.strokePath()
+    }
+
+    /// 实心圆挖去一个偏移圆，挖除色用 mask——钮内用白色，空侧用卡片色。
+    private func drawMoon(_ ctx: CGContext, at c: CGPoint, color: UIColor,
+                          mask: UIColor, radius: CGFloat) {
+        ctx.setFillColor(color.cgColor)
+        ctx.fillEllipse(in: CGRect(x: c.x - radius, y: c.y - radius,
+                                   width: radius * 2, height: radius * 2))
+        ctx.setFillColor(mask.cgColor)
+        ctx.fillEllipse(in: CGRect(x: c.x + 2.2 - radius, y: c.y - 1.4 - radius,
+                                   width: radius * 2, height: radius * 2))
+    }
+}

@@ -24,7 +24,8 @@ final class RootViewController: UIViewController {
     private let subtitleLabel = UILabel()
     private let brandLabel = UILabel()
     private let brandSub = UILabel()
-    private let themeSwitch = UISwitch()
+    /// 自绘主题开关，对应 ImGui TitleBar 右侧药丸（ui.cpp:625-675）。
+    private let themeSwitch = ThemeSwitch()
     private let badgeLabel = UILabel()
     /// 顶栏 logo：对应原 ImGui TitleBar 左侧的「圆底 + DS 纹理」
     /// （ui.cpp:547-565，圆心 min.x+28、半径 18）。原工程用
@@ -39,6 +40,9 @@ final class RootViewController: UIViewController {
     private var diagTick = 0
     private let scrollView = UIScrollView()
     private let contentContainer = UIView()
+    /// 承载四个 page 的垂直 stack：只有可见页参与布局，
+    /// 容器高度自动等于当前页内容高度（切页由 isHidden 驱动）。
+    private let pageStack = UIStackView()
     private let navBar = UIView()
     private var navButtons: [UIButton] = []
     /// GlassPill 的顶边高光：1pt 白线，透明度按底色亮度算（ui.cpp:558-563）。
@@ -95,7 +99,7 @@ final class RootViewController: UIViewController {
         brandLabel.font = .systemFont(ofSize: 20, weight: .bold)
         brandLabel.text = "DsTool"
         brandSub.font = .systemFont(ofSize: 11, weight: .medium)
-        brandSub.text = "UI THEME KIT · v5"
+        brandSub.text = "UI THEME KIT"
         titleLabel.font = .systemFont(ofSize: 24, weight: .bold)
         titleLabel.text = tabTitles[0]
         titleLabel.adjustsFontSizeToFitWidth = true
@@ -168,17 +172,27 @@ final class RootViewController: UIViewController {
         (pages[3] as? EffectsPage)?.onBurst = { [weak self] p in
             self?.fxView.emitBurst(at: p, count: 60)
         }
+        // page 放进垂直 stack：只有可见页参与布局，容器高度就等于当前页的
+        // 内容高度。原来四个 page 各自把 top/bottom 都钉死在容器上，于是每个
+        // 都被拉成容器等高，contentStack 多出来的垂直空间被 UIStackView 全摊
+        // 进 spacing —— 整页控件越拉越开，Dropdown / Text input 被顶出视口。
+        pageStack.axis = .vertical
+        pageStack.spacing = 0
+        pageStack.alignment = .fill
+        pageStack.distribution = .fill
+        pageStack.translatesAutoresizingMaskIntoConstraints = false
+        contentContainer.addSubview(pageStack)
+        NSLayoutConstraint.activate([
+            pageStack.topAnchor.constraint(equalTo: contentContainer.topAnchor),
+            pageStack.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor),
+            pageStack.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor),
+            pageStack.bottomAnchor.constraint(equalTo: contentContainer.bottomAnchor)
+        ])
+
         pages.forEach { p in
-            p.translatesAutoresizingMaskIntoConstraints = false
             p.isHidden = true
-            contentContainer.addSubview(p)
+            pageStack.addArrangedSubview(p)
             p.installContentStackConstraints()
-            NSLayoutConstraint.activate([
-                p.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor),
-                p.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor),
-                p.topAnchor.constraint(equalTo: contentContainer.topAnchor),
-                p.bottomAnchor.constraint(equalTo: contentContainer.bottomAnchor)
-            ])
         }
         pages[0].isHidden = false
 
@@ -196,14 +210,26 @@ final class RootViewController: UIViewController {
 
         for (i, title) in tabTitles.enumerated() {
             let b = UIButton(type: .system)
-            b.setTitle(title, for: .normal)
-            b.titleLabel?.font = .systemFont(ofSize: 11, weight: .regular)
-            b.titleEdgeInsets = UIEdgeInsets(top: 26, left: 0, bottom: 0, right: 0)
             b.tag = i
             b.addTarget(self, action: #selector(onTab(_:)), for: .touchUpInside)
             // 导航按钮只走 frame（layoutNav），保留 autoresizing 转换。
+            //
+            // 图标和文字都手摆：iOS 15+ 的 UIButton 会被 UIButtonConfiguration
+            // 接管，setImage 配 imageEdgeInsets / titleEdgeInsets 会被忽略，
+            // 图标整个不显示。原 ImGui 是「图标在左 + 文字在右」水平居中于
+            // 格子（ui.cpp:524-534）。
+            let icon = UIImageView()
+            icon.contentMode = .scaleAspectFit
+            icon.isUserInteractionEnabled = false
+            icon.tag = 900 + i
+            b.addSubview(icon)
 
-            // 原 ImGui 是「图标在左 + 文字在右」水平居中于格子（ui.cpp:524-534），
+            let lab = UILabel()
+            lab.text = title
+            lab.numberOfLines = 1
+            lab.isUserInteractionEnabled = false
+            lab.tag = 800 + i
+            b.addSubview(lab)
 
             navBar.addSubview(b)
             navButtons.append(b)
@@ -276,14 +302,15 @@ final class RootViewController: UIViewController {
         let badgeX = closeBtn.frame.minX - 12 - badgeW
         badgeLabel.frame = CGRect(x: badgeX, y: cy - badgeH / 2,
                                   width: badgeW, height: badgeH)
-        themeSwitch.frame = CGRect(x: badgeX - 12 - 51, y: cy - 15.5,
-                                   width: 51, height: 31)
+        themeSwitch.frame = CGRect(x: badgeX - 12 - 56, y: cy - 14,
+                                   width: 56, height: 28)
 
         titleLabel.sizeToFit()
 
         // logo：原 ImGui 的圆底 + DS 纹理，圆心 min.x+28、半径 18
         // （ui.cpp:548-556）。iOS 端没有 assets/ds_*.bin，用同尺寸圆底 + 文本等效。
         logoDisc.frame = CGRect(x: 10, y: cy - 18, width: 36, height: 36)
+        logoDisc.layer.cornerRadius = logoDisc.bounds.width * 0.5
         logoLabel.frame = logoDisc.bounds
 
         if wide {
@@ -323,8 +350,9 @@ final class RootViewController: UIViewController {
                               width: navW, height: navH)
         layoutNav()
         // GlassPill 顶边高光：从圆角内缩处画到另一端（ui.cpp:560-561）。
-        navHighlight.frame = CGRect(x: navH * 0.5, y: 1,
-                                    width: max(0, navW - navH), height: 1)
+        let hairline = 1.0 / max(traitCollection.displayScale, 1)
+        navHighlight.frame = CGRect(x: navH * 0.5, y: hairline,
+                                    width: max(0, navW - navH), height: hairline)
 
         // 内容区：宽度由约束链锁定，高度由页面内容撑开，滚动交给 UIScrollView。
         // 对齐 ImGui：内容从标题栏下方 16pt 开始、左右各留 contentPad
@@ -375,7 +403,8 @@ final class RootViewController: UIViewController {
     /// 底部胶囊的玻璃质感：原 ImGui GlassPill 的细描边 + 顶边高光
     /// （ui.cpp:558-563）。外阴影已在 applyPalette 里设置。
     private func applyNavChrome(_ p: Palette) {
-        navBar.layer.borderWidth = 1
+        // 1 物理像素的细描边；写 1.0 在 Retina 上是 2~3 像素，看着像硬边框。
+        navBar.layer.borderWidth = 1.0 / max(traitCollection.displayScale, 1)
         navBar.layer.borderColor = p.cardBorder.cgColor
         var cr: CGFloat = 0, cg: CGFloat = 0, cb: CGFloat = 0, ca: CGFloat = 0
         p.card.getRed(&cr, green: &cg, blue: &cb, alpha: &ca)
@@ -387,14 +416,38 @@ final class RootViewController: UIViewController {
     private func layoutNav() {
         let n = CGFloat(navButtons.count)
         let cellW = navBar.bounds.width / n
+        let h = navBar.bounds.height
+        // 原 ImGui: iconSz = 15, gap = 8（ui.cpp:529-530）
+        let iconSz: CGFloat = 15
+        let gap: CGFloat = 8
+
         for (i, b) in navButtons.enumerated() {
             let sel = (i == state.page)
-            b.frame = CGRect(x: CGFloat(i) * cellW, y: 0, width: cellW, height: navBar.bounds.height)
+            b.frame = CGRect(x: CGFloat(i) * cellW, y: 0, width: cellW, height: h)
+
+            guard let icon = b.viewWithTag(900 + i) as? UIImageView,
+                  let lab = b.viewWithTag(800 + i) as? UILabel else { continue }
+
             // 字号对齐 ImGui 的 io.FontSize（main.cpp 载入的是 18.0f）。
-            b.titleLabel?.font = .systemFont(ofSize: 18, weight: sel ? .medium : .regular)
-            b.setTitleColor(sel ? palette.accent : palette.textDim, for: .normal)
-            // 图标/文字并排由 imageEdgeInsets / titleEdgeInsets 控制，tint 跟随选中态。
-            b.tintColor = sel ? palette.accent : palette.textDim
+            lab.font = .systemFont(ofSize: 18, weight: sel ? .medium : .regular)
+            lab.sizeToFit()
+            icon.image = UIImage(systemName: navIcons[i],
+                                 withConfiguration: UIImage.SymbolConfiguration(pointSize: 15,
+                                                                                weight: .medium))
+
+            let tint = sel ? palette.accent : palette.textDim
+            icon.tintColor = tint
+            lab.textColor = tint
+
+            // 图标在左 + 文字在右，整组水平居中于格子（ui.cpp:531-534）
+            let groupW = iconSz + gap + lab.bounds.width
+            let gx = max(4, (cellW - groupW) * 0.5)
+            let cy = h * 0.5
+            icon.frame = CGRect(x: gx, y: cy - iconSz * 0.5, width: iconSz, height: iconSz)
+            lab.frame = CGRect(x: gx + iconSz + gap,
+                               y: cy - lab.bounds.height * 0.5,
+                               width: lab.bounds.width,
+                               height: lab.bounds.height)
         }
         updateIndicator(animated: false)
     }
@@ -493,13 +546,15 @@ final class RootViewController: UIViewController {
         subtitleLabel.textColor = p.textDim
         logoDisc.backgroundColor = p.accentSoft
         logoLabel.textColor = p.text
-        themeSwitch.onTintColor = p.accent
+        themeSwitch.palette = p
+        themeSwitch.knobT = state.themeT
+        themeSwitch.isDark = state.dark
         badgeLabel.backgroundColor = p.accentSoft
         refreshBadge()
         navButtons.enumerated().forEach { i, b in
-            let sel = (i == state.page)
-            b.setTitleColor(sel ? p.accent : p.textDim, for: .normal)
-            b.tintColor = sel ? p.accent : p.textDim
+            let tint = (i == state.page) ? p.accent : p.textDim
+            (b.viewWithTag(900 + i) as? UIImageView)?.tintColor = tint
+            (b.viewWithTag(800 + i) as? UILabel)?.textColor = tint
         }
         (pages[state.page] as? PageBuildable)?.rebuild(palette: p)
 
@@ -534,7 +589,9 @@ final class RootViewController: UIViewController {
         subtitleLabel.textColor = p.textDim
         logoDisc.backgroundColor = p.accentSoft
         logoLabel.textColor = p.text
-        themeSwitch.onTintColor = p.accent
+        themeSwitch.palette = p
+        themeSwitch.knobT = state.themeT
+        themeSwitch.isDark = state.dark
         badgeLabel.backgroundColor = p.accentSoft
         refreshBadge()
         pages.forEach { $0.rebuild(palette: p) }

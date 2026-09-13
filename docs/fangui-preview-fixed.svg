@@ -65,21 +65,21 @@
 
     <!-- 品牌两行（ui.cpp:596 的 txtX = min.x + 64） -->
     <text x="64" y="33" font-size="20" font-weight="700" fill="#1B1B22">DsTool</text>
-    <text x="64" y="48" font-size="11" font-weight="500" fill="#1B1B22" fill-opacity="0.5">UI THEME KIT · v5</text>
+    <text x="64" y="48" font-size="11" font-weight="500" fill="#1B1B22" fill-opacity="0.5">UI THEME KIT</text>
 
     <!-- 中间标题 + 副标题（ui.cpp:614 scX = min.x + 168；622 副标题接 +16） -->
     <text x="168" y="41" font-size="24" font-weight="700" fill="#1B1B22">Overview</text>
     <text x="300" y="38" font-size="18" fill="#1B1B22" fill-opacity="0.5">Buttons, sliders &amp; inputs</text>
 
     <!-- 主题开关（ui.cpp:626-675：56x28 药丸，透明底 + 28% 描边，浅色态钮在左、紫太阳） -->
-    <rect x="680" y="18" width="56" height="28" rx="14" fill="none"
+    <rect x="684" y="18" width="56" height="28" rx="14" fill="none"
           stroke="#1B1B22" stroke-opacity="0.28" stroke-width="1.3"/>
-    <circle cx="709" cy="32" r="5" fill="#1B1B22" fill-opacity="0.5"/>
-    <circle cx="711.2" cy="30.6" r="5" fill="#FBFAF7"/>
-    <circle cx="694" cy="32" r="14" fill="#FFFFFF" fill-opacity="0.25"/>
-    <circle cx="694" cy="33" r="11" fill="#000000" fill-opacity="0.14"/>
-    <circle cx="694" cy="32" r="11" fill="#FFFFFF"/>
-    <circle cx="694" cy="32" r="3.2" fill="#6C63FF"/>
+    <circle cx="713" cy="32" r="5" fill="#1B1B22" fill-opacity="0.5"/>
+    <circle cx="715.2" cy="30.6" r="5" fill="#FBFAF7"/>
+    <circle cx="698" cy="32" r="14" fill="#FFFFFF" fill-opacity="0.25"/>
+    <circle cx="698" cy="33" r="11" fill="#000000" fill-opacity="0.14"/>
+    <circle cx="698" cy="32" r="11" fill="#FFFFFF"/>
+    <circle cx="698" cy="32" r="3.2" fill="#6C63FF"/>
     <g stroke="#6C63FF" stroke-width="1.3" stroke-linecap="round">
       <line x1="699.2" y1="32" x2="700.8" y2="32"/>
       <line x1="697.7" y1="34.3" x2="698.8" y2="36.8"/>
@@ -92,9 +92,9 @@
     </g>
 
     <!-- Ready 徽章（ui.cpp:677-687：右对齐、绿点 + 主色文字） -->
-    <rect x="743" y="17" width="95" height="30" rx="15" fill="#6C63FF" fill-opacity="0.13"/>
-    <circle cx="763" cy="32" r="4" fill="#2EBD6B"/>
-    <text x="771" y="39" font-size="18" font-weight="500" fill="#1B1B22">Ready</text>
+    <rect x="752" y="17" width="86" height="30" rx="15" fill="#6C63FF" fill-opacity="0.13"/>
+    <circle cx="771.5" cy="32" r="4" fill="#2EBD6B"/>
+    <text x="783.5" y="39" font-size="18" font-weight="500" fill="#1B1B22">Ready</text>
 
     <!-- 关闭按钮（iOS 侧新增，挂在最右） -->
     <circle cx="865" cy="32" r="15" fill="#6C63FF" fill-opacity="0.13"/>
@@ -107,13 +107,13 @@
 
     <!-- BUTTONS -->
     <text x="28" y="95" font-size="18" fill="#1B1B22" fill-opacity="0.5">BUTTONS</text>
-    <rect x="28" y="110" width="94" height="40" rx="12" fill="#6C63FF"/>
-    <text x="75" y="136" font-size="18" font-weight="500" fill="#FFFFFF" text-anchor="middle">Primary</text>
-    <rect x="134" y="110" width="82" height="40" rx="12" fill="none"
+    <rect x="28" y="110" width="98" height="40" rx="12" fill="#6C63FF"/>
+    <text x="77" y="136" font-size="18" font-weight="500" fill="#FFFFFF" text-anchor="middle">Primary</text>
+    <rect x="138" y="110" width="76" height="40" rx="12" fill="none"
           stroke="#6C63FF" stroke-opacity="0.3" stroke-width="1"/>
-    <text x="175" y="136" font-size="18" font-weight="500" fill="#6C63FF" text-anchor="middle">Ghost</text>
-    <rect x="228" y="110" width="66" height="40" rx="12" fill="#E53E3E" fill-opacity="0.094"/>
-    <text x="261" y="136" font-size="18" font-weight="500" fill="#E53E3E" text-anchor="middle">Exit</text>
+    <text x="176" y="136" font-size="18" font-weight="500" fill="#6C63FF" text-anchor="middle">Ghost</text>
+    <rect x="226" y="110" width="61" height="40" rx="12" fill="#E53E3E" fill-opacity="0.094"/>
+    <text x="256.5" y="136" font-size="18" font-weight="500" fill="#E53E3E" text-anchor="middle">Exit</text>
 
     <!-- SLIDER -->
     <text x="28" y="177" font-size="18" fill="#1B1B22" fill-opacity="0.5">SLIDER</text>

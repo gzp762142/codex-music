@@ -170,7 +170,9 @@ final class MetalFXView: MTKView {
             while y < h {
                 var x: Float = spacing * 0.5
                 while x < w {
-                    pushCircle(x / w, 1 - y / h, radius, dr, dg, db, da, segments: 8)
+                    // shader 里 ndcY = 1 - y*2 已经做过一次原点翻转，
+                    // 这里必须传「原点左上」的 0..1，不能再翻。
+                    pushCircle(x / w, y / h, radius, dr, dg, db, da, segments: 8)
                     x += spacing
                 }
                 y += spacing
@@ -255,9 +257,12 @@ extension MetalFXView: MTKViewDelegate {
             for i in 0..<count { ptr[i] = vertexData[i] }
             enc.setRenderPipelineState(pipelineState)
             enc.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+            // MTLViewport 的单位是像素：用 bounds（点）会让绘制区域缩到
+            // drawable 的 1/displayScale（Retina 上只剩左下四分之一）。
+            let ds = drawableSize
             var viewport = MTLViewport(
                 originX: 0, originY: 0,
-                width: Double(w), height: Double(h),
+                width: Double(ds.width), height: Double(ds.height),
                 znear: 0, zfar: 1
             )
             enc.setVertexBytes(&viewport, length: MemoryLayout<MTLViewport>.size, index: 1)

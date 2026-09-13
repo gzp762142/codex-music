@@ -69,13 +69,8 @@ final class OverviewPage: UIView, PageSizing {
         // explicit width so UIKit cannot stretch the last button to fill the
         // whole row on wide cards.
         btnRow.distribution = .fill
-        NSLayoutConstraint.activate([
-            primaryBtn.widthAnchor.constraint(equalToConstant: 94),
-            ghostBtn.widthAnchor.constraint(equalToConstant: 82),
-            // 66 而非 58：58 减去 contentEdgeInsets 左右各 18 只剩 22pt，
-            // "Exit" 放不下会被 UIKit 截断成 "…"。
-            dangerBtn.widthAnchor.constraint(equalToConstant: 66)
-        ])
+        // 不写死宽度：ImGui 的按钮宽度是 CalcTextSize + FramePadding.x*2，
+        // 固定宽度在字号变大后只会把文字截成 "Pr...ry"。
 
         slider = FancySlider(value: state.fpsLimit, min: 30, max: 240, format: "%.0f FPS")
         slider.addTarget(self, action: #selector(onFps), for: .valueChanged)
@@ -138,7 +133,7 @@ final class OverviewPage: UIView, PageSizing {
         primaryBtn.backgroundColor = palette.accent
         primaryBtn.setTitleColor(.white, for: .normal)
         primaryBtn.layer.cornerRadius = 12
-        primaryBtn.contentEdgeInsets = UIEdgeInsets(top: 10, left: 18, bottom: 10, right: 18)
+        primaryBtn.contentEdgeInsets = UIEdgeInsets(top: 10, left: 14, bottom: 10, right: 14)
 
         ghostBtn.backgroundColor = .clear
         ghostBtn.setTitleColor(palette.accent, for: .normal)
