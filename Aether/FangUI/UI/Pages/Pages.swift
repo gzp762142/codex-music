@@ -44,6 +44,8 @@ final class OverviewPage: UIView, PageSizing {
         super.init(frame: .zero)
         stack.axis = .vertical
         stack.spacing = 12
+        stack.alignment = .fill
+        stack.distribution = .fill
         addSubview(stack)
 
         primaryBtn.setTitle("Primary", for: .normal)
@@ -84,6 +86,17 @@ final class OverviewPage: UIView, PageSizing {
             stack.addArrangedSubview(sec)
             stack.addArrangedSubview(view)
         }
+        // Keep the ImGui section rhythm fixed instead of allowing the page
+        // height to distribute extra space through the controls.
+        for arranged in stack.arrangedSubviews {
+            if arranged is SectionLabel {
+                arranged.heightAnchor.constraint(equalToConstant: 18).isActive = true
+            }
+        }
+        btnRow.heightAnchor.constraint(equalToConstant: 40).isActive = true
+        slider.heightAnchor.constraint(equalToConstant: 44).isActive = true
+        langButton.heightAnchor.constraint(equalToConstant: 40).isActive = true
+        textField.heightAnchor.constraint(equalToConstant: 40).isActive = true
     }
 
     required init?(coder: NSCoder) { fatalError() }
