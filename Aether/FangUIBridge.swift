@@ -263,6 +263,11 @@ enum FangUIBridge {
     /// 1. 布局空间按**界面方向归一化**（长边做宽），不再依赖某一个 API 是否跟手旋转。
     /// 2. 夹取位置用 **旋转后的包围盒**，否则一转就顶出屏幕。
     /// 3. 方向变换可切换（`PanelOrientation`），不再写死 identity。
+    ///
+    /// 面板整体缩放系数：卡片与窗口一起等比缩放。
+    /// 改这一个数字就能整体放大 / 缩小菜单，内部比例不受影响。
+    static let panelScale: CGFloat = 0.5
+
     private static func applySceneGeometry(_ w: UIWindow) {
         let space = layoutSpace()
         let inset = RootViewController.shadowInset
@@ -278,8 +283,12 @@ enum FangUIBridge {
         // 标题 + 副标题 + 开关 + 徽章 + 关闭共七件，实测必然把标题挤成
         // "Over..."。620 是单行 header 能成立的最小宽度 —— RootViewController
         // 的 wide 断点也是 620，两处必须一致。
-        let panelW = min(max(longSide - 120, 620), 900)
-        let panelH = min(max(shortSide - 120, 420), 620)
+        let baseW = min(max(longSide - 120, 620), 900)
+        let baseH = min(max(shortSide - 120, 420), 620)
+        // 面板整体缩放：0.5 = 设计尺寸的一半。窗口与卡片一起等比缩，
+        // 圆角 / 阴影 / 内部比例全部不变，位置仍走下面的居中与拖动逻辑。
+        let panelW = baseW * panelScale
+        let panelH = baseH * panelScale
         let winSize = CGSize(width: panelW + inset * 2, height: panelH + inset * 2)
 
         let comp = PanelOrientation.transform()
