@@ -1,0 +1,194 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1164" height="720" viewBox="0 0 1164 720"
+     font-family="Segoe UI, Microsoft YaHei UI, Helvetica Neue, Arial, sans-serif">
+  <!--
+    FangUI 修复后的预览图（浅色主题 / Overview 页）
+    数值来源：
+      原版 ImGui  : D:\项目大全\ui\src\ui.cpp, theme.cpp, effects.cpp
+      iOS 移植版  : D:\工作区\Aether\Aether\FangUI\
+    卡片 900x600 居中于 1164x720 画布，与 ui.cpp 的
+    cardW = min(ws.x-120, 900) / cardH = min(ws.y-120, 620) 一致。
+  -->
+  <defs>
+    <clipPath id="cardClip"><rect x="132" y="60" width="900" height="600" rx="22"/></clipPath>
+    <!-- 点阵：间距 16，方块 1.2x1.2（effects.cpp DrawDotGrid） -->
+    <pattern id="dots" width="16" height="16" patternUnits="userSpaceOnUse" patternTransform="translate(132,60)">
+      <rect x="7.4" y="7.4" width="1.2" height="1.2" fill="#1A1A2E" fill-opacity="0.078"/>
+    </pattern>
+    <linearGradient id="beamGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#6C63FF" stop-opacity="0.05"/>
+      <stop offset="100%" stop-color="#6C63FF" stop-opacity="0.40"/>
+    </linearGradient>
+    <filter id="cardBlur" x="-15%" y="-15%" width="130%" height="130%">
+      <feGaussianBlur stdDeviation="9"/>
+    </filter>
+    <filter id="navBlur" x="-25%" y="-40%" width="150%" height="180%">
+      <feGaussianBlur stdDeviation="7"/>
+    </filter>
+    <filter id="glowBlur" x="-120%" y="-160%" width="340%" height="420%">
+      <feGaussianBlur stdDeviation="7"/>
+    </filter>
+  </defs>
+
+  <!-- 画布底色 p.bg #EAE8E1 -->
+  <rect width="1164" height="720" fill="#EAE8E1"/>
+
+  <!-- 卡片投影（PanelWithShadow 六层叠加的近似） -->
+  <rect x="134" y="68" width="896" height="598" rx="24" fill="#1A1A2E" fill-opacity="0.16" filter="url(#cardBlur)"/>
+
+  <!-- 卡片 p.card #FBFAF7 -->
+  <rect x="132" y="60" width="900" height="600" rx="22" fill="#FBFAF7"/>
+
+  <g clip-path="url(#cardClip)">
+    <rect x="132" y="60" width="900" height="600" fill="url(#dots)"/>
+    <!-- 光束雨（BeamRain）：细竖线，上淡下亮 -->
+    <g fill="url(#beamGrad)">
+      <rect x="284" y="176" width="1.5" height="112"/>
+      <rect x="472" y="296" width="1.5" height="96"/>
+      <rect x="702" y="136" width="1.5" height="124"/>
+      <rect x="902" y="376" width="1.5" height="92"/>
+      <rect x="562" y="472" width="1.5" height="104"/>
+      <rect x="1002" y="246" width="1.5" height="108"/>
+    </g>
+  </g>
+
+  <rect x="132" y="60" width="900" height="600" rx="22" fill="none"
+        stroke="#000000" stroke-opacity="0.071" stroke-width="1.5"/>
+
+  <!-- ================= 顶栏 TitleBar（ui.cpp:544-689，高 64，cy=32） ================= -->
+  <g transform="translate(132,60)">
+
+    <!-- logo 圆底（ui.cpp:548-556：圆心 min.x+28、半径 18） -->
+    <circle cx="28" cy="32" r="18" fill="#F5F3FF"/>
+    <circle cx="28" cy="32" r="18" fill="#6C63FF" fill-opacity="0.13"/>
+    <circle cx="28" cy="32" r="18" fill="none" stroke="#000000" stroke-opacity="0.071" stroke-width="1"/>
+    <text x="28" y="38" font-size="15" font-weight="800" fill="#4B4470" text-anchor="middle" letter-spacing="0.5">DS</text>
+
+    <!-- 品牌两行（ui.cpp:596 的 txtX = min.x + 64） -->
+    <text x="64" y="33" font-size="20" font-weight="700" fill="#1B1B22">DsTool</text>
+    <text x="64" y="48" font-size="11" font-weight="500" fill="#1B1B22" fill-opacity="0.5">UI THEME KIT · v5</text>
+
+    <!-- 中间标题 + 副标题（ui.cpp:614 scX = min.x + 168；622 副标题接 +16） -->
+    <text x="168" y="41" font-size="24" font-weight="700" fill="#1B1B22">Overview</text>
+    <text x="300" y="38" font-size="18" fill="#1B1B22" fill-opacity="0.5">Buttons, sliders &amp; inputs</text>
+
+    <!-- 主题开关（ui.cpp:626-675：56x28 药丸，透明底 + 28% 描边，浅色态钮在左、紫太阳） -->
+    <rect x="680" y="18" width="56" height="28" rx="14" fill="none"
+          stroke="#1B1B22" stroke-opacity="0.28" stroke-width="1.3"/>
+    <circle cx="709" cy="32" r="5" fill="#1B1B22" fill-opacity="0.5"/>
+    <circle cx="711.2" cy="30.6" r="5" fill="#FBFAF7"/>
+    <circle cx="694" cy="32" r="14" fill="#FFFFFF" fill-opacity="0.25"/>
+    <circle cx="694" cy="33" r="11" fill="#000000" fill-opacity="0.14"/>
+    <circle cx="694" cy="32" r="11" fill="#FFFFFF"/>
+    <circle cx="694" cy="32" r="3.2" fill="#6C63FF"/>
+    <g stroke="#6C63FF" stroke-width="1.3" stroke-linecap="round">
+      <line x1="699.2" y1="32" x2="700.8" y2="32"/>
+      <line x1="697.7" y1="34.3" x2="698.8" y2="36.8"/>
+      <line x1="694" y1="37.2" x2="694" y2="38.8"/>
+      <line x1="690.3" y1="34.3" x2="689.2" y2="36.8"/>
+      <line x1="688.8" y1="32" x2="687.2" y2="32"/>
+      <line x1="690.3" y1="29.7" x2="689.2" y2="27.2"/>
+      <line x1="694" y1="26.8" x2="694" y2="25.2"/>
+      <line x1="697.7" y1="29.7" x2="698.8" y2="27.2"/>
+    </g>
+
+    <!-- Ready 徽章（ui.cpp:677-687：右对齐、绿点 + 主色文字） -->
+    <rect x="743" y="17" width="95" height="30" rx="15" fill="#6C63FF" fill-opacity="0.13"/>
+    <circle cx="763" cy="32" r="4" fill="#2EBD6B"/>
+    <text x="771" y="39" font-size="18" font-weight="500" fill="#1B1B22">Ready</text>
+
+    <!-- 关闭按钮（iOS 侧新增，挂在最右） -->
+    <circle cx="865" cy="32" r="15" fill="#6C63FF" fill-opacity="0.13"/>
+    <text x="865" y="38" font-size="15" font-weight="600" fill="#1B1B22" text-anchor="middle">✕</text>
+
+    <!-- 顶栏分隔线（ui.cpp:722） -->
+    <line x1="20" y1="64" x2="880" y2="64" stroke="#000000" stroke-opacity="0.071" stroke-width="1"/>
+
+    <!-- ================= 内容区（ui.cpp:725：cmin.x + 28，宽 cardW - 56） ================= -->
+
+    <!-- BUTTONS -->
+    <text x="28" y="95" font-size="18" fill="#1B1B22" fill-opacity="0.5">BUTTONS</text>
+    <rect x="28" y="110" width="94" height="40" rx="12" fill="#6C63FF"/>
+    <text x="75" y="136" font-size="18" font-weight="500" fill="#FFFFFF" text-anchor="middle">Primary</text>
+    <rect x="134" y="110" width="82" height="40" rx="12" fill="none"
+          stroke="#6C63FF" stroke-opacity="0.3" stroke-width="1"/>
+    <text x="175" y="136" font-size="18" font-weight="500" fill="#6C63FF" text-anchor="middle">Ghost</text>
+    <rect x="228" y="110" width="66" height="40" rx="12" fill="#E53E3E" fill-opacity="0.094"/>
+    <text x="261" y="136" font-size="18" font-weight="500" fill="#E53E3E" text-anchor="middle">Exit</text>
+
+    <!-- SLIDER -->
+    <text x="28" y="177" font-size="18" fill="#1B1B22" fill-opacity="0.5">SLIDER</text>
+    <text x="28" y="207" font-size="18" fill="#1B1B22">Draw FPS limit</text>
+    <line x1="38" y1="256" x2="862" y2="256" stroke="#6C63FF" stroke-opacity="0.2"
+          stroke-width="3" stroke-linecap="round"/>
+    <line x1="38" y1="256" x2="485.3" y2="256" stroke="#6C63FF"
+          stroke-width="3" stroke-linecap="round"/>
+    <circle cx="485.3" cy="258" r="10" fill="#000000" fill-opacity="0.18"/>
+    <circle cx="485.3" cy="256" r="9" fill="#FFFFFF"/>
+    <circle cx="485.3" cy="256" r="9" fill="none" stroke="#6C63FF" stroke-width="1.5"/>
+    <!-- 数值气泡（FancySlider：浮在钮上方，accentSoft 底 + accent 文字） -->
+    <rect x="439.3" y="212" width="92" height="28" rx="14" fill="#6C63FF" fill-opacity="0.13"/>
+    <text x="485.3" y="232" font-size="18" fill="#6C63FF" text-anchor="middle">144 FPS</text>
+
+    <!-- DROPDOWN（RowDropdown：左标签 / 右当前值 / V 形箭头） -->
+    <text x="28" y="293" font-size="18" fill="#1B1B22" fill-opacity="0.5">DROPDOWN</text>
+    <text x="28" y="334" font-size="18" fill="#1B1B22">Language</text>
+    <text x="852" y="334" font-size="18" fill="#1B1B22" fill-opacity="0.5" text-anchor="end">English</text>
+    <path d="M 858 328 L 865 335 L 872 328" fill="none" stroke="#1B1B22" stroke-opacity="0.5"
+          stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <!-- TEXT INPUT（ui.cpp:344 SetNextItemWidth(260)） -->
+    <text x="28" y="375" font-size="18" fill="#1B1B22" fill-opacity="0.5">TEXT INPUT</text>
+    <rect x="28" y="390" width="260" height="40" rx="8" fill="#6C63FF" fill-opacity="0.2"/>
+    <rect x="28" y="390" width="260" height="40" rx="8" fill="#6C63FF" fill-opacity="0.15"/>
+    <text x="42" y="416" font-size="18" fill="#1B1B22">Caesar UI Kit</text>
+  </g>
+
+  <!-- ================= 底部玻璃胶囊导航（ui.cpp:464-541） ================= -->
+  <g transform="translate(170,526)">
+    <!-- 外柔和阴影（GlassPill 第 1 步） -->
+    <rect x="0" y="5" width="560" height="58" rx="29" fill="#1A1A2E" fill-opacity="0.14" filter="url(#navBlur)"/>
+    <!-- 选中格淡紫高光（几乎透明，ui.cpp:483-486） -->
+    <rect x="5.6" y="7" width="128.8" height="44" rx="22" fill="#6C63FF" fill-opacity="0.12"/>
+    <!-- 半透明磨砂底 p.navBar = #FFFFFF @62% -->
+    <rect x="0" y="0" width="560" height="58" rx="29" fill="#FFFFFF" fill-opacity="0.62"/>
+    <!-- 顶边高光（hlA = 0.10 + 0.25 × 底色亮度） -->
+    <line x1="29" y1="1" x2="531" y2="1" stroke="#FFFFFF" stroke-opacity="0.32" stroke-width="1"/>
+    <!-- 细描边 -->
+    <rect x="0" y="0" width="560" height="58" rx="29" fill="none"
+          stroke="#000000" stroke-opacity="0.071" stroke-width="1"/>
+
+    <!-- 灯条：向上光晕 + 悬浮在顶边上方（lampCY = min.y - 2, lampH = 5） -->
+    <ellipse cx="70" cy="-6" rx="52" ry="30" fill="#6C63FF" fill-opacity="0.05" filter="url(#glowBlur)"/>
+    <rect x="58" y="-4.5" width="24" height="5" rx="2.5" fill="#6C63FF"/>
+
+    <!-- tab 0：Overview（选中，accent） -->
+    <g fill="none" stroke="#6C63FF" stroke-width="1.8">
+      <rect x="20.5" y="21.5" width="5.1" height="5.1" rx="1.2"/>
+      <rect x="30.4" y="21.5" width="5.1" height="5.1" rx="1.2"/>
+      <rect x="20.5" y="31.4" width="5.1" height="5.1" rx="1.2"/>
+      <rect x="30.4" y="31.4" width="5.1" height="5.1" rx="1.2"/>
+    </g>
+    <text x="43.5" y="35.5" font-size="18" font-weight="500" fill="#6C63FF">Overview</text>
+
+    <!-- tab 1：Controls -->
+    <g stroke="#1B1B22" stroke-opacity="0.5" stroke-width="1.5" stroke-linecap="round">
+      <line x1="163.5" y1="24.8" x2="178.5" y2="24.8"/>
+      <line x1="163.5" y1="33.2" x2="178.5" y2="33.2"/>
+    </g>
+    <circle cx="173.4" cy="24.8" r="2" fill="#1B1B22" fill-opacity="0.5"/>
+    <circle cx="168.6" cy="33.2" r="2" fill="#1B1B22" fill-opacity="0.5"/>
+    <text x="186.5" y="35.5" font-size="18" fill="#1B1B22" fill-opacity="0.5">Controls</text>
+
+    <!-- tab 2：Colors -->
+    <circle cx="318.5" cy="29" r="6.9" fill="none" stroke="#1B1B22" stroke-opacity="0.5" stroke-width="1.5"/>
+    <circle cx="316.7" cy="26.6" r="1.65" fill="#1B1B22" fill-opacity="0.5"/>
+    <circle cx="321.2" cy="28.7" r="1.65" fill="#1B1B22" fill-opacity="0.5"/>
+    <circle cx="318.2" cy="31.7" r="1.65" fill="#1B1B22" fill-opacity="0.5"/>
+    <text x="334" y="35.5" font-size="18" fill="#1B1B22" fill-opacity="0.5">Colors</text>
+
+    <!-- tab 3：Effects -->
+    <polygon points="457,21.5 458.7,27.3 464.5,29 458.7,30.7 457,36.5 455.3,30.7 449.5,29 455.3,27.3"
+             fill="#1B1B22" fill-opacity="0.5"/>
+    <text x="472.5" y="35.5" font-size="18" fill="#1B1B22" fill-opacity="0.5">Effects</text>
+  </g>
+</svg>

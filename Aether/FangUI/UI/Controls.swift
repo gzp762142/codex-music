@@ -188,7 +188,7 @@ final class FancySlider: UIControl {
         knob.layer.borderWidth = 1.5
         addSubview(knob)
 
-        bubble.font = .systemFont(ofSize: 12, weight: .medium)
+        bubble.font = .systemFont(ofSize: 18, weight: .medium)
         bubble.textAlignment = .center
         bubble.layer.cornerRadius = 12
         bubble.clipsToBounds = true
@@ -252,7 +252,7 @@ final class FancySlider: UIControl {
 
         bubble.text = String(format: format, value * dispScale)
         bubble.sizeToFit()
-        let bw = bubble.bounds.width + 18, bh: CGFloat = 24
+        let bw = bubble.bounds.width + 18, bh: CGFloat = 28
         var bx = knobX - bw * 0.5
         bx = min(max(bx, 0), bounds.width - bw)
         bubble.frame = CGRect(x: bx, y: trackY - 16 - bh, width: bw, height: bh)
@@ -269,7 +269,7 @@ final class RowView: UIView {
         self.control = control
         super.init(frame: .zero)
         label.text = title
-        label.font = .systemFont(ofSize: 15)
+        label.font = .systemFont(ofSize: 18)
         label.numberOfLines = 1
         label.lineBreakMode = .byTruncatingTail
         addSubview(label)
@@ -308,11 +308,132 @@ final class RowView: UIView {
 final class SectionLabel: UILabel {
     override init(frame: CGRect) {
         super.init(frame: frame)
-        font = .systemFont(ofSize: 12, weight: .semibold)
+        font = .systemFont(ofSize: 18)
         // 单行：宽度异常时宁可截断，也不要逐字竖排
         numberOfLines = 1
         lineBreakMode = .byTruncatingTail
     }
 
     required init?(coder: NSCoder) { super.init(coder: coder) }
+}
+
+
+/// 对应原 ImGui 的 RowDropdown（ui.cpp:227-273）：
+/// 左边标签用主色文字、右边当前值用次要色、最右一个 V 形箭头；
+/// 悬停/按下时值转主色（ImGui 的 vcol = hovered ? accent : textDim）。
+final class DropdownRow: UIControl {
+    let label = UILabel()
+    private let valueLabel = UILabel()
+    private let chevron = UIImageView()
+    private(set) var items: [String]
+    private(set) var selectedIndex: Int
+    var onSelect: ((Int) -> Void)?
+
+    var selectedTitle: String {
+        items.isEmpty ? "" : items[min(max(selectedIndex, 0), items.count - 1)]
+    }
+
+    init(title: String, items: [String], selected: Int = 0) {
+        self.items = items
+        self.selectedIndex = items.isEmpty ? 0 : min(max(selected, 0), items.count - 1)
+        super.init(frame: .zero)
+        label.text = title
+        label.font = .systemFont(ofSize: 18)
+        label.numberOfLines = 1
+        label.lineBreakMode = .byTruncatingTail
+        valueLabel.font = .systemFont(ofSize: 18)
+        valueLabel.textAlignment = .right
+        valueLabel.numberOfLines = 1
+        valueLabel.lineBreakMode = .byTruncatingTail
+        valueLabel.text = selectedTitle
+        chevron.image = UIImage(systemName: "chevron.down")
+        chevron.contentMode = .scaleAspectFit
+        [label, valueLabel, chevron].forEach {
+            $0.isUserInteractionEnabled = false
+            addSubview($0)
+        }
+        addTarget(self, action: #selector(tap), for: .touchUpInside)
+        isAccessibilityElement = true
+        accessibilityTraits = .button
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    @objc private func tap() {
+        guard let vc = DropdownRow.topViewController() else { return }
+        let sheet = UIAlertController(title: label.text, message: nil,
+                                      preferredStyle: .actionSheet)
+        items.enumerated().forEach { i, name in
+            sheet.addAction(UIAlertAction(title: name, style: .default) { [weak self] _ in
+                guard let self = self else { return }
+                self.selectedIndex = i
+                self.valueLabel.text = name
+                self.setNeedsLayout()
+                self.sendActions(for: .valueChanged)
+                self.onSelect?(i)
+            })
+        }
+        sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        // iPad 上 actionSheet 走 popover，必须给锚点，否则直接崩。
+        if let pop = sheet.popoverPresentationController {
+            pop.sourceView = self
+            pop.sourceRect = bounds
+        }
+        vc.present(sheet, animated: true)
+    }
+
+    static func topViewController() -> UIViewController? {
+        let key = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap { $0.windows }
+            .first { $0.isKeyWindow }
+        return key?.rootViewController
+    }
+
+    /// 当前主题快照：按下高亮要用调用方传进来的 palette，不能回头查
+    /// FangTheme —— 那个枚举里的 state.themeT 从不更新，永远返回浅色。
+    private var palette: Palette = .light
+
+    func apply(palette: Palette) {
+        self.palette = palette
+        refreshColors()
+    }
+
+    private func refreshColors() {
+        label.textColor = palette.text
+        let dim = isHighlighted ? palette.accent : palette.textDim
+        valueLabel.textColor = dim
+        chevron.tintColor = dim
+    }
+
+    override var isHighlighted: Bool {
+        didSet { refreshColors() }
+    }
+
+    /// 行高固定 30，和原 ImGui 的 RowDropdown h = 30.0f（ui.cpp:232）一致。
+    override var intrinsicContentSize: CGSize {
+        CGSize(width: UIView.noIntrinsicMetric, height: 30)
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        label.sizeToFit()
+        let lh = min(label.bounds.height, bounds.height)
+        label.frame = CGRect(x: 0, y: (bounds.height - lh) / 2,
+                             width: min(label.bounds.width, max(0, bounds.width - 70)),
+                             height: lh)
+
+        let chevW: CGFloat = 14
+        chevron.frame = CGRect(x: bounds.width - chevW,
+                               y: (bounds.height - chevW) / 2,
+                               width: chevW, height: chevW)
+
+        valueLabel.sizeToFit()
+        let vh = min(valueLabel.bounds.height, bounds.height)
+        let avail = max(0, bounds.width - label.frame.maxX - 8 - chevW - 6)
+        let vw = min(valueLabel.bounds.width, avail)
+        valueLabel.frame = CGRect(x: bounds.width - chevW - 6 - vw,
+                                  y: (bounds.height - vh) / 2,
+                                  width: vw, height: vh)
+    }
 }

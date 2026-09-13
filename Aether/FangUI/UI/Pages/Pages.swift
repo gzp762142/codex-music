@@ -19,10 +19,10 @@ extension PageSizing where Self: UIView {
             addSubview(contentStack)
         }
         NSLayoutConstraint.activate([
-            contentStack.topAnchor.constraint(equalTo: topAnchor, constant: 4),
-            contentStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
-            contentStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
-            contentStack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4)
+            contentStack.topAnchor.constraint(equalTo: topAnchor, constant: 0),
+            contentStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 0),
+            contentStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: 0),
+            contentStack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: 0)
         ])
     }
 }
@@ -35,7 +35,13 @@ final class OverviewPage: UIView, PageSizing {
     private let ghostBtn = UIButton(type: .system)
     private let dangerBtn = UIButton(type: .system)
     private var slider: FancySlider!
-    private let langButton = UIButton(type: .system)
+    /// 原 ImGui 是「左标签 Language + 右侧当前值 + 小箭头」（ui.cpp:227-273），
+    /// 不是把标签和值拼成一行文本。
+    private lazy var langRow = DropdownRow(title: "Language",
+                                           items: ["English", "中文", "日本語", "Español"],
+                                           selected: state.langIdx)
+    /// 原 ImGui 在 SLIDER 段标题下还有一行 "Draw FPS limit"（ui.cpp:338）。
+    private let fpsCaption = UILabel()
     private let textField = UITextField()
     private let state: FangUIState
 
@@ -51,7 +57,12 @@ final class OverviewPage: UIView, PageSizing {
         primaryBtn.setTitle("Primary", for: .normal)
         ghostBtn.setTitle("Ghost", for: .normal)
         dangerBtn.setTitle("Exit", for: .normal)
-        let btnRow = UIStackView(arrangedSubviews: [primaryBtn, ghostBtn, dangerBtn])
+        // 尾部弹性 spacer：.fill 分布会拉伸 hugging 最低的 arranged subview，
+        // 没有它 Primary 会被拉满整行（ImGui 里三颗按钮都是固有宽度）。
+        let btnSpacer = UIView()
+        btnSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        btnSpacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let btnRow = UIStackView(arrangedSubviews: [primaryBtn, ghostBtn, dangerBtn, btnSpacer])
         btnRow.axis = .horizontal
         btnRow.spacing = 12
         // ImGui uses compact intrinsic button widths. Give each control an
@@ -61,25 +72,41 @@ final class OverviewPage: UIView, PageSizing {
         NSLayoutConstraint.activate([
             primaryBtn.widthAnchor.constraint(equalToConstant: 94),
             ghostBtn.widthAnchor.constraint(equalToConstant: 82),
-            dangerBtn.widthAnchor.constraint(equalToConstant: 58)
+            // 66 而非 58：58 减去 contentEdgeInsets 左右各 18 只剩 22pt，
+            // "Exit" 放不下会被 UIKit 截断成 "…"。
+            dangerBtn.widthAnchor.constraint(equalToConstant: 66)
         ])
 
         slider = FancySlider(value: state.fpsLimit, min: 30, max: 240, format: "%.0f FPS")
         slider.addTarget(self, action: #selector(onFps), for: .valueChanged)
+        fpsCaption.text = "Draw FPS limit"
+        fpsCaption.font = .systemFont(ofSize: 18)
+        fpsCaption.numberOfLines = 1
+        let fpsBlock = UIStackView(arrangedSubviews: [fpsCaption, slider])
+        fpsBlock.axis = .vertical
+        // ImGui 里 Text 与 FancySlider 之间是 ItemSpacing(12)；气泡从滑条顶部
+        // 溢出 8pt，视觉间距约 4pt。
+        fpsBlock.spacing = 12
 
-        langButton.setTitle("Language: English", for: .normal)
-        langButton.contentHorizontalAlignment = .left
-        langButton.addTarget(self, action: #selector(onLang), for: .touchUpInside)
+        langRow.addTarget(self, action: #selector(onLang), for: .valueChanged)
 
         textField.borderStyle = .roundedRect
         textField.text = state.textBuf
         textField.addTarget(self, action: #selector(onText), for: .editingChanged)
+        // 原 ImGui 是 SetNextItemWidth(260)，输入框不是满宽（ui.cpp:344）。
+        let textSpacer = UIView()
+        textSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        textSpacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let textRow = UIStackView(arrangedSubviews: [textField, textSpacer])
+        textRow.axis = .horizontal
+        textRow.spacing = 0
+        textField.widthAnchor.constraint(equalToConstant: 260).isActive = true
 
         for (title, view) in [
-            ("BUTTONS", btnRow),
-            ("SLIDER", slider as UIView),
-            ("DROPDOWN", langButton),
-            ("TEXT INPUT", textField)
+            ("BUTTONS", btnRow as UIView),
+            ("SLIDER", fpsBlock),
+            ("DROPDOWN", langRow),
+            ("TEXT INPUT", textRow)
         ] {
             let sec = SectionLabel()
             sec.text = title
@@ -95,8 +122,8 @@ final class OverviewPage: UIView, PageSizing {
         }
         btnRow.heightAnchor.constraint(equalToConstant: 40).isActive = true
         slider.heightAnchor.constraint(equalToConstant: 44).isActive = true
-        langButton.heightAnchor.constraint(equalToConstant: 40).isActive = true
-        textField.heightAnchor.constraint(equalToConstant: 40).isActive = true
+        langRow.heightAnchor.constraint(equalToConstant: 40).isActive = true
+        textRow.heightAnchor.constraint(equalToConstant: 40).isActive = true
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -104,25 +131,7 @@ final class OverviewPage: UIView, PageSizing {
     @objc private func onFps() { state.fpsLimit = slider.value }
     @objc private func onText() { state.textBuf = textField.text ?? "" }
 
-    @objc private func onLang() {
-        let langs = ["English", "中文", "日本語", "Español"]
-        let sheet = UIAlertController(title: "Language", message: nil, preferredStyle: .actionSheet)
-        langs.enumerated().forEach { i, name in
-            sheet.addAction(UIAlertAction(title: name, style: .default) { _ in
-                self.state.langIdx = i
-                self.langButton.setTitle("Language: \(name)", for: .normal)
-            })
-        }
-        sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        // UIWindowScene.keyWindow is iOS 15+; walk windows for iOS 13.
-        let key = UIApplication.shared.connectedScenes
-            .compactMap { $0 as? UIWindowScene }
-            .flatMap { $0.windows }
-            .first { $0.isKeyWindow }
-        if let root = key?.rootViewController {
-            root.present(sheet, animated: true)
-        }
-    }
+    @objc private func onLang() { state.langIdx = langRow.selectedIndex }
 
     func rebuild(palette: Palette) {
         backgroundColor = .clear
@@ -144,7 +153,8 @@ final class OverviewPage: UIView, PageSizing {
         dangerBtn.contentEdgeInsets = primaryBtn.contentEdgeInsets
 
         slider.apply(palette: palette)
-        langButton.setTitleColor(palette.textDim, for: .normal)
+        fpsCaption.textColor = palette.text
+        langRow.apply(palette: palette)
         textField.textColor = palette.text
         textField.backgroundColor = palette.track.withAlphaComponent(0.35)
         textField.attributedPlaceholder = NSAttributedString(
@@ -154,7 +164,9 @@ final class OverviewPage: UIView, PageSizing {
         stack.arrangedSubviews.forEach {
             if let s = $0 as? SectionLabel { s.textColor = palette.textDim }
             if let r = $0 as? UIStackView {
-                r.arrangedSubviews.forEach { ($0 as? UIButton)?.titleLabel?.font = .systemFont(ofSize: 15, weight: .medium) }
+                r.arrangedSubviews.forEach {
+                    ($0 as? UIButton)?.titleLabel?.font = .systemFont(ofSize: 18, weight: .medium)
+                }
             }
         }
     }
