@@ -1,12 +1,15 @@
 import UIKit
 
-/// 极简面板：**只有一个菜单，菜单上只有背景**。
+/// 菜单面板 —— **只有背景**。
 ///
-/// 刻意不包含：顶部标题栏、品牌、标题、副标题、主题开关、状态徽章、
-/// 页签导航、四页内容、关闭按钮、诊断行。
-/// 唯一保留的交互是拖动 —— 它属于窗口本身，不是控件。
+/// 面板内不含任何控件：没有标题栏、品牌、标题、副标题、主题开关、状态徽章、
+/// 关闭按钮、页签导航，也没有四页内容（按钮 / 滑块 / 下拉 / 输入框）。
+/// 面板整体就是一张背景图。
 ///
-/// 几何全部走 frame（viewDidLayoutSubviews），不引入任何 Auto Layout 约束：
+/// 保留的唯一交互是**拖动**：它属于窗口本身（把菜单挪到屏幕任意位置），
+/// 不是按钮。
+///
+/// 几何全部走 frame（viewDidLayoutSubviews），不引入 Auto Layout 约束：
 /// 历史提交里两次布局错乱都来自「手写 frame 与 Auto Layout 混用」。
 final class RootViewController: UIViewController {
 
@@ -15,18 +18,20 @@ final class RootViewController: UIViewController {
 
     /// 面板不透明底色，回传给 FangUIBridge（窗口层跟着换底）。
     var onSurfaceColorChange: ((UIColor) -> Void)?
-    /// 收起回调。极简版没有关闭按钮，保留接口以免桥接处断链。
+    /// 收起回调。面板上没有关闭按钮，保留接口以免桥接处断链。
     var onRequestClose: (() -> Void)?
 
-    /// 承载阴影的容器：它比卡片大 shadowInset，所以阴影不会被裁掉。
+    /// 承载阴影的容器：比卡片大 shadowInset，阴影不会被裁掉。
     private let cardShadow = UIView()
-    /// 菜单本体：圆角 + 背景，上面不放任何控件。
+    /// 菜单本体：圆角 + 背景图，上面不放任何子视图。
     private let cardView = UIView()
-    /// 拖动把手：只有顶栏那一条响应 pan，卡片其余部分不拦手势。
+    /// 背景层：柔和的径向渐变，作为菜单的背景图。
+    private let backdrop = CAGradientLayer()
+    /// 拖动把手：整块卡片都响应拖动。
     private let dragHandle = UIView()
     private var dragStartCenter: CGPoint = .zero
 
-    /// 面板底色：取自设计稿的米白背景。
+    /// 背景底色：取自设计稿的米白。
     private var surface: UIColor { Palette.light.card }
 
     override func viewDidLoad() {
@@ -42,8 +47,20 @@ final class RootViewController: UIViewController {
 
         cardView.layer.cornerRadius = 28
         cardView.layer.cornerCurve = .continuous
+        cardView.clipsToBounds = true
         cardView.backgroundColor = surface
         cardShadow.addSubview(cardView)
+
+        // 背景图：中上方偏亮、四周略沉，做出柔光纸面的感觉。
+        backdrop.type = .radial
+        backdrop.colors = [
+            UIColor.white.withAlphaComponent(0.75).cgColor,
+            UIColor.white.withAlphaComponent(0.0).cgColor
+        ]
+        backdrop.locations = [0, 1]
+        backdrop.startPoint = CGPoint(x: 0.5, y: 0.34)
+        backdrop.endPoint = CGPoint(x: 1.15, y: 1.25)
+        cardView.layer.addSublayer(backdrop)
 
         dragHandle.backgroundColor = .clear
         dragHandle.addGestureRecognizer(
@@ -62,12 +79,15 @@ final class RootViewController: UIViewController {
 
         cardShadow.frame = view.bounds.insetBy(dx: Self.shadowInset, dy: Self.shadowInset)
         cardView.frame = cardShadow.bounds
-        // 顶部 56pt 作为拖动条；其余区域完全留白。
-        dragHandle.frame = CGRect(x: 0, y: 0,
-                                  width: cardView.bounds.width, height: 56)
+        // 渐变层不走自动布局，尺寸跟着卡片走。
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        backdrop.frame = cardView.bounds
+        CATransaction.commit()
+        dragHandle.frame = cardView.bounds
     }
 
-    /// 由宿主在面板被摘出窗口 / 重新挂上时调用。极简版没有动画，只保留接口。
+    /// 由宿主在面板被摘出窗口 / 重新挂上时调用。面板没有动画，只保留接口。
     func setActive(_ active: Bool) {
         _ = active
     }
