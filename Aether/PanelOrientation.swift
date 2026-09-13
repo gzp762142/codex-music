@@ -53,7 +53,10 @@ enum PanelOrientation {
         }
     }
 
-    private static let defaultsKey = "FangUI.PanelOrientationOverride"
+    // Do not reuse a stale value from the old diagnostic implementation. A
+    // persisted 90-degree override would make the repaired menu look rotated
+    // immediately after upgrade, before the user has interacted with it.
+    private static let defaultsKey = "FangUI.PanelOrientationOverride.v2"
 
     static var override: Fix {
         get {

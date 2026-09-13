@@ -37,7 +37,9 @@ enum FangUIBridge {
     /// SpringBoard 托管开关（排查重影用）。**启动时读取**：
     /// `registerWindowWithContextID:` 没有对应的注销接口，运行期改这个值
     /// 不会撤掉已经注册的托管层，所以只能靠重启生效。
-    private static let hostingKey = "FangUI.SpringBoardHostingEnabled"
+    // Use a versioned key so an old diagnostic toggle cannot silently disable
+    // the cross-app menu after upgrading to the single-window implementation.
+    private static let hostingKey = "FangUI.SpringBoardHostingEnabled.v2"
 
     static var hostingEnabled: Bool {
         get {
@@ -74,14 +76,16 @@ enum FangUIBridge {
     /// 而「本地层放到哪一档才不被自己场景合成」这件事只能在真机上试出来，
     /// 因此给出这几档而不是写死一个猜测值。
     private static let localLevels: [(name: String, level: UIWindow.Level)] = [
-        ("sys",  UIWindow.Level(rawValue: UIWindow.Level.statusBar.rawValue + 2000)),
-        ("sb1",  UIWindow.Level(rawValue: UIWindow.Level.statusBar.rawValue + 1)),
-        ("0",    .normal),
+        ("-100", UIWindow.Level(rawValue: -100)),
         ("-1",   UIWindow.Level(rawValue: -1)),
-        ("-100", UIWindow.Level(rawValue: -100))
+        ("0",    .normal),
+        ("sb1",  UIWindow.Level(rawValue: UIWindow.Level.statusBar.rawValue + 1)),
+        ("sys",  UIWindow.Level(rawValue: UIWindow.Level.statusBar.rawValue + 2000))
     ]
 
-    private static let levelKey = "FangUI.LocalWindowLevelIndex"
+    // Bump the key so devices that previously persisted the diagnostic `sys`
+    // level start with the single-copy production setting.
+    private static let levelKey = "FangUI.LocalWindowLevelIndex.v2"
 
     static var localLevelIndex: Int {
         get {
@@ -130,6 +134,10 @@ enum FangUIBridge {
         installLifecycleObserversIfNeeded()
         startOrientationObserver()
 
+        // The registration guard intentionally checks this flag. Set it before
+        // creating the first window so makeWindow() can register its context.
+        isOpen = true
+
         // 窗口是**长期单例**：创建一次、注册一次、永不销毁。
         // 每次开关都新建窗口的话，旧窗口的 SpringBoard 托管层不会被注销，
         // 屏幕上就会叠加出好几份面板（实测重影的来源）。
@@ -146,7 +154,6 @@ enum FangUIBridge {
             if let scene = preferredWindowScene() { w.windowScene = scene }
         }
 
-        isOpen = true
         if panel == nil || panel?.view.superview !== w {
             attachPanel(to: w)
         }
@@ -156,6 +163,11 @@ enum FangUIBridge {
         w.isHidden = false
         w.alpha = 1
         applySceneGeometry(w)
+        CATransaction.flush()
+        // Register only after the panel and its final geometry are attached.
+        // The operation is idempotent for this context and retries if CA has
+        // not assigned a context id yet.
+        registerWithSpringBoard(w)
         startKeepAlive()
     }
 
@@ -178,7 +190,6 @@ enum FangUIBridge {
         // 刻意不 makeKeyAndVisible：避免抢走 App 主窗口的 key。
         w.isHidden = false
         CATransaction.flush()
-        registerWithSpringBoard(w)
         return w
     }
 
@@ -284,8 +295,14 @@ enum FangUIBridge {
             // 默认正居中。
             center = CGPoint(x: space.midX, y: space.midY)
         }
-        center.x = min(max(center.x, halfW), max(halfW, space.width - halfW))
-        center.y = min(max(center.y, halfH), max(halfH, space.height - halfH))
+        // Clamp in the scene's actual coordinate space. Some iPad scenes have
+        // a non-zero bounds origin; clamping against zero shifts the panel.
+        let minX = space.minX + halfW
+        let maxX = max(minX, space.maxX - halfW)
+        let minY = space.minY + halfH
+        let maxY = max(minY, space.maxY - halfH)
+        center.x = min(max(center.x, minX), maxX)
+        center.y = min(max(center.y, minY), maxY)
 
         let changed = w.bounds.size != winSize || w.center != center || w.transform != comp
         if changed {
@@ -430,6 +447,10 @@ enum FangUIBridge {
                 // 方向/层级档位可能变化；保持与当前档位一致。
                 if w.windowLevel != localLevel { w.windowLevel = localLevel }
                 applySceneGeometry(w)
+                // Context IDs can be assigned after the first CA commit. Keep
+                // retrying until SpringBoard accepts the one registration;
+                // the guard in registerWithSpringBoard prevents duplicates.
+                registerWithSpringBoard(w)
             }
         }
         RunLoop.main.add(keepAlive!, forMode: .common)
