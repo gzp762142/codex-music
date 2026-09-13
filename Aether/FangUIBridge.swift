@@ -257,6 +257,26 @@ enum FangUIBridge {
         registerWithSpringBoard(w)
     }
 
+    /// 求最大的可用缩放：让「窗口按 comp 旋转后」四边都落在 space 之内。
+    /// 竖屏时窗口的宽会顶到屏幕窄边，直接乘 0.5 可能溢出 1pt 被裁。
+    private static func maxFitScale(baseW: CGFloat, baseH: CGFloat, target: CGFloat,
+                                    inset: CGFloat, comp: CGAffineTransform,
+                                    space: CGRect) -> CGFloat {
+        func fits(_ s: CGFloat) -> Bool {
+            let size = CGSize(width: baseW * s + inset * 2, height: baseH * s + inset * 2)
+            let r = CGRect(origin: .zero, size: size).applying(comp)
+            return abs(r.width) <= space.width && abs(r.height) <= space.height
+        }
+        if fits(target) { return target }
+        var lo: CGFloat = 0.01
+        var hi: CGFloat = target
+        for _ in 0..<24 {
+            let mid = (lo + hi) * 0.5
+            if fits(mid) { lo = mid } else { hi = mid }
+        }
+        return lo
+    }
+
     /// 面板整体缩放系数：卡片与窗口一起等比缩放。
     /// 改这一个数字就能整体放大 / 缩小菜单，内部比例不受影响。
     static let panelScale: CGFloat = 0.5
@@ -275,35 +295,31 @@ enum FangUIBridge {
         // 空间已归一化（横屏时长边 = 宽），这里再夹一次保证卡片宽 > 高。
         let longSide = max(space.width, space.height)
         let shortSide = min(space.width, space.height)
-        // Match the original ImGui root window: centered card with 60pt
-        // total margin and a 900x620 maximum. The previous proportional
-        // 0.58/0.72 sizing compressed the wide layout into a narrow card,
-        // stretching Exit and overlapping the title bar.
-        // 下限从 560 提到 620：560 的卡片宽度下，顶栏要塞下 logo + 品牌 +
-        // 标题 + 副标题 + 开关 + 徽章 + 关闭共七件，实测必然把标题挤成
-        // "Over..."。620 是单行 header 能成立的最小宽度 —— RootViewController
-        // 的 wide 断点也是 620，两处必须一致。
+        // 基准尺寸：长边留 120pt 合计边距，并夹在 620...900 之间。
         let baseW = min(max(longSide - 120, 620), 900)
         let baseH = min(max(shortSide - 120, 420), 620)
         // 面板整体缩放：0.5 = 设计尺寸的一半。窗口与卡片一起等比缩，
-        // 圆角 / 阴影 / 内部比例全部不变，位置仍走下面的居中与拖动逻辑。
-        let panelW = baseW * panelScale
-        let panelH = baseH * panelScale
+        // 圆角 / 阴影 / 内部比例全部不变。
+        //
+        // 再按**旋转后**的屏幕尺寸夹一次：竖屏时窗口的宽会顶到屏幕的窄边，
+        // 固定 0.5 会溢出 1pt 被裁掉。取「能完整放进屏幕」与「目标缩放」中
+        // 较小的那个 —— 宁可略小，也不要出现显示不全的面板。
+        let comp = PanelOrientation.transform()
+        let scale = maxFitScale(baseW: baseW, baseH: baseH, target: panelScale,
+                                inset: inset, comp: comp,
+                                space: space)
+        let panelW = baseW * scale
+        let panelH = baseH * scale
         let winSize = CGSize(width: panelW + inset * 2, height: panelH + inset * 2)
 
-        let comp = PanelOrientation.transform()
         // 旋转以中心为轴：先定中心，再用旋转后的半宽半高夹取。
         let rotated = CGRect(origin: .zero, size: winSize).applying(comp)
         let halfW = abs(rotated.width) / 2
         let halfH = abs(rotated.height) / 2
 
-        var center: CGPoint
-        if let saved = customCenter {
-            center = saved
-        } else {
-            // 默认正居中。
-            center = CGPoint(x: space.midX, y: space.midY)
-        }
+        // 面板钉死在屏幕正中：面板不接收触摸，位置也就不该有第二个来源。
+        // customCenter 只保留给 setPanelCenter 这个公开接口，不参与计算。
+        var center = CGPoint(x: space.midX, y: space.midY)
         // Clamp in the scene's actual coordinate space. Some iPad scenes have
         // a non-zero bounds origin; clamping against zero shifts the panel.
         let minX = space.minX + halfW
