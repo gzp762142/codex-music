@@ -257,16 +257,16 @@ enum FangUIBridge {
         registerWithSpringBoard(w)
     }
 
+    /// 面板整体缩放系数：卡片与窗口一起等比缩放。
+    /// 改这一个数字就能整体放大 / 缩小菜单，内部比例不受影响。
+    static let panelScale: CGFloat = 0.5
+
     /// 面板 ＝ 一块悬浮卡片：窗口只覆盖卡片（加上阴影边距）。
     ///
     /// 三处修正：
     /// 1. 布局空间按**界面方向归一化**（长边做宽），不再依赖某一个 API 是否跟手旋转。
     /// 2. 夹取位置用 **旋转后的包围盒**，否则一转就顶出屏幕。
     /// 3. 方向变换可切换（`PanelOrientation`），不再写死 identity。
-    ///
-    /// 面板整体缩放系数：卡片与窗口一起等比缩放。
-    /// 改这一个数字就能整体放大 / 缩小菜单，内部比例不受影响。
-    static let panelScale: CGFloat = 0.5
 
     private static func applySceneGeometry(_ w: UIWindow) {
         let space = layoutSpace()
