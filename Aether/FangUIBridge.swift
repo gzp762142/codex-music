@@ -149,11 +149,6 @@ enum FangUIBridge {
             window = w
         }
 
-        // 首次 show 时可能还没拿到 scene；每次 show 补绑一次，否则窗口永远不入场景。
-        if #available(iOS 13.0, *), w.windowScene == nil {
-            if let scene = preferredWindowScene() { w.windowScene = scene }
-        }
-
         if panel == nil || panel?.view.superview !== w {
             attachPanel(to: w)
         }
@@ -181,13 +176,10 @@ enum FangUIBridge {
         // 宿主 VC 只管窗口状态；面板视图直接挂在窗口上，
         // 绕开 UIKit 对 rootViewController.view 的方向旋转。
         w.rootViewController = FangUIContentHost()
-        if #available(iOS 13.0, *) {
-            if let scene = preferredWindowScene() {
-                w.windowScene = scene
-            }
-        }
-        // 让 layer 进 CA，拿到非零 _contextId 后才好注册托管。
-        // 刻意不 makeKeyAndVisible：避免抢走 App 主窗口的 key。
+        // Keep this window detached from the application's UIWindowScene.
+        // Attaching it to the scene makes UIKit composite a second local copy;
+        // SpringBoard hosting is the only compositor for this window.
+        // The window still gets a WindowServer context when made visible.
         w.isHidden = false
         CATransaction.flush()
         return w
