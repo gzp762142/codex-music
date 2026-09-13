@@ -8,10 +8,8 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
-        // FangUI 关闭按钮 → 控制台「关闭」→ 自动收起菜单
-        FangUIBridge.setPowerCallback { [weak self] on in
-            self?.state.setPower(on)
-        }
+        // 极简版：没有卡片密钥 / 解锁 / 电源开关，启动直接亮出菜单面板。
+        FangUIBridge.presentPanel()
         return true
     }
 
