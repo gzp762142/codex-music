@@ -289,21 +289,46 @@ final class RootViewController: UIViewController {
         // 相对次序对齐原 ImGui：开关在左、徽章在右
         // （ui.cpp:627 的 max.x-224 与 ui.cpp:682 的 max.x-24）；
         // 关闭按钮是本工程新增，挂在最右。
+        //
+        // 锚定方向：三个控件各自从**右缘**往左排，宽度互相独立。
+        // 旧写法是从徽章宽度反推开关的 x（themeSwitch.x = badgeX - 12 - 56），
+        // 开关位置因此被绑在徽章的 intrinsic 宽度上：徽章文案一变长、或
+        // 辅助功能字号被放大，开关就跟着往左滑，极端情况下会被推出卡片。
         let closeSide: CGFloat = 30
+        let switchW: CGFloat = 56
+        let switchH: CGFloat = 28
+        let badgeH: CGFloat = 28
+        let clusterGap: CGFloat = 12
+        /// 标题文字必须保住的最小横向空间：右栏集群不得越过这条线。
+        /// 值取标题起点 + 最宽标签（Overview 24pt 实测约 110pt）再留一点余量，
+        /// 不能取大：面板最窄时会把徽章压到 86pt 以下、副标题整条被挤没。
+        let clusterLeftLimit: CGFloat = 176
+
+        closeBtn.layer.cornerRadius = closeSide / 2
+        // 竖直位置一律跟 cy 走；cy 已经把 top 算进去了，不要再写绝对 y。
         closeBtn.frame = CGRect(x: W - pad - closeSide,
                                 y: cy - closeSide / 2,
                                 width: closeSide, height: closeSide)
-        closeBtn.layer.cornerRadius = closeSide / 2
+
+        themeSwitch.frame = CGRect(x: closeBtn.frame.minX - clusterGap - switchW,
+                                   y: cy - switchH / 2,
+                                   width: switchW, height: switchH)
 
         refreshBadge()
-        let badgeW = min(max(badgeLabel.bounds.width + 22, 86), W * 0.45)
-        let badgeH: CGFloat = 28
+        // 徽章宽度上限由「主题开关左缘」给出：它永远不覆盖开关，
+        // 也永远不把开关往左顶。
+        let badgeAvail = max(0, themeSwitch.frame.minX - clusterGap - clusterLeftLimit)
+        let badgeW = min(max(badgeLabel.bounds.width + 22, 86), badgeAvail)
         badgeLabel.layer.cornerRadius = badgeH / 2
-        let badgeX = closeBtn.frame.minX - 12 - badgeW
+        let badgeX = themeSwitch.frame.minX - clusterGap - badgeW
+        // 窄到塞不下徽章时整块退场，而不是压成一条看不清的细边。
+        badgeLabel.isHidden = badgeW < 60
         badgeLabel.frame = CGRect(x: badgeX, y: cy - badgeH / 2,
                                   width: badgeW, height: badgeH)
-        themeSwitch.frame = CGRect(x: badgeX - 12 - 56, y: cy - 14,
-                                   width: 56, height: 28)
+
+        // 标题 / 副标题与右栏集群在水平方向不得打架；空间不足时副标题退场
+        // （它是 .byTruncatingTail，宁可整块隐藏也不要显示成 "UI THEME K…"）。
+        let hasRoomForSubtitle = badgeX > clusterLeftLimit + 80
 
         titleLabel.sizeToFit()
 
@@ -319,25 +344,31 @@ final class RootViewController: UIViewController {
             brandLabel.frame = CGRect(x: 64, y: cy - 18, width: 160, height: 24)
             brandSub.frame = CGRect(x: 64, y: cy + 5, width: 160, height: 14)
             brandSub.isHidden = false
-            subtitleLabel.isHidden = false
 
             // 标题 x = min.x + 168（ui.cpp:614），字号 24，竖直居中于 cy。
+            // 宽度收在右栏集群之前，避免长标题（Effects）压到副标题或开关。
+            let titleMaxW = max(60, badgeX - clusterGap - 24 - 168)
             titleLabel.frame = CGRect(x: 168, y: cy - 15,
-                                      width: titleLabel.bounds.width, height: 30)
+                                      width: min(titleLabel.bounds.width, titleMaxW),
+                                      height: 30)
             let subX = titleLabel.frame.maxX + 16      // ui.cpp:622 scX + scW + 16
+            subtitleLabel.isHidden = !hasRoomForSubtitle
             subtitleLabel.frame = CGRect(
                 x: subX, y: cy - 9,
-                width: max(0, themeSwitch.frame.minX - 16 - subX), height: 18
+                width: max(0, badgeX - clusterGap - subX), height: 18
             )
         } else {
             // 窄屏两行 header：上行 logo + 品牌 + 开关/关闭，下行标题
             brandLabel.frame = CGRect(x: 64, y: top + 14, width: 160, height: 26)
             brandSub.isHidden = true
             subtitleLabel.isHidden = true
+            _ = hasRoomForSubtitle      // 窄屏本就不放副标题，保留取值以保持判定一致
 
+            // 下行标题的右边界同样收在主题开关之前，不是收在徽章之前。
             titleLabel.frame = CGRect(x: pad + 8, y: top + 48,
                                       width: min(titleLabel.bounds.width,
-                                                 W - pad * 2 - badgeW - 12),
+                                                 max(60, themeSwitch.frame.minX
+                                                     - clusterGap - (pad + 8))),
                                       height: 30)
         }
 
