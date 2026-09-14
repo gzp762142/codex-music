@@ -1,25 +1,30 @@
 import UIKit
 
-/// 进程扫描调试页（挂在「设置」页签下面）。
+/// 进程扫描 + 读内存探针的调试页（挂在「设置」页签下面）。
 ///
-/// 目的很单纯：**把 p_comm 直接摆在面板上看**。没有 Mac 日志，肉眼扫列表最快。
-/// 命中目标进程的行整行标蓝，一眼能看见。
+/// 上半部分显示三行状态：
+///   1. 进程数 / 命中数 / libproc 两条路是否可用
+///   2. 游戏 pid（精确命中才有）
+///   3. task_for_pid 探针结果 —— 端口号、内存区数、读到的 Mach-O magic
+/// 下面是可滚动的 p_comm 列表，● 精确命中、○ 疑似。
 final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
 
     static let rowHeight: CGFloat = 22
 
     private let scanner = ProcessScanner()
+    private let probe = MemoryProbe()
     private var entries: [ProcessScanner.ProcEntry] = []
-    private let headerH: CGFloat = 34
+    private let headerH: CGFloat = 50
 
     private let refreshBtn = UIButton(type: .system)
     private let countLabel = UILabel()
     private let hitLabel = UILabel()
+    private let probeLabel = UILabel()
     private let table = UITableView(frame: .zero, style: .plain)
 
     private let accent = UIColor.hex(0x185EE0)
     private let idleText = UIColor.hex(0x5A6A82)
-    private let mainText = UIColor.hex(0x2A2A32)
+    private let warnText = UIColor.hex(0xB04141)
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -31,16 +36,15 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         refreshBtn.addTarget(self, action: #selector(onRefresh), for: .touchUpInside)
         addSubview(refreshBtn)
 
-        countLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        countLabel.textColor = idleText
-        countLabel.adjustsFontSizeToFitWidth = true
-        countLabel.minimumScaleFactor = 0.7
-        countLabel.lineBreakMode = .byTruncatingTail
-        addSubview(countLabel)
-
+        for l in [countLabel, hitLabel, probeLabel] {
+            l.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+            l.textColor = idleText
+            l.adjustsFontSizeToFitWidth = true
+            l.minimumScaleFactor = 0.65
+            l.lineBreakMode = .byTruncatingTail
+            addSubview(l)
+        }
         hitLabel.font = .monospacedSystemFont(ofSize: 11, weight: .medium)
-        hitLabel.textColor = mainText
-        addSubview(hitLabel)
 
         table.dataSource = self
         table.delegate = self
@@ -57,10 +61,12 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     override func layoutSubviews() {
         super.layoutSubviews()
         let w = bounds.width
-        refreshBtn.frame = CGRect(x: w - 62, y: 0, width: 56, height: headerH)
-        countLabel.frame = CGRect(x: 0, y: 2, width: w - 66, height: 14)
-        hitLabel.frame = CGRect(x: 0, y: 17, width: w - 66, height: 14)
-        table.frame = CGRect(x: 0, y: headerH, width: w, height: max(0, bounds.height - headerH))
+        refreshBtn.frame = CGRect(x: w - 62, y: 0, width: 56, height: 28)
+        countLabel.frame = CGRect(x: 0, y: 0, width: w - 66, height: 14)
+        hitLabel.frame = CGRect(x: 0, y: 15, width: w - 66, height: 14)
+        probeLabel.frame = CGRect(x: 0, y: 30, width: w, height: 14)
+        table.frame = CGRect(x: 0, y: headerH, width: w,
+                             height: max(0, bounds.height - headerH))
     }
 
     /// 进入这一页时调用：重扫一遍。
@@ -77,14 +83,25 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         let exactCount = entries.filter { $0.exact }.count
         let looseCount = entries.filter { $0.matched && !$0.exact }.count
         countLabel.text = "共 \(total) · 精确\(exactCount) · 疑似\(looseCount) · \(ProcessScanner.channelSummary)"
+
         if let pid = hit {
             hitLabel.text = "game pid = \(pid)  确认"
             hitLabel.textColor = accent
+            runProbe(pid: pid)
         } else {
             hitLabel.text = "game pid = 未找到"
-            hitLabel.textColor = UIColor.hex(0xB04141)
+            hitLabel.textColor = warnText
+            probeLabel.text = "task_for_pid: 等待命中进程"
+            probeLabel.textColor = idleText
         }
         table.reloadData()
+    }
+
+    /// 探针：dlsym task_for_pid → 取端口 → 枚举区 + 读头部。
+    private func runProbe(pid: Int32) {
+        let r = probe.probe(pid: pid)
+        probeLabel.text = r.summary
+        probeLabel.textColor = r.ok ? accent : warnText
     }
 
     // MARK: - Table
