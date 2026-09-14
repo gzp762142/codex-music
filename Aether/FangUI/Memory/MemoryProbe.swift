@@ -248,68 +248,76 @@ final class MemoryProbe {
         return "区域归属: 0x\(String(addr, radix: 16)) → \(short) \(isGame ? "是游戏映像" : "不是游戏")"
     }
 
+    /// 找基址：**完全不读内存**，用 proc_regionfilename 二分。
+    ///
+    /// 原理：把地址喂给 proc_regionfilename，它回答"这个地址属于哪个文件"。
+    /// 同一个映像区域内所有地址返回同一路径，跨出区域就变了。
+    /// 于是二分就能逼近区域起点 —— 而 __TEXT 段的起点就是 image base。
+    ///
+    /// 为什么不用扫描：实测读内存超过几千页游戏必崩（64MB 与 32KB 都崩），
+    /// 而本方法一次内存都不读，只用那个已验证稳定（从不引发崩溃）的 API。
+    ///
+    /// 约 15 次调用收敛，远低于任何危险量级。
     static func stepFindBase(pid: Int32) -> String {
         let off = Offsets.load()
-        let (kr, p) = port(for: pid)
-        guard kr == KERN_SUCCESS, p != 0 else { return "找村口: 取端口失败 \(describe(kr))" }
+        guard let fn = procRegionFileNameFn else {
+            return "找基址: proc_regionfilename 符号缺失"
+        }
 
+        // 查某个地址属于哪个文件（返回归一化路径，失败返回 nil）
+        func fileAt(_ addr: UInt64) -> String? {
+            var buf = [CChar](repeating: 0, count: 1024)
+            let cap = UInt32(buf.count)
+            let n = buf.withUnsafeMutableBytes { raw -> Int32 in
+                guard let base = raw.baseAddress else { return 0 }
+                return fn(pid, addr, base, cap)
+            }
+            guard n > 0 else { return nil }
+            return String(cString: buf)
+        }
+
+        // 先用 dump 基址拿基准文件名 —— 这一句已验证过会返回游戏路径
+        guard let refPath = fileAt(off.moduleBase), refPath.lowercased().contains("shadowtracker") else {
+            return "找基址: 0x\(String(off.moduleBase, radix: 16)) 不属于游戏映像（基准失败）"
+        }
+
+        // 二分：找该区域的起始地址。
+        // lo 取一个确定不属于该区域的下界（dump 里 PAGEZERO 段未映射）
+        var lo: UInt64 = 0x100000000
+        var hi: UInt64 = off.moduleBase
+        var calls = 1
+
+        // 若 lo 竟然也属于同一文件，说明区域更大，先把下界往外推
+        var guardCount = 0
+        while let p2 = fileAt(lo), p2 == refPath, guardCount < 8 {
+            hi = lo
+            lo = (lo > 0x4000000) ? (lo - 0x4000000) : 0
+            guardCount += 1
+            calls += 1
+        }
+
+        // 精度用 4KB：dump 的 __TEXT 起点 0x1047D0000 是 4KB 对齐而非 16KB
+        // （0x1047D0000 & 0xFFFF = 0xD000），用 16KB 会错过真实边界。
+        let page: UInt64 = 0x1000
+        while hi > lo + page {
+            let mid = lo + (hi - lo) / 2
+            calls += 1
+            if let p3 = fileAt(mid), p3 == refPath {
+                hi = mid
+            } else {
+                lo = mid
+            }
+        }
+
+        // hi 是该区域内已知的最低地址；再往下探一页确认
+        let below = (hi > page) ? (hi - page) : 0
+        let belowSame = (fileAt(below) == refPath)
+        calls += 1
+
+        let base = belowSame ? below : hi
         let dumpBase = off.moduleBase
-        let page: UInt64 = 0x4000              // 16KB：iOS arm64 常用页大小
-        let objectsOff = off.gObjects - dumpBase
-        let namesOff = off.gNames - dumpBase
-        let expectedDelta: UInt64 = 0x117597F90 - 0x115A21B00
-
-        // 先在 dump 基址上诊断，看两个全局量分别是什么
-        // （比直接扫有用：如果这里就能看出哪个不对，就不用扫）
-        var diag = ""
-        do {
-            let (r1, g) = readRaw(port: p, address: MachVmAddress(dumpBase + objectsOff))
-            let (r2, n) = readRaw(port: p, address: MachVmAddress(dumpBase + namesOff))
-            let inDump = { (v: UInt64) -> Bool in v >= 0x1000000000 && v < 0x1400000000 }
-            let gOk = (r1 == KERN_SUCCESS) && inDump(g)
-            let nOk = (r2 == KERN_SUCCESS) && inDump(n)
-            diag = " [dump基址: GObj\(gOk ? "内" : "外") GName\(nOk ? "内" : "外")]"
-        }
-
-        // 逐轮向外扩，**每轮只扫新增的环带**，不重复也不越界。
-        // 上一版把"累计半径"写进了循环条件，低侧会从 dumpBase 一路减到接近 0，
-        // 白读 6.5 万次 —— 那正是"扫太多把游戏搞崩"的量级。
-        let ringStep: UInt64 = 0x100000        // 每轮外扩 1MB
-        var scanned = 0
-        var lastWhy = ""
-        for ring in 1...16 {                   // 最多 ±16MB
-            let inner = ringStep * UInt64(ring - 1)
-            let outer = ringStep * UInt64(ring)
-
-            // 低侧环带：[dumpBase-outer, dumpBase-inner)
-            var off2 = inner
-            while off2 < outer {
-                let a = dumpBase - off2
-                if a < page { break }
-                let (hit, why) = probeBase(port: p, base: a, objectsOff: objectsOff,
-                                           namesOff: namesOff, expectedDelta: expectedDelta)
-                if let h = hit {
-                    return "找村口: 命中 0x\(String(h, radix: 16)) 扫\(scanned)页 \(why)" + diag
-                }
-                lastWhy = why
-                off2 += page
-                scanned += 1
-            }
-            // 高侧环带：(dumpBase+inner, dumpBase+outer]
-            var off3 = inner + page
-            while off3 <= outer {
-                let b = dumpBase + off3
-                let (hit, why) = probeBase(port: p, base: b, objectsOff: objectsOff,
-                                           namesOff: namesOff, expectedDelta: expectedDelta)
-                if let h = hit {
-                    return "找村口: 命中 0x\(String(h, radix: 16)) 扫\(scanned)页 \(why)" + diag
-                }
-                lastWhy = why
-                off3 += page
-                scanned += 1
-            }
-        }
-        return "找村口: ±16MB 未命中 扫\(scanned)页 最后原因[\(lastWhy)]" + diag
+        let slide = Int64(bitPattern: base &- dumpBase)
+        return "找基址: base=0x\(String(base, radix: 16)) slide=\(slide >= 0 ? "+" : "")0x\(String(base &- dumpBase, radix: 16)) 调用\(calls)次"
     }
 
     /// 试探一个候选基址 —— 用 dump 里的**多重约束**判据。
