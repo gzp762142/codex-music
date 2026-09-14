@@ -20,6 +20,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     private let countLabel = UILabel()
     private let hitLabel = UILabel()
     private let probeLabel = UILabel()
+    /// trap 编号扫描结果（只在这一行里挤，不动列表高度）
+    private let trapLabel = UILabel()
     private let table = UITableView(frame: .zero, style: .plain)
 
     private let accent = UIColor.hex(0x185EE0)
@@ -36,7 +38,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         refreshBtn.addTarget(self, action: #selector(onRefresh), for: .touchUpInside)
         addSubview(refreshBtn)
 
-        for l in [countLabel, hitLabel, probeLabel] {
+        for l in [countLabel, hitLabel, probeLabel, trapLabel] {
             l.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
             l.textColor = idleText
             l.adjustsFontSizeToFitWidth = true
@@ -64,7 +66,9 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         refreshBtn.frame = CGRect(x: w - 62, y: 0, width: 56, height: 28)
         countLabel.frame = CGRect(x: 0, y: 0, width: w - 66, height: 14)
         hitLabel.frame = CGRect(x: 0, y: 15, width: w - 66, height: 14)
-        probeLabel.frame = CGRect(x: 0, y: 30, width: w, height: 14)
+        // probe / trap 共占一行：左半放结论，右半放 trap 扫号结果
+        probeLabel.frame = CGRect(x: 0, y: 30, width: w / 2, height: 14)
+        trapLabel.frame = CGRect(x: w / 2 + 4, y: 30, width: w / 2 - 4, height: 14)
         table.frame = CGRect(x: 0, y: headerH, width: w,
                              height: max(0, bounds.height - headerH))
     }
@@ -93,6 +97,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
             hitLabel.textColor = warnText
             probeLabel.text = "task_for_pid: 等待命中进程"
             probeLabel.textColor = idleText
+            trapLabel.text = ""
         }
         table.reloadData()
     }
@@ -102,6 +107,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         let r = probe.probe(pid: pid)
         probeLabel.text = r.summary
         probeLabel.textColor = r.ok ? accent : warnText
+        trapLabel.text = r.trapScan
+        trapLabel.textColor = idleText
     }
 
     // MARK: - Table
