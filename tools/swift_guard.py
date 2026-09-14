@@ -216,6 +216,32 @@ def check_duplicate_funcs(path, text):
     return problems
 
 
+def check_tuple_arity(path, text):
+    """核对「返回元组的函数」与其解构处的元素个数是否一致。
+
+    编译器只在解构处报错，改起来要等一轮 CI。
+    这一路已经踩过：readPointer 返回 4 个元素，三处按 2 个解构。
+    """
+    problems = []
+    # 函数名 -> 返回元组元素数
+    arity = {}
+    for m in re.finditer(r"func\s+(\w+)\s*\([^)]*\)[^{]*?->\s*\(([^)]*)\)", text, re.S):
+        fields = [f for f in m.group(2).split(",") if f.strip()]
+        if len(fields) > 1:
+            arity[m.group(1)] = len(fields)
+    # 解构处
+    for n, line in enumerate(text.split("\n"), 1):
+        dm = re.search(r"let\s*\(([^)]*)\)\s*=\s*(\w+)\s*\(", line)
+        if not dm:
+            continue
+        names = [x.strip() for x in dm.group(1).split(",") if x.strip()]
+        fn = dm.group(2)
+        if fn in arity and len(names) != arity[fn]:
+            problems.append(f"{path}:{n}  {fn}(...) 返回 {arity[fn]} 个值，"
+                            f"这里按 {len(names)} 个解构")
+    return problems
+
+
 def main():
     all_problems = []
     files = []
@@ -235,6 +261,7 @@ def main():
         all_problems += check_file(f)
         all_problems += check_api_usage(f, body, static_members)
         all_problems += check_duplicate_funcs(f, body)
+        all_problems += check_tuple_arity(f, body)
 
     if all_problems:
         print("发现问题：")

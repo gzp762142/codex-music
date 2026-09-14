@@ -101,19 +101,26 @@ final class MemoryProbe {
         return (KERN_SUCCESS, v)
     }
 
-    /// 按绝对地址读 8 字节，并按指针解读。
-    private static func readPointer(port: MachPort, address: MachVmAddress)
-        -> (KernReturn, UInt64, Bool, String) {
+    /// 按绝对地址读 8 字节 —— 只给值，供程序判断用。
+    private static func readRaw(port: MachPort, address: MachVmAddress) -> (KernReturn, UInt64) {
         guard let vmRead = vmReadFn else { return (KERN_FAILURE, 0, false, "n/a") }
         var dataPtr: UInt = 0
         var dataLen: MachVmSize = 8
         let kr = vmRead(port, address, 8, &dataPtr, &dataLen)
-        guard kr == KERN_SUCCESS, dataPtr != 0, dataLen >= 8 else { return (kr, 0, false, "n/a") }
+        guard kr == KERN_SUCCESS, dataPtr != 0, dataLen >= 8 else { return (kr, 0) }
         var value: UInt64 = 0
         if let p = UnsafeRawPointer(bitPattern: dataPtr) {
             value = p.load(as: UInt64.self)
         }
         _ = vmDeallocateFn?(port, dataPtr, dataLen)
+        return (KERN_SUCCESS, value)
+    }
+
+    /// 给面板用的指针解读：值 + 是否像有效指针 + 高位（便于看落在哪个地址段）。
+    private static func pointerInfo(port: MachPort, address: MachVmAddress)
+        -> (KernReturn, UInt64, Bool, String) {
+        let (kr, value) = readRaw(port: port, address: address)
+        guard kr == KERN_SUCCESS else { return (kr, 0, false, "n/a") }
         // iOS arm64 用户态地址是 36 位宽
         let looksReal = value >= 0x100000000 && value < 0x10000000000
         let hi = String(format: "%04llx", (value >> 32) & 0xFFFF)
@@ -166,7 +173,7 @@ final class MemoryProbe {
         var values: [String: UInt64] = [:]
         var parts: [String] = []
         for (name, addr) in items {
-            let (rk, value, real, _) = readPointer(port: p, address: MachVmAddress(addr))
+            let (rk, value, real, _) = pointerInfo(port: p, address: MachVmAddress(addr))
             if rk != KERN_SUCCESS {
                 parts.append("\(name)=\(describe(rk))")
                 continue
@@ -241,8 +248,8 @@ final class MemoryProbe {
         // （这比直接扫有用 —— 如果这里就能看出是哪个不对，就不用扫）
         var diag = ""
         do {
-            let (r1, g) = readPointer(port: p, address: MachVmAddress(dumpBase + objectsOff))
-            let (r2, n) = readPointer(port: p, address: MachVmAddress(dumpBase + namesOff))
+            let (r1, g) = readRaw(port: p, address: MachVmAddress(dumpBase + objectsOff))
+            let (r2, n) = readRaw(port: p, address: MachVmAddress(dumpBase + namesOff))
             let gOk = (r1 == KERN_SUCCESS) && g >= lo && g < hi
             let nOk = (r2 == KERN_SUCCESS) && n >= lo && n < hi
             diag = " [dump基址: GObj\(gOk ? "内" : "外") GName\(nOk ? "内" : "外")]"
@@ -296,9 +303,9 @@ final class MemoryProbe {
                                   namesOff: UInt64, expectedDelta: UInt64)
         -> (UInt64?, String) {
 
-        let (rk1, g) = readPointer(port: port, address: MachVmAddress(base + objectsOff))
+        let (rk1, g) = readRaw(port: port, address: MachVmAddress(base + objectsOff))
         guard rk1 == KERN_SUCCESS, g != 0 else { return (nil, "GObjects读失败/\(rk1)") }
-        let (rk2, n) = readPointer(port: port, address: MachVmAddress(base + namesOff))
+        let (rk2, n) = readRaw(port: port, address: MachVmAddress(base + namesOff))
         guard rk2 == KERN_SUCCESS, n != 0 else { return (nil, "GNames读失败/\(rk2)") }
 
         // 条件 1：GNames 落在 dump 地址空间
@@ -312,13 +319,13 @@ final class MemoryProbe {
         guard g >= hs, g < he else { return (nil, "GObj非堆指针") }
 
         // 条件 3：chunk0[0] 必须是 dump 记录的那个对象地址
-        let (rk3, firstObj) = readPointer(port: port, address: MachVmAddress(g))
+        let (rk3, firstObj) = readRaw(port: port, address: MachVmAddress(g))
         guard rk3 == KERN_SUCCESS, firstObj == 0x128370000 else {
             return (nil, "chunk0[0]≠0x128370000")
         }
 
         // 条件 4：该对象的 vtable 落在模块映像内
-        let (rk4, vtable) = readPointer(port: port, address: MachVmAddress(firstObj))
+        let (rk4, vtable) = readRaw(port: port, address: MachVmAddress(firstObj))
         guard rk4 == KERN_SUCCESS, vtable >= 0x1000000000, vtable < 0x1200000000 else {
             return (nil, "vtable越域")
         }
