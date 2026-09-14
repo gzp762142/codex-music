@@ -33,6 +33,9 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
 
         countLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         countLabel.textColor = idleText
+        countLabel.adjustsFontSizeToFitWidth = true
+        countLabel.minimumScaleFactor = 0.7
+        countLabel.lineBreakMode = .byTruncatingTail
         addSubview(countLabel)
 
         hitLabel.font = .monospacedSystemFont(ofSize: 11, weight: .medium)
@@ -72,7 +75,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
 
         let total = entries.count
         let matched = entries.filter { $0.matched }.count
-        countLabel.text = "共 \(total) 个进程 · 命中 \(matched)"
+        countLabel.text = "共 \(total) 进程 · 命中 \(matched) · \(ProcessScanner.channelSummary)"
         if let pid = hit {
             hitLabel.text = "game pid = \(pid)"
             hitLabel.textColor = accent
