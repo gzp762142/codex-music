@@ -27,6 +27,11 @@ PATTERNS = [
      "ptrace —— 有副作用，不要为了试探而调用"),
     (r"(?:scanMachTrap|trapScan|syscallCandidates)",
      "mach trap 编号扫描 —— 未知编号的调用会杀掉进程"),
+    # 只抓「直接把 baseAddress 当值用」的写法：
+    #   bad : f(buf.baseAddress)      /  return buf.baseAddress
+    #   ok  : let p = buf.baseAddress /  buf.baseAddress! / buf.baseAddress ??
+    # 上一版没排除 let 绑定，把 guard let ... = buf.baseAddress 这种正确写法
+    # 也报了，属于自检自己误报。
 ]
 
 # internal 可见的函数签名里出现私有类型别名：Swift 报
@@ -50,6 +55,31 @@ def strip_comments_and_strings(text):
     return text
 
 
+def check_optional_baseaddress(path, text):
+    """withUnsafe…Bytes 的 baseAddress 是 UnsafeMutableRawPointer?，
+    直接当非可选参数用会编译失败。
+
+    判断不靠正则上下文（试过两版 lookbehind，不等长/位置关系都出错），
+    就直接看这一行：
+      前后有 let           -> 解包或绑定，合法
+      后面跟 ! ? ??        -> 已解包，合法
+      其余                 -> 报
+    """
+    problems = []
+    for n, line in enumerate(text.split("\n"), 1):
+        if "baseAddress" not in line:
+            continue
+        i = line.index("baseAddress")
+        before = line[max(0, i - 30):i]
+        after = line[i + len("baseAddress"):]
+        if "let" in before:
+            continue
+        if after.lstrip().startswith(("!", "?", "??")):
+            continue
+        problems.append(f"{path}:{n}  baseAddress 是可选类型，必须解包后再传")
+    return problems
+
+
 def check_file(path):
     problems = []
     raw = open(path, encoding="utf-8", newline="").read()
@@ -60,6 +90,8 @@ def check_file(path):
         for m in re.finditer(tex, text):
             line = text[:m.start()].count("\n") + 1
             problems.append(f"{path}:{line}  {why}")
+
+    problems += check_optional_baseaddress(path, text)
 
     priv = set(PRIVATE_TYPE_RE.findall(text))
     if priv:

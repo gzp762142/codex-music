@@ -198,8 +198,10 @@ final class ProcessScanner {
         let maxCount = 4096
         var pids = [Int32](repeating: 0, count: maxCount)
         let byteCount = pids.withUnsafeMutableBytes { buf -> Int32 in
-            fn(UInt32(Self.PROC_ALL_PIDS), 0, buf.baseAddress,
-               Int32(maxCount * MemoryLayout<Int32>.size))
+            // 函数指针签名里这个参数是可选的，但显式解包更清楚
+            guard let base = buf.baseAddress else { return 0 }
+            return fn(UInt32(Self.PROC_ALL_PIDS), 0, base,
+                      Int32(maxCount * MemoryLayout<Int32>.size))
         }
         guard byteCount > 0 else { return [] }
         let n = Int(byteCount) / MemoryLayout<Int32>.size
@@ -211,7 +213,8 @@ final class ProcessScanner {
         guard let fn = Self.procPidPathPtr else { return nil }
         var buffer = [CChar](repeating: 0, count: Self.PIDPATH_MAXSIZE)
         let n = buffer.withUnsafeMutableBytes { buf -> Int32 in
-            fn(pid, buf.baseAddress, UInt32(Self.PIDPATH_MAXSIZE))
+            guard let base = buf.baseAddress else { return 0 }
+            return fn(pid, base, UInt32(Self.PIDPATH_MAXSIZE))
         }
         guard n > 0 else { return nil }
         let path = String(cString: buffer)

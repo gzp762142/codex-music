@@ -104,7 +104,9 @@ final class MemoryProbe {
         var info = [Int32](repeating: 0, count: 32)
         var words = count
         let kr = info.withUnsafeMutableBytes { buf -> KernReturn in
-            vmRegion(port, &address, &size, flavor, buf.baseAddress, &words)
+            // buf.baseAddress 是可选，必须解包后才能当非可选参数传
+            guard let infoPtr = buf.baseAddress else { return KERN_FAILURE }
+            return vmRegion(port, &address, &size, flavor, infoPtr, &words)
         }
         return (kr, address, size)
     }
@@ -133,7 +135,8 @@ final class MemoryProbe {
             var info = [Int32](repeating: 0, count: 32)
             var words = cnt
             let kr = info.withUnsafeMutableBytes { buf -> KernReturn in
-                vmRegion(port, &address, &size, flavor, buf.baseAddress, &words)
+                guard let infoPtr = buf.baseAddress else { return KERN_FAILURE }
+                return vmRegion(port, &address, &size, flavor, infoPtr, &words)
             }
             lines.append("\(name)=\(kr)")
         }
