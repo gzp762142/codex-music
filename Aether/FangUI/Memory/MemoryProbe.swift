@@ -113,9 +113,11 @@ final class MemoryProbe {
             value = p.load(as: UInt64.self)
         }
         _ = Self.vmDeallocateFn?(port, dataPtr, dataLen)
-        // arm64 用户态堆指针的高 16 位通常非零（0x00000001xxxx 或 0x0000001xxxxx）
-        let looksReal = value != 0 && (value >> 48) != 0
-        let hi = String(format: "%04llx", (value >> 48) & 0xFFFF)
+        // iOS arm64 用户态地址是 36 位宽（0x1_0000_0000 ~ 0x100_0000_0000）。
+        // 上一版用「高 16 位非零」判断 —— 太窄：0x0001xxxxxxxx 这种正常堆地址
+        // 高 16 位是 0x0001，非零没错，但 0x0000_1xxx_xxxx 就会被误判成异常。
+        let looksReal = value >= 0x100000000 && value < 0x10000000000
+        let hi = String(format: "%04llx", (value >> 32) & 0xFFFF)
         return (KERN_SUCCESS, value, looksReal, hi)
     }
 
