@@ -113,12 +113,45 @@ def check_file(path):
     return problems
 
 
+def check_api_usage(path, text, static_members):
+    """跨文件核对：把 static 成员当实例成员调用会编译失败。
+
+    上一轮就是这样连错三处（stepSymbols/stepDlsym/stepReadProof 都改成了
+    static，但调用点还是 obj.method()），所以加这条机器检查。
+    """
+    problems = []
+    for n, line in enumerate(text.split("\n"), 1):
+        for m in re.finditer(r"\b(\w+)\.(\w+)\(", line):
+            obj, member = m.group(1), m.group(2)
+            # 只有「小写开头的对象名」才是实例；大写开头是类名，
+            # UIColor.hex() 这种类名调 static 完全合法。
+            # 第一版没排除这一点，把 UIColor/PanelOrientation 全报了。
+            # 单字符对象名（p / v / q）多为安全指针等系统类型，其成员不是本项目的
+            # static；p.load(...) 就是 UnsafeRawPointer 的方法，报它是误报。
+            if (member in static_members and obj[:1].islower()
+                    and obj != "self" and len(obj) > 1):
+                problems.append(f"{path}:{n}  对 static 成员用了实例调用：{obj}.{member}(...)"
+                                f" —— 改成 ClassName.{member}(...)")
+    return problems
+
+
 def main():
     all_problems = []
-    for base, _, files in os.walk(ROOT):
-        for f in files:
+    files = []
+    for base, _, names in os.walk(ROOT):
+        for f in names:
             if f.endswith(".swift"):
-                all_problems += check_file(os.path.join(base, f))
+                files.append(os.path.join(base, f))
+
+    # 全仓收集 static 成员名（用于跨文件核对调用方式）
+    static_members = set()
+    for f in files:
+        src = open(f, encoding="utf-8", newline="").read()
+        static_members |= set(re.findall(r"static (?:func|var|let) (\w+)", src))
+
+    for f in files:
+        all_problems += check_file(f)
+        all_problems += check_api_usage(f, open(f, encoding="utf-8", newline="").read(), static_members)
 
     if all_problems:
         print("发现问题：")

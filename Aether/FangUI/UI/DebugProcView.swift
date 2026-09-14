@@ -144,13 +144,13 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
 
     @objc private func onDlsym() {
         guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
-        probeLabel.text = probe.stepDlsym(pid: gpid)
+        probeLabel.text = MemoryProbe.stepDlsym(pid: gpid)
         probeLabel.textColor = accent
     }
 
     @objc private func onProof() {
         guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
-        probeLabel.text = probe.stepReadProof(pid: gpid)
+        probeLabel.text = MemoryProbe.stepReadProof(pid: gpid)
         probeLabel.textColor = accent
     }
 
