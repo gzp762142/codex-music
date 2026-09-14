@@ -53,7 +53,7 @@ final class MemoryProbe {
     }
 
     /// 把 kern_return_t 翻成人和自己能读懂的话。
-    static func describe(_ kr: KernReturn) -> String {
+    private static func describe(_ kr: KernReturn) -> String {
         switch kr {
         case KERN_SUCCESS: return "成功"
         case KERN_FAILURE: return "权限被挡 (KERN_FAILURE)"
