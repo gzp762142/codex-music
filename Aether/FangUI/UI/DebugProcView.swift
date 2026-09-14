@@ -20,8 +20,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     private let countLabel = UILabel()
     private let hitLabel = UILabel()
     private let probeLabel = UILabel()
-    /// trap 编号扫描结果（只在这一行里挤，不动列表高度）
-    private let trapLabel = UILabel()
+    /// 崩溃记录（贴在 hit 行右侧，不额外占高度）
+    private let crashLabel = UILabel()
     private let table = UITableView(frame: .zero, style: .plain)
 
     private let accent = UIColor.hex(0x185EE0)
@@ -38,7 +38,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         refreshBtn.addTarget(self, action: #selector(onRefresh), for: .touchUpInside)
         addSubview(refreshBtn)
 
-        for l in [countLabel, hitLabel, probeLabel, trapLabel] {
+        for l in [countLabel, hitLabel, probeLabel, crashLabel] {
             l.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
             l.textColor = idleText
             l.adjustsFontSizeToFitWidth = true
@@ -66,9 +66,9 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         refreshBtn.frame = CGRect(x: w - 62, y: 0, width: 56, height: 28)
         countLabel.frame = CGRect(x: 0, y: 0, width: w - 66, height: 14)
         hitLabel.frame = CGRect(x: 0, y: 15, width: w - 66, height: 14)
-        // probe / trap 共占一行：左半放结论，右半放 trap 扫号结果
-        probeLabel.frame = CGRect(x: 0, y: 30, width: w / 2, height: 14)
-        trapLabel.frame = CGRect(x: w / 2 + 4, y: 30, width: w / 2 - 4, height: 14)
+        // 第三行：左半结论，右半 syscall 候选号返回码
+        probeLabel.frame = CGRect(x: 0, y: 30, width: w * 0.62, height: 14)
+        crashLabel.frame = CGRect(x: w * 0.64, y: 30, width: w * 0.36, height: 14)
         table.frame = CGRect(x: 0, y: headerH, width: w,
                              height: max(0, bounds.height - headerH))
     }
@@ -97,9 +97,15 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
             hitLabel.textColor = warnText
             probeLabel.text = "task_for_pid: 等待命中进程"
             probeLabel.textColor = idleText
-            trapLabel.text = ""
+            crashLabel.text = ""
         }
         table.reloadData()
+    }
+
+    /// 清掉崩溃记录（调试页右上角长按用；也可由外部调用）。
+    func clearCrashLog() {
+        CrashCatcher.clear()
+        crashLabel.text = ""
     }
 
     /// 探针：dlsym task_for_pid → 取端口 → 枚举区 + 读头部。
@@ -107,8 +113,15 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         let r = probe.probe(pid: pid)
         probeLabel.text = r.summary
         probeLabel.textColor = r.ok ? accent : warnText
-        trapLabel.text = r.trapScan
-        trapLabel.textColor = idleText
+        // 崩过就先显示崩溃原因，否则显示 syscall 候选号的返回码
+        if let crash = CrashCatcher.lastCrash() {
+            let firstLine = crash.split(separator: "\n").prefix(2).joined(separator: " ")
+            crashLabel.text = "崩溃: " + firstLine
+            crashLabel.textColor = warnText
+        } else {
+            crashLabel.text = r.numberNote
+            crashLabel.textColor = idleText
+        }
     }
 
     // MARK: - Table

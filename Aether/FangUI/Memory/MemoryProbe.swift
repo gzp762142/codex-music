@@ -3,34 +3,32 @@ import Darwin
 
 /// 读内存探针：**只读**，不写、不 hook、不注入。
 ///
-/// 目标是把「能不能读到游戏内存」变成面板上的可见结果，分三条通道试：
-///   A. dlsym 取 libSystem 的 `task_for_pid`，直接调用
-///   B. syscall 直调内核（绕过用户态 hook；若挡人的是内核，结果会一致）
-///   C. 拿到端口后确实读一次内存（`mach_vm_region` + `mach_vm_read`），
-///      用读回的 Mach-O magic 作为证据 —— 端口号本身证明不了任何事
+/// 两条通道，都只碰「明确知道用途」的调用：
+///   A. dlsym 取 libSystem 的 `task_for_pid`
+///   B. syscall 直调同一个调用（绕过可能的用户态 hook）
+/// 拿到端口后确实读一次内存（`mach_vm_region` + `mach_vm_read`），
+/// 用读回的 Mach-O magic 作为「真的读到了它的内存」的证据。
 ///
-/// mach trap 编号不靠记忆：`syscall` 在编号不存在时返回 ENOSYS(-78)，
-/// 所以扫描一段编号，返回码不是 ENOSYS 的那个才是真号。
-/// 另有原生命令可对照：`sudo dtrace -n 'syscall::-1:entry'`（需 dtrace 权限）。
+/// **不要在这个文件里扫 mach trap 编号。** 上一版做过：在 20…43 区间逐个
+/// `syscall(N, ...)` 试探，其中有些编号不是安全的只读调用（thread_switch /
+/// mach_msg_trap 那一类），实机上点一下设置就直接闪退。
+/// 编号只能一次试一个明确的候选，试之前先想清楚它是什么调用。
 final class MemoryProbe {
 
     struct Result {
-        /// A：dlsym 是否解析到 task_for_pid
         let symbolFound: Bool
-        /// A：调用返回码
+        /// A：libSystem 调用返回码
         let symbolReturn: Int32
-        /// B：syscall 直调返回码；-78 = ENOSYS 表示 trap 号不存在
+        /// B：syscall 直调返回码；Int32.min = 未执行
         let syscallReturn: Int32
-        /// B：实际使用的 trap 号
+        /// B 用的 syscall 号
         let syscallNumber: Int32
-        /// 端口（两条通道合起来看，谁成功算谁的）
         let taskPort: UInt32
         let regionCount: Int
         let headMagic: UInt32
-        /// 面板上直接显示的结论行
         let summary: String
-        /// mach trap 编号扫描结果（面板显示的诊断行）
-        let trapScan: String
+        /// 编号判定说明（面板第二栏）
+        let numberNote: String
         let ok: Bool
     }
 
@@ -40,17 +38,21 @@ final class MemoryProbe {
     private typealias MachVmSize = UInt64
 
     private typealias TaskForPidFn = @convention(c) (MachPort, Int32, UnsafeMutablePointer<MachPort>) -> KernReturn
-    /// syscall 的变参在 arm64 上同样走 x0..x7，所以固定 4 参签名可以调用；
-    /// mach trap 第 4 个参数用不上，但为了对齐寄存器仍要传。
+    /// syscall 的变参在 arm64 上同样走 x0..x7，所以固定 4 参签名可以调用。
     private typealias SyscallFn = @convention(c) (Int32, Int32, UInt32, UnsafeMutablePointer<UInt32>) -> Int32
     private typealias VmRegionFn = @convention(c) (MachPort, UnsafeMutablePointer<MachVmAddress>,
                                                    UnsafeMutablePointer<MachVmSize>, Int32,
                                                    UnsafeMutablePointer<Int32>,
                                                    UnsafeMutablePointer<UInt32>) -> KernReturn
-    /// out 参数用 UInt 而不是 UInt64：Swift 里 vm_offset_t 是 UInt 的别名。
+    /// out 参数用 UInt：Swift 里 vm_offset_t 是 UInt 的别名。
     private typealias VmReadFn = @convention(c) (MachPort, MachVmAddress, MachVmSize,
                                                  UnsafeMutablePointer<UInt>,
                                                  UnsafeMutablePointer<MachVmSize>) -> KernReturn
+
+    /// syscall 号候选。**每个都必须是自己确认过含义的号，绝不做区间遍历。**
+    /// 45 = BSD syscall 表里的 SYS_task_for_pid
+    /// 26 = 部分资料引用的 mach trap 号
+    static let syscallCandidates: [Int32] = [45, 26]
 
     private static func symbol<T>(_ name: String, as: T.Type) -> T? {
         guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), name) else { return nil }
@@ -62,10 +64,6 @@ final class MemoryProbe {
     private static let vmRegionFn = symbol("mach_vm_region", as: VmRegionFn.self)
     private static let vmReadFn = symbol("mach_vm_read", as: VmReadFn.self)
 
-    /// mach trap 编号比 BSD syscall 表更早，但不同 XNU 版本有出入，
-    /// 所以默认从这个号起扫，扫到不是 ENOSYS 的为止。
-    private static let trapScanStart: Int32 = 20
-    private static let trapScanCount = 24
     private static let ENOSYS: Int32 = -78
 
     static var symbolSummary: String {
@@ -84,36 +82,42 @@ final class MemoryProbe {
         // 通道 A：libSystem 符号
         if let taskForPid = Self.taskForPidFn {
             symbolReturn = taskForPid(mach_task_self_, pid, &port)
-        } else {
-            symbolReturn = Int32.min   // 用 Int32.min 表示「符号都没有」
         }
 
-        // 通道 B：只有 A 没成功才试
+        // 通道 B：仅在 A 未成功时，逐个试明确的候选号（不做区间遍历）。
+        // 每个候选都记录返回码：ENOSYS 说明号不对，其它值说明号存在。
         var syscallReturn: Int32 = Int32.min
-        var usedNumber: Int32 = Self.trapScanStart
-        let scanLine = scanMachTrapNumbers()
+        var candidate: Int32 = 0
+        var numberNote = "B 未执行（A 已成功或 syscall 符号缺失）"
         if port == 0, let sc = Self.syscallFn {
-            let numbers = scanLine.numbers
-            for n in numbers {
+            var notes: [String] = []
+            for n in Self.syscallCandidates {
                 var p: MachPort = 0
-                let kr = sc(n, Int32(bitPattern: mach_task_self_), UInt32(bitPattern: pid), &p)
+                let kr = sc(n, Int32(bitPattern: mach_task_self_),
+                            UInt32(bitPattern: pid), &p)
+                if candidate == 0 { candidate = n }
                 syscallReturn = kr
-                usedNumber = n
                 if kr == KERN_SUCCESS, p != 0 {
                     port = p
+                    candidate = n
+                    notes.append("\(n)=成功")
                     break
+                } else if kr == Self.ENOSYS {
+                    notes.append("\(n)=ENOSYS")
+                } else {
+                    notes.append("\(n)=ret\(kr)")
                 }
             }
+            numberNote = "B " + notes.joined(separator: " ")
         }
 
-        let scanText = scanLine.text
         if port == 0 {
             let a = symbolReturn == Int32.min ? "符号缺失" : "ret=\(symbolReturn)"
-            let b = syscallReturn == Int32.min ? "未执行" : "trap\(usedNumber) ret=\(syscallReturn)"
+            let b = syscallReturn == Int32.min ? "未执行" : "ret=\(syscallReturn)"
             return Result(symbolFound: symbolReturn != Int32.min, symbolReturn: symbolReturn,
-                          syscallReturn: syscallReturn, syscallNumber: usedNumber,
+                          syscallReturn: syscallReturn, syscallNumber: candidate,
                           taskPort: 0, regionCount: 0, headMagic: 0,
-                          summary: "取端口失败：A[\(a)] B[\(b)]", trapScan: scanText,
+                          summary: "取端口失败：A[\(a)] B[\(b)]", numberNote: numberNote,
                           ok: false)
         }
 
@@ -121,30 +125,9 @@ final class MemoryProbe {
         let via = (symbolReturn == KERN_SUCCESS) ? "A:dlsym" : "B:syscall"
         let summary = "读通 \(via) · port=0x\(String(port, radix: 16)) · 区=\(regionCount) · head=0x\(String(magic, radix: 16))"
         return Result(symbolFound: true, symbolReturn: symbolReturn,
-                      syscallReturn: syscallReturn, syscallNumber: usedNumber,
+                      syscallReturn: syscallReturn, syscallNumber: candidate,
                       taskPort: port, regionCount: regionCount, headMagic: magic,
-                      summary: summary, trapScan: scanText, ok: true)
-    }
-
-    /// 扫一段 mach trap 编号：ENOSYS 之外的返回码说明这个号存在。
-    /// 用 pid 0（不可能存在的进程）探号，避免对真实进程反复试。
-    private func scanMachTrapNumbers() -> (text: String, numbers: [Int32]) {
-        guard let sc = Self.syscallFn else { return ("syscall 符号缺失，无法扫号", []) }
-        var hits: [Int32] = []
-        var detail: [String] = []
-        for i in 0..<Self.trapScanCount {
-            let n = Self.trapScanStart + Int32(i)
-            var dummy: MachPort = 0
-            let kr = sc(n, Int32(bitPattern: mach_task_self_), 0, &dummy)
-            if kr != Self.ENOSYS {
-                hits.append(n)
-                detail.append("\(n)=\(kr)")
-            }
-        }
-        if hits.isEmpty {
-            return ("trap 扫描 \(Self.trapScanStart)…\(Self.trapScanStart + Int32(Self.trapScanCount) - 1)：全部 ENOSYS", [])
-        }
-        return ("trap 命中 " + detail.joined(separator: " "), hits)
+                      summary: summary, numberNote: numberNote, ok: true)
     }
 
     /// 枚举第一块区并读前 4 字节。

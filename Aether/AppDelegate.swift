@@ -8,6 +8,9 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
+        // 装崩溃捕获：闪退原因写盘，下次进面板能直接读到
+        CrashCatcher.install()
+
         // FangUI 关闭按钮 → 控制台「关闭」→ 自动收起菜单
         FangUIBridge.setPowerCallback { [weak self] on in
             self?.state.setPower(on)
