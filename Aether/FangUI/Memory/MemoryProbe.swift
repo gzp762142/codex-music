@@ -36,6 +36,23 @@ final class MemoryProbe {
     }
 
     private static let taskForPidFn = symbol("task_for_pid", as: TaskForPidFn.self)
+    /// vm_region_recurse_64：枚举目标地址空间里的 region（**不读内存内容**）。
+    ///
+    /// 比 mach_vm_region 少一个 flavor 参数、多一个 nesting_depth，
+    /// info 是 vm_region_submap_info_64（19 个字）。
+    /// 注意：mach_vm_region 因为在它上面配错过参数（count=0 / info 指针类型），
+    /// 连崩两次，所以这里在真正枚举目标之前**先对自己进程枚举一次**做参数自检。
+    private typealias VmRegionRecurseFn = @convention(c) (
+        UInt32,                              // task
+        UnsafeMutablePointer<UInt64>,        // &address (in/out)
+        UnsafeMutablePointer<UInt64>,        // &size
+        UnsafeMutablePointer<UInt32>,        // &nesting_depth
+        UnsafeMutableRawPointer,             // info
+        UnsafeMutablePointer<UInt32>         // &infoCnt（字数）
+    ) -> Int32
+
+    private static let vmRegionRecurseFn = symbol("vm_region_recurse_64", as: VmRegionRecurseFn.self)
+
     /// proc_regionfilename：问「这个地址属于哪个文件」。
     /// 只要 pid + 地址，不需要 mach_vm_region —— 正好绕开那个我连错两次的调用。
     /// iOS 无 <libproc.h>，符号同样只能 dlsym 取。
@@ -248,76 +265,97 @@ final class MemoryProbe {
         return "区域归属: 0x\(String(addr, radix: 16)) → \(short) \(isGame ? "是游戏映像" : "不是游戏")"
     }
 
-    /// 找基址：**完全不读内存**，用 proc_regionfilename 二分。
+    // MARK: - 找基址（枚举 region，零内存读取）
+
+    /// 枚举下一个 region。会把 addr 更新为该 region 的实际起始。
+    /// 返回 (成功, size, protection, 文件偏移)
+    private static func nextRegion(task: UInt32, addr: inout UInt64)
+        -> (ok: Bool, size: UInt64, prot: Int32, offset: UInt32) {
+        guard let fn = vmRegionRecurseFn else { return (false, 0, 0, 0) }
+        var size: UInt64 = 0
+        var depth: UInt32 = 0
+        var info = [Int32](repeating: 0, count: 32)
+        var count: UInt32 = 19          // VM_REGION_SUBMAP_INFO_COUNT_64
+        let kr = info.withUnsafeMutableBytes { buf -> Int32 in
+            guard let base = buf.baseAddress else { return KERN_FAILURE }
+            return fn(task, &addr, &size, &depth, base, &count)
+        }
+        guard kr == KERN_SUCCESS, size > 0 else { return (false, 0, 0, 0) }
+        // vm_region_submap_info_64 开头四个字：protection, max_protection, inheritance, offset
+        return (true, size, info[0], UInt32(bitPattern: info[3]))
+    }
+
+    /// 问某地址属于哪个文件（proc_regionfilename 封装）
+    private static func regionFile(pid: Int32, addr: UInt64) -> String? {
+        guard let fn = procRegionFileNameFn else { return nil }
+        var buf = [CChar](repeating: 0, count: 1024)
+        let cap = UInt32(buf.count)
+        let n = buf.withUnsafeMutableBytes { raw -> Int32 in
+            guard let base = raw.baseAddress else { return 0 }
+            return fn(pid, addr, base, cap)
+        }
+        guard n > 0 else { return nil }
+        let s = String(cString: buf)
+        return s.isEmpty ? nil : s
+    }
+
+    /// 找基址（主二进制），**全程不读游戏内存内容**。
     ///
-    /// 原理：把地址喂给 proc_regionfilename，它回答"这个地址属于哪个文件"。
-    /// 同一个映像区域内所有地址返回同一路径，跨出区域就变了。
-    /// 于是二分就能逼近区域起点 —— 而 __TEXT 段的起点就是 image base。
+    /// 判据（三个条件同时成立才认）：
+    ///   1. proc_regionfilename 返回的路径匹配 ShadowTracker
+    ///   2. protection 含 VM_PROT_EXECUTE(0x4)  → 可执行段
+    ///   3. offset == 0                          → 从文件头映射 = Mach-O 头所在段
+    /// 满足这三条的就是 __TEXT 段，它的起始地址 = image base。
     ///
-    /// 为什么不用扫描：实测读内存超过几千页游戏必崩（64MB 与 32KB 都崩），
-    /// 而本方法一次内存都不读，只用那个已验证稳定（从不引发崩溃）的 API。
-    ///
-    /// 约 15 次调用收敛，远低于任何危险量级。
+    /// 为什么不用"二分 proc_regionfilename"：实测它的语义是
+    /// "返回该地址所在或**之后第一个** region" —— 对未映射的低地址也会返回
+    /// 游戏路径，二分因此完全失效（会出现负 slide 这种不可能的结果）。
+    /// 所以必须有 region 边界信息，只能靠枚举。
     static func stepFindBase(pid: Int32) -> String {
-        let off = Offsets.load()
-        guard let fn = procRegionFileNameFn else {
-            return "找基址: proc_regionfilename 符号缺失"
+        guard vmRegionRecurseFn != nil else { return "找基址: vm_region_recurse_64 符号缺失" }
+        guard procRegionFileNameFn != nil else { return "找基址: proc_regionfilename 符号缺失" }
+
+        // ---- 参数自检：先对自己进程枚举一次，参数错就停在这里，绝不碰游戏 ----
+        var selfAddr: UInt64 = 0
+        let selfCheck = nextRegion(task: mach_task_self_, addr: &selfAddr)
+        guard selfCheck.ok else {
+            return "找基址: 参数自检失败（对自己枚举就不成功），未碰游戏"
         }
 
-        // 查某个地址属于哪个文件（返回归一化路径，失败返回 nil）
-        func fileAt(_ addr: UInt64) -> String? {
-            var buf = [CChar](repeating: 0, count: 1024)
-            let cap = UInt32(buf.count)
-            let n = buf.withUnsafeMutableBytes { raw -> Int32 in
-                guard let base = raw.baseAddress else { return 0 }
-                return fn(pid, addr, base, cap)
+        // ---- 拿游戏的 task port ----
+        let (kr, p) = port(for: pid)
+        guard kr == KERN_SUCCESS, p != 0 else {
+            return "找基址: 取端口失败 \(describe(kr))"
+        }
+
+        var addr: UInt64 = 0
+        var scanned = 0
+        var hitBase: UInt64 = 0
+        var hitName = ""
+
+        while scanned < 6000 {
+            let (ok, size, prot, offset) = nextRegion(task: p, addr: &addr)
+            guard ok else { break }
+            scanned += 1
+
+            // 三个条件全中才算 __TEXT
+            if let path = regionFile(pid: pid, addr: addr),
+               path.lowercased().contains("shadowtracker"),
+               (prot & 0x4) != 0,          // VM_PROT_EXECUTE
+               offset == 0 {
+                hitBase = addr
+                hitName = path.split(separator: "/").last.map(String.init) ?? "?"
+                break
             }
-            guard n > 0 else { return nil }
-            return String(cString: buf)
+
+            addr += size
+            if addr < size { break }        // 溢出保护
         }
 
-        // 先用 dump 基址拿基准文件名 —— 这一句已验证过会返回游戏路径
-        guard let refPath = fileAt(off.moduleBase), refPath.lowercased().contains("shadowtracker") else {
-            return "找基址: 0x\(String(off.moduleBase, radix: 16)) 不属于游戏映像（基准失败）"
+        guard hitBase != 0 else {
+            return "找基址: 枚举\(scanned)个region，未命中(__TEXT & offset=0)"
         }
-
-        // 二分：找该区域的起始地址。
-        // lo 取一个确定不属于该区域的下界（dump 里 PAGEZERO 段未映射）
-        var lo: UInt64 = 0x100000000
-        var hi: UInt64 = off.moduleBase
-        var calls = 1
-
-        // 若 lo 竟然也属于同一文件，说明区域更大，先把下界往外推
-        var guardCount = 0
-        while let p2 = fileAt(lo), p2 == refPath, guardCount < 8 {
-            hi = lo
-            lo = (lo > 0x4000000) ? (lo - 0x4000000) : 0
-            guardCount += 1
-            calls += 1
-        }
-
-        // 精度用 4KB：dump 的 __TEXT 起点 0x1047D0000 是 4KB 对齐而非 16KB
-        // （0x1047D0000 & 0xFFFF = 0xD000），用 16KB 会错过真实边界。
-        let page: UInt64 = 0x1000
-        while hi > lo + page {
-            let mid = lo + (hi - lo) / 2
-            calls += 1
-            if let p3 = fileAt(mid), p3 == refPath {
-                hi = mid
-            } else {
-                lo = mid
-            }
-        }
-
-        // hi 是该区域内已知的最低地址；再往下探一页确认
-        let below = (hi > page) ? (hi - page) : 0
-        let belowSame = (fileAt(below) == refPath)
-        calls += 1
-
-        let base = belowSame ? below : hi
-        let dumpBase = off.moduleBase
-        let slide = Int64(bitPattern: base &- dumpBase)
-        return "找基址: base=0x\(String(base, radix: 16)) slide=\(slide >= 0 ? "+" : "")0x\(String(base &- dumpBase, radix: 16)) 调用\(calls)次"
+        return "找基址: base=0x\(String(hitBase, radix: 16)) region=\(scanned) \(hitName)"
     }
 
     /// 试探一个候选基址 —— 用 dump 里的**多重约束**判据。
