@@ -235,11 +235,17 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
             probeLabel.textColor = idleText
             return
         }
-        // 先列全部 .ips（标出游戏/我们自己的），再附上最新一份 Music 的摘要
-        var rows = CrashLogReader.listReports()
+        // 顺序：先列全部 .ips → 再游戏最新崩溃详情（最关键）→ 最后我们自己的
+        var rows = CrashLogReader.listReports(limit: 16)
+        rows.append("")
+        rows.append("══ 游戏最新崩溃 ══")
+        rows.append(contentsOf: CrashLogReader.crashDetail(for: "ShadowTrackerExtra"))
+        rows.append("")
+        rows.append("══ Music 最新崩溃 ══")
         if let s = CrashLogReader.latestSummary() {
-            rows.append("— 最新 Music 崩溃摘要 —")
-            rows.append(contentsOf: s.split(separator: "\n").prefix(3).map(String.init))
+            rows.append(contentsOf: s.split(separator: "\n").prefix(4).map(String.init))
+        } else {
+            rows.append("(无)")
         }
         extraRows = rows
         table.reloadData()

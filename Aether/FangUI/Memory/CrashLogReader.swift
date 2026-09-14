@@ -15,6 +15,100 @@ final class CrashLogReader {
         "/var/mobile/Library/Logs/CrashReporter/Retired"
     ]
 
+    /// 找某个进程最新的**标准崩溃报告**。
+    ///
+    /// 注意排除 `Xxx.wakeups_resource-*.ips` 这类非崩溃报告 ——
+    /// 它们同样以进程名开头，不排除就会把资源统计当成崩溃。
+    /// 区分方式：标准崩溃是 `<name>-<时间>.ips`（连字符），
+    /// 资源类是 `<name>.wakeups_resource-<时间>.ips`（点号分段）。
+    static func latestStandardCrash(prefix: String) -> String? {
+        let fm = FileManager.default
+        var best: (path: String, date: Date)?
+        for dir in dirs {
+            guard let items = try? fm.contentsOfDirectory(atPath: dir) else { continue }
+            for name in items {
+                guard name.hasPrefix(prefix + "-"), name.hasSuffix(".ips") else { continue }
+                let path = dir + "/" + name
+                let d = (try? URL(fileURLWithPath: path)
+                    .resourceValues(forKeys: [.contentModificationDateKey]))?
+                    .contentModificationDate ?? .distantPast
+                if best == nil || d > best!.date { best = (path, d) }
+            }
+        }
+        return best?.path
+    }
+
+    /// 解析崩溃报告的关键字段：终止原因 + 栈顶。
+    /// 这是判定"游戏到底怎么死的"最直接的证据。
+    static func crashDetail(for prefix: String) -> [String] {
+        guard let path = latestStandardCrash(prefix: prefix) else {
+            return ["未找到 " + prefix + " 的标准崩溃报告"]
+        }
+        var rows: [String] = ["file: " + (path as NSString).lastPathComponent]
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else {
+            return rows + ["(读取失败)"]
+        }
+        // .ips：第一行是 header JSON，第二行起是正文 JSON
+        let body: String
+        if let nl = text.firstIndex(of: "\n") {
+            body = String(text[text.index(after: nl)...])
+        } else {
+            body = text
+        }
+        guard let data = body.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return rows + ["(正文 JSON 解析失败)"]
+        }
+
+        // bug_type：109=崩溃，298=jetsam，其它见 Apple 文档
+        if let bt = anyString(root["bug_type"]) { rows.append("bug_type = " + bt) }
+
+        // exception：类型 + 信号
+        if let exc = root["exception"] as? [String: Any] {
+            if let t = anyString(exc["type"]) { rows.append("exception = " + t) }
+            if let s = anyString(exc["signal"]) { rows.append("signal = " + s) }
+            if let c = anyString(exc["codes"]) { rows.append("codes = " + c) }
+        }
+
+        // termination：命名空间 + code + indicator —— 最关键的一行
+        if let term = root["termination"] as? [String: Any] {
+            var s = "termination = "
+            if let ns = anyString(term["namespace"]) { s += ns + " " }
+            if let code = anyString(term["code"]) { s += "code=" + code + " " }
+            if let ind = anyString(term["indicator"]) { s += ind }
+            rows.append(s)
+        } else {
+            rows.append("termination = (无此字段)")
+        }
+
+        // 栈顶
+        if let ft = root["faultingThread"] as? Int,
+           let threads = root["threads"] as? [[String: Any]],
+           ft >= 0, ft < threads.count,
+           let frames = threads[ft]["frames"] as? [[String: Any]] {
+            let images = root["usedImages"] as? [[String: Any]] ?? []
+            rows.append("栈顶 faultingThread=\(ft):")
+            for f in frames.prefix(6) {
+                let sym = (f["symbol"] as? String) ?? ""
+                let off = anyString(f["imageOffset"]) ?? "?"
+                let idx = (f["imageIndex"] as? Int) ?? -1
+                var img = ""
+                if idx >= 0, idx < images.count {
+                    img = (images[idx]["name"] as? String) ?? ""
+                }
+                rows.append("  " + img + " +" + off + " " + sym)
+            }
+        }
+        return rows
+    }
+
+    /// JSON 里的值可能是 String 也可能是 Int，统一成 String
+    private static func anyString(_ v: Any?) -> String? {
+        if let s = v as? String { return s }
+        if let i = v as? Int { return String(i) }
+        return nil
+    }
+
     /// 列出崩溃报告目录里的全部 .ips（按时间倒序），并标出是谁的。
     ///
     /// 为什么需要它：JetsamEvent 里**没有**游戏 → 游戏不是被内存杀的 →
