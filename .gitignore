@@ -7,3 +7,5 @@ xcuserdata/
 *.ipa
 .DS_Store
 Payload/
+__pycache__/
+*.pyc
