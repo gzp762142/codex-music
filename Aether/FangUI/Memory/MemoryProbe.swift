@@ -49,10 +49,12 @@ final class MemoryProbe {
                                                  UnsafeMutablePointer<UInt>,
                                                  UnsafeMutablePointer<MachVmSize>) -> KernReturn
 
-    /// syscall 号候选。**每个都必须是自己确认过含义的号，绝不做区间遍历。**
-    /// 45 = BSD syscall 表里的 SYS_task_for_pid
-    /// 26 = 部分资料引用的 mach trap 号
-    static let syscallCandidates: [Int32] = [45, 26]
+    /// syscall 号候选。**只放确认过含义的号，绝不做区间遍历。**
+    ///
+    /// 45 = task_for_pid 的 mach trap 号（已确认）。
+    /// 26 已移除：那是 ptrace —— 有副作用、会改目标进程状态的调用，
+    /// 为了"试一下"去调它是错的。
+    static let syscallCandidates: [Int32] = [45]
 
     private static func symbol<T>(_ name: String, as: T.Type) -> T? {
         guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), name) else { return nil }
