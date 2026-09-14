@@ -393,12 +393,13 @@ enum FangUIBridge {
         case .portraitUpsideDown: ori = "U"
         default: ori = "P"
         }
-        return String(format: "#w%d sbs%@ lv%d ori%@ %@ · sp %.0f×%.0f · sc %.0f×%.0f · win %.0f×%.0f",
+        return String(format: "#w%d sbs%@ lv%d ori%@ %@ · sp %.0f×%.0f · sc %.0f×%.0f · win %.0f×%.0f · scr %.0f×%.0f",
                       count, sbs, lv, ori,
                       PanelOrientation.describe(),
                       space.width, space.height,
                       sceneSize.width, sceneSize.height,
-                      size.width, size.height)
+                      size.width, size.height,
+                      screen.width, screen.height)
     }
 
     /// 进程内属于我们自己的悬浮窗口数量（正常应为 1）。
