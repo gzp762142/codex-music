@@ -242,6 +242,76 @@ def check_tuple_arity(path, text):
     return problems
 
 
+def check_return_arity(path, text):
+    """核对「函数体内 return 的元组元素数」与「声明的返回类型」是否一致。
+
+    编译器只在出错那一行报，但要等一轮 CI。
+    这一路踩过：readRaw 声明返回 2 元组，函数体里却还留着 4 元组的
+    `return (KERN_FAILURE, 0, false, "n/a")` —— 拆函数时漏改的提前返回。
+
+    用大括号深度界定函数作用域：签名可能跨行（pointerInfo 就是），
+    第一版没做作用域界定，把 pointerInfo 的 return 算到了跨行签名的
+    readRaw 头上，报了误报。
+    """
+    problems = []
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = re.search(r"func\s+(\w+)\s*\(", line)
+        if not m:
+            i += 1
+            continue
+
+        # 多行拼接签名，直到看见 "{"
+        sig = line
+        j = i
+        while "{" not in sig and j + 1 < len(lines) and j - i < 8:
+            j += 1
+            sig += " " + lines[j]
+        rm = re.search(r"->\s*\(([^)]*)\)", sig)
+        if not rm:
+            i = j + 1
+            continue
+        arity = len([f for f in rm.group(1).split(",") if f.strip()])
+        fname = m.group(1)
+
+        # 从 "{ " 起按大括号深度找到函数体结束
+        depth = 0
+        started = False
+        k = j
+        body_end = j
+        while k < len(lines):
+            for ch in lines[k]:
+                if ch == "{":
+                    depth += 1
+                    started = True
+                elif ch == "}":
+                    depth -= 1
+                    if started and depth == 0:
+                        body_end = k
+                        break
+            if started and depth == 0:
+                break
+            k += 1
+
+        # 在函数体内找单行 return (a, b, ...)
+        for ln in range(i, min(body_end + 1, len(lines))):
+            rm2 = re.search(r"\breturn\s*\((.*)\)\s*$", lines[ln].strip())
+            if not rm2:
+                continue
+            body = rm2.group(1).strip()
+            if "(" in body or ")" in body:
+                continue                      # 含调用，跳过避免误判
+            cnt = len([x for x in body.split(",") if x.strip()])
+            if cnt > 1 and cnt != arity:
+                problems.append(f"{path}:{ln + 1}  {fname} 声明返回 {arity} 个值，"
+                                f"这里 return 了 {cnt} 个")
+
+        i = body_end + 1
+    return problems
+
+
 def main():
     all_problems = []
     files = []
@@ -262,6 +332,7 @@ def main():
         all_problems += check_api_usage(f, body, static_members)
         all_problems += check_duplicate_funcs(f, body)
         all_problems += check_tuple_arity(f, body)
+        all_problems += check_return_arity(f, body)
 
     if all_problems:
         print("发现问题：")

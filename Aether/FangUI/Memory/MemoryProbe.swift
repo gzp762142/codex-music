@@ -103,7 +103,7 @@ final class MemoryProbe {
 
     /// 按绝对地址读 8 字节 —— 只给值，供程序判断用。
     private static func readRaw(port: MachPort, address: MachVmAddress) -> (KernReturn, UInt64) {
-        guard let vmRead = vmReadFn else { return (KERN_FAILURE, 0, false, "n/a") }
+        guard let vmRead = vmReadFn else { return (KERN_FAILURE, 0) }
         var dataPtr: UInt = 0
         var dataLen: MachVmSize = 8
         let kr = vmRead(port, address, 8, &dataPtr, &dataLen)
