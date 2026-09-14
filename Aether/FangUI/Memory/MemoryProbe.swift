@@ -121,14 +121,13 @@ final class MemoryProbe {
         return "自测: 读自己OK addr=0x\(String(addr, radix: 16)) 首4字节=\(bytes)"
     }
 
-    /// 读证：拿到端口后，按候选地址直接读 4 字节。
+    /// 读证：**扫基址** —— 在目标进程里找 Mach-O 头（MH_MAGIC_64 = 0xFEEDFACF）。
     ///
-    /// 候选地址顺序：
-    ///   1. 0x100000000 —— arm64 上主可执行文件在**未启用 PIE 随机化**时的经典基址
-    ///   2. 0x102000000 —— 部分系统上 dyld 的基址
-    ///   3. 0x100000000 的前一页（0x0ffff0000）
-    /// 三个都失败不代表读不了，只代表这几个地址不对；那时再想办法从别的渠道
-    /// 拿真实基址（后续做内存扫描时本来也要找基址）。
+    /// 为什么是扫描而不是读固定地址：iOS 上主可执行文件带 PIE 随机化，地址每次
+    /// 启动都在变。扫到 Magic 等于同时证明两件事：**能读** 且 **基址在哪**。
+    ///
+    /// 按块读而不是按页读：mach_vm_read 每次调用都有开销，131072 次单页读太慢。
+    /// 一次读 64KB，缓冲区内再找 Magic —— 前 64MB 区间只要 1024 次调用。
     func stepReadProof(pid: Int32) -> String {
         guard let tfp = Self.taskForPidFn else { return "读证: tfp 符号缺失" }
         var port: MachPort = 0
@@ -137,16 +136,40 @@ final class MemoryProbe {
             return "读证: 取端口失败 \(Self.describe(kr))"
         }
 
-        let candidates: [MachVmAddress] = [0x100000000, 0x102000000, 0x0ffff0000]
-        var out: [String] = []
-        for addr in candidates {
-            let (rk, magic) = readAt(port: port, address: addr)
-            if rk == KERN_SUCCESS {
-                out.append("0x\(String(addr, radix: 16))→OK head=0x\(String(magic, radix: 16))")
-                return "读证: " + out.joined(separator: " ")
+        let startAddr: MachVmAddress = 0x100000000
+        let blockSize = 0x10000          // 64KB
+        let blocks = 1024                // 共 64MB
+        guard let vmRead = Self.vmReadFn else { return "读证: vm_read 符号缺失" }
+
+        var readable = 0
+        var scanned = 0
+        for i in 0..<blocks {
+            let addr = startAddr + MachVmAddress(i * blockSize)
+            var dataPtr: UInt = 0
+            var dataLen: MachVmSize = MachVmSize(blockSize)
+            let rk = vmRead(port, addr, MachVmSize(blockSize), &dataPtr, &dataLen)
+            scanned += 1
+            guard rk == KERN_SUCCESS, dataPtr != 0, dataLen >= 4 else { continue }
+            readable += 1
+
+            var found: MachVmAddress = 0
+            if let base = UnsafeRawPointer(bitPattern: dataPtr) {
+                let p32 = base.assumingMemoryBound(to: UInt32.self)
+                let words = Int(dataLen) / 4
+                for w in 0..<words where p32[w] == 0xFEEDFACF {
+                    found = addr + MachVmAddress(w * 4)
+                    break
+                }
             }
-            out.append("0x\(String(addr, radix: 16))→\(rk)")
+            // 内核给的内存必须还，否则扫一趟就漏一趟
+            _ = Self.vmDeallocateFn?(port, dataPtr, dataLen)
+            if found != 0 {
+                return "读证: 命中基址=0x\(String(found, radix: 16)) 块\(scanned) 可读\(readable)"
+            }
         }
-        return "读证: 端口OK但候选地址均不可读 [" + out.joined(separator: " ") + "]"
+        if readable == 0 {
+            return "读证: 扫\(scanned)块全不可读 —— 这个 pid 的内存读不到"
+        }
+        return "读证: 扫\(scanned)块 可读\(readable) 未找到 Mach-O magic"
     }
 }
