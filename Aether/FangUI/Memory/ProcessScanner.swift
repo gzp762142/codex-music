@@ -9,12 +9,14 @@ import Darwin
 /// 1. `sysctl(CTL_KERN, KERN_PROC, KERN_PROC_ALL)` —— 拿 pid + p_comm。
 ///    `<sys/sysctl.h>` 在 iOS SDK 里存在，可以直接链接。
 /// 2. `proc_listpids(PROC_ALL_PIDS)` + `proc_pidpath` —— 兜底，并补可执行路径。
-///    iOS SDK **没有** `<libproc.h>`（macOS 手册），无法编译期声明；
-///    但 libSystem 里有实现，所以用 dlsym 运行时取函数指针。
-///    dlsym 返回 nil 时这条路直接跳过，退化成 sysctl 单路，不会崩。
+///    iOS SDK **没有** `<libproc.h>`（macOS 手册），无法编译期声明；但 libSystem
+///    里有实现，所以用 dlsym 运行时取函数指针。取不到就跳过这条路。
 ///
-/// 权限：`Music.entitlements` 已有 `proc_info-allow`。`task_for_pid-allow`
-/// 是下一步（真正读内存）才需要的东西，这一阶段不碰。
+/// 匹配分两级（实机验证后定的策略）：
+/// - `exact`：p_comm 与已知游戏名完全相等 —— 这是唯一可信的判据
+/// - `loose`：小写子串包含 —— 只用于展示，**不**用来判断"找到游戏"
+///   （实机踩过：`notificationserv` 因为 proc_pidpath 给出的路径里含
+///   "shadowtracker" 被误命中）
 final class ProcessScanner {
 
     struct ProcEntry {
@@ -23,14 +25,21 @@ final class ProcessScanner {
         let comm: String
         /// proc_pidpath 拿到的可执行路径；拿不到就是空串
         let path: String
+        /// 宽松匹配（精确 或 子串）—— 仅用于列表高亮
         let matched: Bool
+        /// 精确匹配 —— 用于判定游戏主进程
+        let exact: Bool
     }
 
-    /// 匹配词：先精确比对（不区分大小写），再退到小写子串包含。
-    /// 注意 p_comm 只有 16 字符，"ShadowTrackerExtra" 会被内核截成
-    /// "ShadowTrackerExt" —— 所以精确词里两个都留着。
+    /// 精确名：p_comm 被内核截到 MAXCOMLEN(16)，所以 "ShadowTrackerExtra"
+    /// 实际到达时是 "ShadowTrackerExt"，两个都留着。
     static let exactNames: [String] = ["pubgmhd", "ShadowTrackerExt", "ShadowTracker"]
+    /// 宽松子串（仅展示用）
     static let substrings: [String] = ["pubgmhd", "shadowtracker"]
+    /// 已知误报：p_comm 或路径里恰好含匹配词的系统进程，从宽松命中里剔除。
+    /// notificationserv 是实机抓到的 —— 它自己不含 "shadowtracker"，
+    /// 是 proc_pidpath 返回的路径里带了这个词。
+    static let denyList: [String] = ["notificationserv", "notificationserver"]
 
     /// libproc.h 里的 PROC_ALL_PIDS。iOS 上没有该头文件，只能自己写死。
     private static let PROC_ALL_PIDS: Int32 = 1
@@ -68,12 +77,12 @@ final class ProcessScanner {
 
     // MARK: - 对外
 
-    /// 找游戏进程 pid。找不到返回 nil。
+    /// 找游戏进程 pid。只在精确命中时返回，找不到返回 nil。
     func findGamePID(forceRefresh: Bool = false) -> Int32? {
         if !forceRefresh, let pid = cachedPID, Date().timeIntervalSince(cachedAt) < cacheTTL {
             return pid
         }
-        let hit = scan().first(where: { $0.matched })
+        let hit = scan().first(where: { $0.exact })
         cachedPID = hit?.pid
         cachedAt = Date()
         return cachedPID
@@ -106,19 +115,27 @@ final class ProcessScanner {
         return byPID
             .map { pid, v in
                 ProcEntry(pid: pid, comm: v.comm, path: v.path,
-                          matched: Self.matches(comm: v.comm, path: v.path))
+                          matched: Self.isLooseMatch(comm: v.comm, path: v.path),
+                          exact: Self.isExactName(v.comm))
             }
             .sorted { $0.pid < $1.pid }
     }
 
     // MARK: - 匹配
 
-    static func matches(comm: String, path: String) -> Bool {
+    /// p_comm 是否与已知游戏名完全相等（不区分大小写）。唯一可信判据。
+    static func isExactName(_ comm: String) -> Bool {
         let c = comm.lowercased()
+        return exactNames.contains { $0.lowercased() == c }
+    }
+
+    /// 宽松命中：精确名 或 子串命中；黑名单里的系统进程即使子串命中也不算。
+    static func isLooseMatch(comm: String, path: String) -> Bool {
+        if isExactName(comm) { return true }
+        let c = comm.lowercased()
+        if denyList.contains(where: { c == $0 || c.hasPrefix($0) }) { return false }
         let p = path.lowercased()
-        for name in exactNames where c == name.lowercased() { return true }
-        for needle in substrings where c.contains(needle) || p.contains(needle) { return true }
-        return false
+        return substrings.contains { c.contains($0) || p.contains($0) }
     }
 
     // MARK: - 枚举实现

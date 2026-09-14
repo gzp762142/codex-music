@@ -74,10 +74,11 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         let hit: Int32? = scanner.findGamePID(forceRefresh: true)
 
         let total = entries.count
-        let matched = entries.filter { $0.matched }.count
-        countLabel.text = "共 \(total) 进程 · 命中 \(matched) · \(ProcessScanner.channelSummary)"
+        let exactCount = entries.filter { $0.exact }.count
+        let looseCount = entries.filter { $0.matched && !$0.exact }.count
+        countLabel.text = "共 \(total) · 精确\(exactCount) · 疑似\(looseCount) · \(ProcessScanner.channelSummary)"
         if let pid = hit {
-            hitLabel.text = "game pid = \(pid)"
+            hitLabel.text = "game pid = \(pid)  确认"
             hitLabel.textColor = accent
         } else {
             hitLabel.text = "game pid = 未找到"
@@ -100,13 +101,19 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
 
         let e = entries[indexPath.row]
         let comm = e.comm.isEmpty ? "(no comm)" : e.comm
-        var text = String(format: "%6d  %@", e.pid, comm)
-        if e.matched {
-            text = String(format: "%6d  %@  ●", e.pid, comm)
+        // ● = 精确命中（判据）／○ = 疑似（仅子串命中，可能是误报）
+        var mark = ""
+        if e.exact { mark = "  ●" } else if e.matched { mark = "  ○" }
+        cell.textLabel?.text = String(format: "%6d  %@%@", e.pid, comm, mark)
+        let weight: UIFont.Weight = e.exact ? .bold : (e.matched ? .semibold : .regular)
+        cell.textLabel?.font = .monospacedSystemFont(ofSize: 11, weight: weight)
+        if e.exact {
+            cell.textLabel?.textColor = accent
+        } else if e.matched {
+            cell.textLabel?.textColor = UIColor.hex(0x7A93B8)
+        } else {
+            cell.textLabel?.textColor = idleText
         }
-        cell.textLabel?.text = text
-        cell.textLabel?.font = .monospacedSystemFont(ofSize: 11, weight: e.matched ? .semibold : .regular)
-        cell.textLabel?.textColor = e.matched ? accent : idleText
         cell.textLabel?.lineBreakMode = .byTruncatingMiddle
         return cell
     }
