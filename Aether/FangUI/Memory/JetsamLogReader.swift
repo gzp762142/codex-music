@@ -93,30 +93,41 @@ final class JetsamLogReader {
         return Int(digits) ?? 0
     }
 
-    /// 列出 "<名字>": {... "rpages": N ...} 形式的条目
+    /// 用 JSON 解析 processes 字典 —— 这是 JetsamEvent 的真正结构。
+    ///
+    /// 上一版用字符串回溯找进程名，结果把某个字段名（csrfustLevel）当成了
+    /// 进程名，整列都不可用。JetsamEvent 是标准 JSON（首行是 header，
+    /// 第二行起才是正文），直接解析比抠字符串可靠。
     private static func listProcesses(_ text: String, limit: Int) -> [String] {
-        var out: [String] = []
-        for m in text.ranges(of: "\"rpages\"") {
-            let after = text[m.upperBound...]
-            let digits = after.drop(while: { !$0.isNumber }).prefix(while: { $0.isNumber })
-            guard let pages = Int(digits) else { continue }
-            // 往回找这个条目所属的进程名：最近的一个 "xxx": { 形式
-            let head = text[text.startIndex..<m.lowerBound]
-            let back = head.suffix(400)
-            var name = "?"
-            if let colon = back.lastIndex(of: ":") {
-                let before = back[back.startIndex..<colon]
-                if let q2 = before.lastIndex(of: "\"") {
-                    let quoted = before[before.startIndex..<q2]
-                    if let q1 = quoted.lastIndex(of: "\"") {
-                        name = String(quoted[quoted.index(after: q1)...])
-                    }
-                }
-            }
-            out.append("  " + name + "  rpages=" + String(pages))
-            if out.count >= limit { break }
+        // .ips 格式：第一行是 header JSON，第二行起是正文 JSON
+        guard let nl = text.firstIndex(of: "\n") else { return ["  (日志无正文)"] }
+        let body = String(text[text.index(after: nl)...])
+        guard let data = body.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return ["  (正文 JSON 解析失败)"]
         }
-        return out
+        guard let procs = root["processes"] as? [String: Any] else {
+            return ["  (没有 processes 字段)"]
+        }
+
+        // 按 rpages 倒序，最占内存的排前面
+        var items: [(String, Int, String)] = []
+        for (name, value) in procs {
+            guard let d = value as? [String: Any] else { continue }
+            let pages = (d["rpages"] as? Int) ?? 0
+            var state = ""
+            if let st = d["states"] as? [String] { state = st.joined(separator: ",") }
+            items.append((name, pages, state))
+        }
+        items.sort { $0.1 > $1.1 }
+
+        var rows: [String] = ["  共 \(items.count) 个进程，按 rpages 倒序（前 \(min(limit, items.count))）"]
+        for (name, pages, state) in items.prefix(limit) {
+            let isTarget = name.hasPrefix(targetPrefix)
+            rows.append("  " + (isTarget ? "▶ " : "  ") + name
+                        + "  rpages=\(pages)" + (state.isEmpty ? "" : "  [\(state)]"))
+        }
+        return rows
     }
 
     private static func extract(_ text: String, key: String) -> String? {

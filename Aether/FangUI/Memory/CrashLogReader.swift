@@ -15,6 +15,43 @@ final class CrashLogReader {
         "/var/mobile/Library/Logs/CrashReporter/Retired"
     ]
 
+    /// 列出崩溃报告目录里的全部 .ips（按时间倒序），并标出是谁的。
+    ///
+    /// 为什么需要它：JetsamEvent 里**没有**游戏 → 游戏不是被内存杀的 →
+    /// 那它要么死于某个信号（会留下 ShadowTracker*.ips），要么被 SIGKILL
+    /// （不留下任何报告）。这两种情况的下一步完全不同，所以要先看目录里有什么。
+    static func listReports(limit: Int = 24) -> [String] {
+        let fm = FileManager.default
+        let scanDirs = dirs + ["/var/mobile/Library/Logs/CrashReporter/DiagnosticLogs"]
+        var all: [(name: String, date: Date)] = []
+
+        for dir in scanDirs {
+            guard let items = try? fm.contentsOfDirectory(atPath: dir) else { continue }
+            for name in items where name.hasSuffix(".ips") {
+                let path = dir + "/" + name
+                let d = (try? URL(fileURLWithPath: path)
+                    .resourceValues(forKeys: [.contentModificationDateKey]))?
+                    .contentModificationDate ?? .distantPast
+                all.append((name, d))
+            }
+        }
+        guard !all.isEmpty else {
+            return ["崩溃报告目录为空或不可读", "已扫:"] + scanDirs.map { "  " + $0 }
+        }
+        all.sort { $0.date > $1.date }
+
+        var rows: [String] = ["崩溃报告共 \(all.count) 份（按时间倒序）"]
+        for item in all.prefix(limit) {
+            var mark = ""
+            if item.name.hasPrefix("ShadowTracker") { mark = "  ◀ 游戏" }
+            else if item.name.hasPrefix("Music") { mark = "  ◀ 我们" }
+            else if item.name.lowercased().hasPrefix("jetsam") { mark = "  (jetsam)" }
+            rows.append("  " + item.name.replacingOccurrences(of: ".ips", with: "") + mark)
+        }
+        if all.count > limit { rows.append("  …还有 \(all.count - limit) 份") }
+        return rows
+    }
+
     /// 找最新的 Music 崩溃报告并返回摘要；找不到返回 nil。
     static func latestSummary() -> String? {
         let fm = FileManager.default

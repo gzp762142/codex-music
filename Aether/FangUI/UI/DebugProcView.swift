@@ -228,12 +228,23 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     }
 
     @objc private func onCrashFile() {
-        if let s = CrashLogReader.latestSummary() {
-            probeLabel.text = "ips: " + s.replacingOccurrences(of: "\n", with: " | ")
-        } else {
-            probeLabel.text = "ips: 没找到 Music 的崩溃报告"
+        if !extraRows.isEmpty {
+            extraRows = []
+            table.reloadData()
+            probeLabel.text = "已返回进程列表"
+            probeLabel.textColor = idleText
+            return
         }
-        probeLabel.textColor = warnText
+        // 先列全部 .ips（标出游戏/我们自己的），再附上最新一份 Music 的摘要
+        var rows = CrashLogReader.listReports()
+        if let s = CrashLogReader.latestSummary() {
+            rows.append("— 最新 Music 崩溃摘要 —")
+            rows.append(contentsOf: s.split(separator: "\n").prefix(3).map(String.init))
+        }
+        extraRows = rows
+        table.reloadData()
+        probeLabel.text = "崩溃报告 \(rows.count) 行已填入列表（可滚动）"
+        probeLabel.textColor = accent
     }
 
     // MARK: - Table
