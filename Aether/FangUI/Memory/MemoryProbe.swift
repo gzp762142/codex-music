@@ -98,60 +98,111 @@ final class MemoryProbe {
         return (KERN_SUCCESS, magic)
     }
 
-    /// **对照实验**：对自己进程读一段**保证可读**的内存 —— 用 dlsym 拿到的
-    /// 函数地址。自己的权限必然够，所以这里失败只可能是代码问题，不是权限。
-    static func stepSelfTest() -> String {
-        guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "task_for_pid"),
-              let vmRead = vmReadFn else {
-            return "自测: 符号缺失"
-        }
-        let addr = MachVmAddress(UInt(bitPattern: sym))
+    // MARK: - 定点读（用 dump 偏移，不做任何扫描）
+
+    /// 按绝对地址读 8 字节，并按指针解读。
+    /// 返回 (kern_return, 原始值, 是否像有效指针, 值的高 4 位十六进制)
+    private func readPointer(port: MachPort, address: MachVmAddress) -> (KernReturn, UInt64, Bool, String) {
+        guard let vmRead = Self.vmReadFn else { return (KERN_FAILURE, 0, false, "n/a") }
         var dataPtr: UInt = 0
         var dataLen: MachVmSize = 8
-        let kr = vmRead(mach_task_self_, addr, 8, &dataPtr, &dataLen)
-        guard kr == KERN_SUCCESS, dataPtr != 0 else {
-            return "自测: 读自己的代码失败 \(describe(kr))"
+        let kr = vmRead(port, address, 8, &dataPtr, &dataLen)
+        guard kr == KERN_SUCCESS, dataPtr != 0, dataLen >= 8 else { return (kr, 0, false, "n/a") }
+        var value: UInt64 = 0
+        if let p = UnsafeRawPointer(bitPattern: dataPtr) {
+            value = p.load(as: UInt64.self)
         }
-        var bytes = "0x"
-        if let base = UnsafeRawPointer(bitPattern: dataPtr) {
-            let p = base.assumingMemoryBound(to: UInt8.self)
-            for i in 0..<4 { bytes += String(format: "%02x", p[i]) }
-        }
-        _ = vmDeallocateFn?(mach_task_self_, dataPtr, dataLen)
-        return "自测: 读自己OK addr=0x\(String(addr, radix: 16)) 首4字节=\(bytes)"
+        _ = Self.vmDeallocateFn?(port, dataPtr, dataLen)
+        // arm64 用户态堆指针的高 16 位通常非零（0x00000001xxxx 或 0x0000001xxxxx）
+        let looksReal = value != 0 && (value >> 48) != 0
+        let hi = String(format: "%04llx", (value >> 48) & 0xFFFF)
+        return (KERN_SUCCESS, value, looksReal, hi)
     }
 
-    /// 读证：**扫基址** —— 在目标进程里找 Mach-O 头（MH_MAGIC_64 = 0xFEEDFACF）。
-    ///
-    /// 为什么是扫描而不是读固定地址：iOS 上主可执行文件带 PIE 随机化，地址每次
-    /// 启动都在变。扫到 Magic 等于同时证明两件事：**能读** 且 **基址在哪**。
-    ///
-    /// 按块读而不是按页读：mach_vm_read 每次调用都有开销，131072 次单页读太慢。
-    /// 一次读 64KB，缓冲区内再找 Magic —— 前 64MB 区间只要 1024 次调用。
-    func stepReadProof(pid: Int32) -> String {
-        guard let tfp = Self.taskForPidFn else { return "读证: tfp 符号缺失" }
+    /// 读模块头：dump 基址处读 Mach-O 头（magic + cputype）。
+    static func stepModuleHead(pid: Int32) -> String {
+        let probe = MemoryProbe()
+        let off = Offsets.load()
+        guard let tfp = taskForPidFn else { return "模块头: tfp 符号缺失" }
         var port: MachPort = 0
         let kr = tfp(mach_task_self_, pid, &port)
-        guard kr == KERN_SUCCESS, port != 0 else {
-            return "读证: 取端口失败 \(Self.describe(kr))"
+        guard kr == KERN_SUCCESS, port != 0 else { return "模块头: 取端口失败 \(describe(kr))" }
+
+        guard let vmRead = vmReadFn else { return "模块头: vm_read 符号缺失" }
+        var dataPtr: UInt = 0
+        var dataLen: MachVmSize = 16
+        let rk = vmRead(port, MachVmAddress(off.moduleBase), 16, &dataPtr, &dataLen)
+        guard rk == KERN_SUCCESS, dataPtr != 0, dataLen >= 8 else {
+            return "模块头: 读 0x\(String(off.moduleBase, radix: 16)) 失败 \(describe(rk))"
         }
+        var magic: UInt32 = 0
+        var cputype: UInt32 = 0
+        if let p = UnsafeRawPointer(bitPattern: dataPtr) {
+            magic = p.assumingMemoryBound(to: UInt32.self).pointee
+            cputype = p.advanced(by: 4).assumingMemoryBound(to: UInt32.self).pointee
+        }
+        _ = vmDeallocateFn?(port, dataPtr, dataLen)
+        let isMachO = (magic == 0xFEEDFACF)
+        return "模块头: 0x\(String(off.moduleBase, radix: 16)) magic=0x\(String(magic, radix: 16))"
+            + " cpu=\(cputype) " + (isMachO ? "是Mach-O(基址正确)" : "不是Mach-O(基址被ASLR搬了)")
+    }
+
+    /// 定点读：用 dump 偏移算绝对地址，读 8 字节。
+    /// **一次只读一个地址** —— 这是刻意的：扫大范围是上几次出问题的来源。
+    static func stepFixedRead(pid: Int32) -> String {
+        let probe = MemoryProbe()
+        let off = Offsets.load()
+        guard let tfp = taskForPidFn else { return "定点读: tfp 符号缺失" }
+        var port: MachPort = 0
+        let kr = tfp(mach_task_self_, pid, &port)
+        guard kr == KERN_SUCCESS, port != 0 else { return "定点读: 取端口失败 \(describe(kr))" }
+
+        // 三个全局静态量，都应该是有效指针
+        let items: [(String, UInt64)] = [
+            ("GObjects", off.gObjects),
+            ("GNames", off.gNames),
+            ("GWorld", off.gWorld)
+        ]
+        var ok = 0
+        var parts: [String] = []
+        for (name, addr) in items {
+            let (rk, value, real, hi) = probe.readPointer(port: port, address: MachVmAddress(addr))
+            if rk != KERN_SUCCESS {
+                parts.append("\(name)=\(describe(rk))")
+            } else if real {
+                ok += 1
+                parts.append("\(name)=OK(hi\(hi))")
+            } else {
+                parts.append("\(name)=值异常(v=0x\(String(value, radix: 16)))")
+            }
+        }
+        let verdict: String
+        if ok == items.count { verdict = "三个都在 → 读通" }
+        else if ok > 0 { verdict = "部分通" }
+        else { verdict = "全不通" }
+        return "定点读[\(verdict)] " + parts.joined(separator: " ")
+    }
+
+    /// 扫基址：找 Mach-O magic。范围按块推进，比上一版小（只 128MB）。
+    static func stepBaseScan(pid: Int32) -> String {
+        let probe = MemoryProbe()
+        guard let tfp = taskForPidFn else { return "扫基址: tfp 符号缺失" }
+        var port: MachPort = 0
+        let kr = tfp(mach_task_self_, pid, &port)
+        guard kr == KERN_SUCCESS, port != 0 else { return "扫基址: 取端口失败 \(describe(kr))" }
+        guard let vmRead = vmReadFn else { return "扫基址: vm_read 符号缺失" }
 
         let startAddr: MachVmAddress = 0x100000000
-        let blockSize = 0x10000          // 64KB
-        let blocks = 1024                // 共 64MB
-        guard let vmRead = Self.vmReadFn else { return "读证: vm_read 符号缺失" }
-
+        let blockSize = 0x10000
+        let blocks = 2048                      // 128MB
         var readable = 0
-        var scanned = 0
         for i in 0..<blocks {
             let addr = startAddr + MachVmAddress(i * blockSize)
             var dataPtr: UInt = 0
             var dataLen: MachVmSize = MachVmSize(blockSize)
             let rk = vmRead(port, addr, MachVmSize(blockSize), &dataPtr, &dataLen)
-            scanned += 1
             guard rk == KERN_SUCCESS, dataPtr != 0, dataLen >= 4 else { continue }
             readable += 1
-
             var found: MachVmAddress = 0
             if let base = UnsafeRawPointer(bitPattern: dataPtr) {
                 let p32 = base.assumingMemoryBound(to: UInt32.self)
@@ -161,15 +212,11 @@ final class MemoryProbe {
                     break
                 }
             }
-            // 内核给的内存必须还，否则扫一趟就漏一趟
-            _ = Self.vmDeallocateFn?(port, dataPtr, dataLen)
+            _ = vmDeallocateFn?(port, dataPtr, dataLen)
             if found != 0 {
-                return "读证: 命中基址=0x\(String(found, radix: 16)) 块\(scanned) 可读\(readable)"
+                return "扫基址: 命中 0x\(String(found, radix: 16)) 块\(i + 1) 可读\(readable)"
             }
         }
-        if readable == 0 {
-            return "读证: 扫\(scanned)块全不可读 —— 这个 pid 的内存读不到"
-        }
-        return "读证: 扫\(scanned)块 可读\(readable) 未找到 Mach-O magic"
+        return "扫基址: 128MB 内未命中 可读\(readable)块"
     }
 }

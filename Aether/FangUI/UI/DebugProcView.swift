@@ -27,7 +27,12 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     private let btnDlsym = UIButton(type: .system)
     private let btnProof = UIButton(type: .system)
     private let btnCrashFile = UIButton(type: .system)
-    private let btnSelf = UIButton(type: .system)
+    /// 定点读：用 dump 偏移读 GObjects/GNames/GWorld —— 只读 3 个地址，不扫描
+    private let btnFixed = UIButton(type: .system)
+    /// 读模块头：dump 基址处读 Mach-O，判断 ASLR 是否搬过基址
+    private let btnHead = UIButton(type: .system)
+    /// 扫基址：128MB 内找 Mach-O magic（比上一版范围小）
+    private let btnScan = UIButton(type: .system)
 
     private let accent = UIColor.hex(0x185EE0)
     private let idleText = UIColor.hex(0x5A6A82)
@@ -51,9 +56,11 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
             (btnSym, "符号", #selector(onSym)),
             (btnDlsym, "dlsym", #selector(onDlsym)),
             (btnProof, "读证", #selector(onProof)),
+            (btnFixed, "定点读", #selector(onFixedRead)),
+            (btnHead, "模块头", #selector(onModuleHead)),
+            (btnScan, "扫基址", #selector(onBaseScan)),
             (btnRefresh, "刷新", #selector(onRefresh)),
-            (btnCrashFile, "崩溃文件", #selector(onCrashFile)),
-            (btnSelf, "自测(本进程)", #selector(onSelfTest))
+            (btnCrashFile, "崩溃文件", #selector(onCrashFile))
         ]
         for (b, title, sel) in buttons {
             b.setTitle(title, for: .normal)
@@ -85,10 +92,10 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         crashLabel.frame = CGRect(x: w * 0.6, y: 15, width: w * 0.4, height: 14)
         probeLabel.frame = CGRect(x: 0, y: 30, width: w, height: 14)
 
-        // 六个按钮排成 3×2：单行会窄到放不下"自测(本进程)"这种标签
-        let all = [btnSym, btnDlsym, btnProof, btnRefresh, btnCrashFile, btnSelf]
+        // 八个按钮排成 4×2
+        let all = [btnSym, btnDlsym, btnProof, btnFixed, btnHead, btnScan, btnRefresh, btnCrashFile]
         let gap: CGFloat = 4
-        let perRow = 3
+        let perRow = 4
         let bw = (w - gap * CGFloat(perRow - 1)) / CGFloat(perRow)
         let bh = btnRowH - 6
         for (i, b) in all.enumerated() {
@@ -147,11 +154,26 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         probeLabel.textColor = accent
     }
 
-    /// 对照实验：对自己进程跑同一套 vm_region 调用。
-    /// 自己都失败 → 参数写错；自己成功 → 之前对游戏的失败才是权限问题。
-    @objc private func onSelfTest() {
-        probeLabel.text = MemoryProbe.stepSelfTest()
-        probeLabel.textColor = idleText
+    /// 定点读：只用 dump 偏移读 3 个全局量，一次调用读完，不扫描。
+    /// 读到有效指针 → 权限和读链路都没问题，"找不到"是范围/基址问题。
+    @objc private func onFixedRead() {
+        guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
+        probeLabel.text = MemoryProbe.stepFixedRead(pid: gpid)
+        probeLabel.textColor = accent
+    }
+
+    /// 读模块头：dump 基址处读 Mach-O 头，能判断 ASLR 是否搬过基址。
+    @objc private func onModuleHead() {
+        guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
+        probeLabel.text = MemoryProbe.stepModuleHead(pid: gpid)
+        probeLabel.textColor = accent
+    }
+
+    /// 扫基址：最后手段，128MB 内找 Mach-O magic。
+    @objc private func onBaseScan() {
+        guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
+        probeLabel.text = MemoryProbe.stepBaseScan(pid: gpid)
+        probeLabel.textColor = accent
     }
 
     @objc private func onCrashFile() {
