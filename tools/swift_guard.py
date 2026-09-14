@@ -21,6 +21,8 @@ PATTERNS = [
      "裸 write —— UIKit 上下文会被解析成实例方法，要写 Darwin.write"),
     (r"(?<![.\w])read\(",
      "裸 read —— 同上"),
+    (r"(?<![.\w])(?:open|close|strlen)\(",
+     "裸 POSIX 调用 —— 统一写 Darwin.open / Darwin.close / Darwin.strlen"),
     (r"\bsyscall\s*\(",
      "syscall 调用 —— syscall() 只走 BSD 表，Mach trap 号交给它会直接崩"),
     (r"\bptrace\s*\(",
@@ -51,7 +53,10 @@ def strip_comments_and_strings(text):
 
     text = re.sub(r'"""[\s\S]*?"""', blank, text)
     text = re.sub(r"(?m)//[^\n]*", "", text)
-    text = re.sub(r'"(?:[^"\\\n]|\\.)*"', lambda m: '"' + "\n" * m.group(0).count("\n") + '"', text)
+    # 字符串替换成空引号对（保留在同一行）：
+    # 换行会破坏元组计数 —— 第一版把 "n/a" 整段吃掉，
+    # (kr, 0, false, "n/a") 被看成 3 个元素，报了误报。
+    text = re.sub(r'"(?:[^"\\\n]|\\.)*"', '""', text)
     return text
 
 

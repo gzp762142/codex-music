@@ -12,12 +12,12 @@ private func appendCrashLog(_ text: String) {
     let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
     guard let url = dir?.appendingPathComponent(kCrashLogName) else { return }
     // APPEND + CREATE，避免第二次崩溃把第一次的记录冲掉
-    let fd = open(url.path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+    let fd = Darwin.open(url.path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
     guard fd >= 0 else { return }
     text.withCString { ptr in
-        _ = Darwin.write(fd, ptr, strlen(ptr))
+        _ = Darwin.write(fd, ptr, Darwin.strlen(ptr))
     }
-    close(fd)
+    Darwin.close(fd)
 }
 
 /// 未捕获异常处理器：必须是 C 函数，不能是捕获上下文的闭包。
@@ -32,12 +32,12 @@ private func signalHandler(_ signo: Int32) {
     let msg = "[signal] \(signo)\n"
     let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
     if let url = dir?.appendingPathComponent(kCrashLogName) {
-        let fd = open(url.path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+        let fd = Darwin.open(url.path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
         if fd >= 0 {
             msg.withCString { ptr in
-                _ = Darwin.write(fd, ptr, strlen(ptr))
+                _ = Darwin.write(fd, ptr, Darwin.strlen(ptr))
             }
-            close(fd)
+            Darwin.close(fd)
         }
     }
     // 恢复默认处理并重新抛给系统，保持正常的崩溃行为

@@ -217,10 +217,13 @@ final class MemoryProbe {
             return "区域归属: proc_regionfilename 符号缺失"
         }
         var buf = [CChar](repeating: 0, count: 1024)
+        // buf.count 必须在闭包外取：withUnsafeMutableBytes 已对 buf 取独占访问，
+        // 闭包内再读 buf.count 会触发 "overlapping accesses" 编译错误。
+        let cap = UInt32(buf.count)
         let addr = off.moduleBase
         let n = buf.withUnsafeMutableBytes { raw -> Int32 in
             guard let base = raw.baseAddress else { return 0 }
-            return fn(pid, addr, base, UInt32(buf.count))
+            return fn(pid, addr, base, cap)
         }
         guard n > 0 else {
             return "区域归属: 0x\(String(addr, radix: 16)) → 返回 \(n)（该地址不在任何区域?)"
@@ -236,53 +239,59 @@ final class MemoryProbe {
         let (kr, p) = port(for: pid)
         guard kr == KERN_SUCCESS, p != 0 else { return "找村口: 取端口失败 \(describe(kr))" }
 
-        let page: UInt64 = 0x4000
         let dumpBase = off.moduleBase
-        let expectedDelta: UInt64 = 0x117597F90 - 0x115A21B00
+        let page: UInt64 = 0x4000              // 16KB：iOS arm64 常用页大小
         let objectsOff = off.gObjects - dumpBase
         let namesOff = off.gNames - dumpBase
-        let lo: UInt64 = 0x1000000000
-        let hi: UInt64 = 0x1400000000
+        let expectedDelta: UInt64 = 0x117597F90 - 0x115A21B00
 
-        // 先诊断：在 dump 基址上读一次，看两个全局量分别是什么
-        // （这比直接扫有用 —— 如果这里就能看出是哪个不对，就不用扫）
+        // 先在 dump 基址上诊断，看两个全局量分别是什么
+        // （比直接扫有用：如果这里就能看出哪个不对，就不用扫）
         var diag = ""
         do {
             let (r1, g) = readRaw(port: p, address: MachVmAddress(dumpBase + objectsOff))
             let (r2, n) = readRaw(port: p, address: MachVmAddress(dumpBase + namesOff))
-            let gOk = (r1 == KERN_SUCCESS) && g >= lo && g < hi
-            let nOk = (r2 == KERN_SUCCESS) && n >= lo && n < hi
+            let inDump = { (v: UInt64) -> Bool in v >= 0x1000000000 && v < 0x1400000000 }
+            let gOk = (r1 == KERN_SUCCESS) && inDump(g)
+            let nOk = (r2 == KERN_SUCCESS) && inDump(n)
             diag = " [dump基址: GObj\(gOk ? "内" : "外") GName\(nOk ? "内" : "外")]"
         }
 
-        // 逐轮向外扩：每轮扫窗口 [dump ± span*(round+1)]，只扫新增的环带，不重复
-        let span = page * 256                 // 每轮外扩 4MB
+        // 逐轮向外扩，**每轮只扫新增的环带**，不重复也不越界。
+        // 上一版把"累计半径"写进了循环条件，低侧会从 dumpBase 一路减到接近 0，
+        // 白读 6.5 万次 —— 那正是"扫太多把游戏搞崩"的量级。
+        let ringStep: UInt64 = 0x100000        // 每轮外扩 1MB
         var scanned = 0
         var lastWhy = ""
-        for round in 0..<4 {                  // 最多到 ±16MB
-            let w = span * UInt64(round + 1)
-            // 低侧环带
-            var a = dumpBase
-            while a >= dumpBase - w, a > page {
-                let (hitL, whyL) = probeBase(port: p, base: a, objectsOff: objectsOff,
-                                            namesOff: namesOff, expectedDelta: expectedDelta)
-                if let hit = hitL {
-                    return "找村口: 命中 0x\(String(hit, radix: 16)) 扫\(scanned)页 \(whyL)" + diag
+        for ring in 1...16 {                   // 最多 ±16MB
+            let inner = ringStep * UInt64(ring - 1)
+            let outer = ringStep * UInt64(ring)
+
+            // 低侧环带：[dumpBase-outer, dumpBase-inner)
+            var off2 = inner
+            while off2 < outer {
+                let a = dumpBase - off2
+                if a < page { break }
+                let (hit, why) = probeBase(port: p, base: a, objectsOff: objectsOff,
+                                           namesOff: namesOff, expectedDelta: expectedDelta)
+                if let h = hit {
+                    return "找村口: 命中 0x\(String(h, radix: 16)) 扫\(scanned)页 \(why)" + diag
                 }
-                lastWhy = whyL
-                a -= page
+                lastWhy = why
+                off2 += page
                 scanned += 1
             }
-            // 高侧环带
-            var b = dumpBase
-            while b <= dumpBase + w {
-                let (hitH, whyH) = probeBase(port: p, base: b, objectsOff: objectsOff,
-                                            namesOff: namesOff, expectedDelta: expectedDelta)
-                if let hit = hitH {
-                    return "找村口: 命中 0x\(String(hit, radix: 16)) 扫\(scanned)页 \(whyH)" + diag
+            // 高侧环带：(dumpBase+inner, dumpBase+outer]
+            var off3 = inner + page
+            while off3 <= outer {
+                let b = dumpBase + off3
+                let (hit, why) = probeBase(port: p, base: b, objectsOff: objectsOff,
+                                           namesOff: namesOff, expectedDelta: expectedDelta)
+                if let h = hit {
+                    return "找村口: 命中 0x\(String(h, radix: 16)) 扫\(scanned)页 \(why)" + diag
                 }
-                lastWhy = whyH
-                b += page
+                lastWhy = why
+                off3 += page
                 scanned += 1
             }
         }
