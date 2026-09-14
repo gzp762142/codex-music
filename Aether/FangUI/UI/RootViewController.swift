@@ -27,6 +27,8 @@ final class RootViewController: UIViewController {
     private let cardView = UIView()
     /// 背景层：柔和的径向渐变，作为菜单的背景图。
     private let backdrop = CAGradientLayer()
+    /// 调试页：进程扫描列表（挂在「设置」页签下面，其他页签保持为空）。
+    private let debugView = DebugProcView()
     /// 底部分段控件（切换页面用），贴面板底边居中。
     private let tabs = SegmentedTabs(titles: ["透视", "追踪", "设置"])
     /// 控件距面板底边的距离。
@@ -63,6 +65,9 @@ final class RootViewController: UIViewController {
         backdrop.endPoint = CGPoint(x: 1.15, y: 1.25)
         cardView.layer.addSublayer(backdrop)
 
+        debugView.isHidden = true
+        cardView.addSubview(debugView)
+
         tabs.onSelect = { [weak self] index in
             self?.showPage(index)
         }
@@ -85,19 +90,29 @@ final class RootViewController: UIViewController {
         backdrop.frame = cardView.bounds
         CATransaction.commit()
 
-        // 分段控件：水平居中、贴底边；宽度按面板宽度夹一下，
-        // 窄面板上不会被挤出圆角。
+        // 先量分段控件：它决定了调试页能占多高。
         let tabsSize = tabs.intrinsicSize
         let tabsW = min(tabsSize.width, cardView.bounds.width - 32)
+        let tabsY = cardView.bounds.height - tabsSize.height - tabsBottomInset
+
+        // 分段控件：水平居中、贴底边。宽度夹一下，窄面板上不会被挤出圆角。
         tabs.frame = CGRect(x: (cardView.bounds.width - tabsW) / 2,
-                            y: cardView.bounds.height - tabsSize.height - tabsBottomInset,
+                            y: tabsY,
                             width: tabsW,
                             height: tabsSize.height)
+
+        // 调试页：占住分段控件以上的整块区域。
+        debugView.frame = CGRect(x: 0, y: 0,
+                                 width: cardView.bounds.width,
+                                 height: max(0, tabsY))
     }
 
-    /// 分段控件的落点：先记录下标，页面内容随后再挂。
+    /// 分段控件的落点。
+    /// 目前只有「设置」页有内容（进程扫描调试页），另外两页保持为空。
     private func showPage(_ index: Int) {
-        _ = index
+        let showDebug = (index == 2)
+        debugView.isHidden = !showDebug
+        if showDebug { debugView.reload() }
     }
 
     /// 由宿主在面板被摘出窗口 / 重新挂上时调用。面板没有动画，只保留接口。
