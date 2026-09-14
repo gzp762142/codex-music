@@ -6,7 +6,7 @@
 
 用 python3 tools/full_audit.py，退出码非 0 表示发现问题。
 """
-﻿import re, os, glob
+import re, os, glob
 
 ROOT = r"D:\工作区\Aether\Aether"
 files = glob.glob(os.path.join(ROOT, "**", "*.swift"), recursive=True)
