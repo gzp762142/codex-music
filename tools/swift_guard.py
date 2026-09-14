@@ -135,6 +135,87 @@ def check_api_usage(path, text, static_members):
     return problems
 
 
+def extract_sig(lines, i, start_col):
+    """从 lines[i] 的 start_col 处开始，提取完整参数表（可能跨多行）。
+
+    第一版只看当前行，参数表跨行时就只拿到函数名，
+    于是 AppDelegate 两个不同签名的 application 被当成重复 —— 误报。
+    """
+    out = []
+    depth = 0
+    for k in range(i, min(i + 30, len(lines))):
+        s = lines[k] if k == i else lines[k]
+        begin = start_col if k == i else 0
+        for ch in s[begin:]:
+            out.append(ch)
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return "".join(out)
+        out.append(" ")
+    return "".join(out)
+
+
+def check_duplicate_funcs(path, text):
+    """同一作用域内重复定义同名函数。
+
+    只在**同一个类/结构体内部**才算重复 —— 不同类的同名方法完全合法
+    （AppDelegate 有两个 application，UnlockView 的 makeUIView 等）。
+    第一版按文件全局比对，在全仓报了 17 条误报，就是因为没跟踪作用域。
+
+    它确实抓过真的：stepFindBase / probeBase / stepRegionName 各重复两份，
+    是脚本化插入时整段粘了两遍。
+    """
+    problems = []
+    scope = "<global>"
+    seen = {}          # (scope, funcName) -> 首次行号
+    depth = 0
+    pendingType = None
+
+    for n, line in enumerate(text.split("\n"), 1):
+        stripped = line.strip()
+
+        m = re.match(r"^\s*(?:final |public |internal |fileprivate |private |open )*"
+                     r"(class|struct|enum|extension|protocol)\s+(\w+)", line)
+        if m and "{" in line:
+            pendingType = m.group(2)
+            depth = 0
+
+        fm = re.match(r"\s*(?:private |fileprivate |internal |public |static |class |override )*"
+                      r"func\s+(\w+)", line)
+        if fm:
+            # 用「函数名 + 完整参数表」判重，而不是只用名字 ——
+            # 参数表不同就是重载，完全合法（AppDelegate 的两个 application、
+            # DebugProcView 的两个 tableView 都是重载，第一版按名字报成了误报）。
+            sig = fm.group(1)
+            all_lines = text.split("\n")
+            j = line.find("(", fm.end())
+            if j >= 0:
+                sig += extract_sig(all_lines, n - 1, j)
+            key = (scope, sig)
+            if key in seen:
+                problems.append(f"{path}:{n}  函数 {sig} 在 {scope} 内重复定义"
+                                f"（首次在 {seen[key]} 行）")
+            else:
+                seen[key] = n
+
+        if pendingType is not None:
+            for ch in stripped:
+                if ch == "{":
+                    depth += 1
+                    if depth == 1:
+                        scope = pendingType
+                elif ch == "}":
+                    depth -= 1
+                    if depth <= 0:
+                        scope = "<global>"
+                        pendingType = None
+                        depth = 0
+    return problems
+
+
 def main():
     all_problems = []
     files = []
@@ -150,8 +231,10 @@ def main():
         static_members |= set(re.findall(r"static (?:func|var|let) (\w+)", src))
 
     for f in files:
+        body = open(f, encoding="utf-8", newline="").read()
         all_problems += check_file(f)
-        all_problems += check_api_usage(f, open(f, encoding="utf-8", newline="").read(), static_members)
+        all_problems += check_api_usage(f, body, static_members)
+        all_problems += check_duplicate_funcs(f, body)
 
     if all_problems:
         print("发现问题：")

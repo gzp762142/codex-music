@@ -32,6 +32,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     /// 读模块头：dump 基址处读 Mach-O，判断 ASLR 是否搬过基址
     /// 扫基址：128MB 内找 Mach-O magic（比上一版范围小）
     private let btnScan = UIButton(type: .system)
+    /// 区域归属：问「这个地址属于哪个文件」（零风险探测）
+    private let btnRegion = UIButton(type: .system)
 
     private let accent = UIColor.hex(0x185EE0)
     private let idleText = UIColor.hex(0x5A6A82)
@@ -56,6 +58,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
             (btnDlsym, "dlsym", #selector(onDlsym)),
             (btnProof, "读证", #selector(onProof)),
             (btnFixed, "定点读", #selector(onFixedRead)),
+            (btnRegion, "区域归属", #selector(onRegionName)),
             (btnScan, "找村口", #selector(onFindBase)),
             (btnRefresh, "刷新", #selector(onRefresh)),
             (btnCrashFile, "崩溃文件", #selector(onCrashFile))
@@ -91,7 +94,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         probeLabel.frame = CGRect(x: 0, y: 30, width: w, height: 14)
 
         // 八个按钮排成 4×2
-        let all = [btnSym, btnDlsym, btnProof, btnFixed, btnScan, btnRefresh, btnCrashFile]
+        let all = [btnSym, btnDlsym, btnProof, btnFixed, btnRegion, btnScan, btnRefresh, btnCrashFile]
         let gap: CGFloat = 4
         let perRow = 4
         let bw = (w - gap * CGFloat(perRow - 1)) / CGFloat(perRow)
@@ -157,6 +160,13 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     @objc private func onFixedRead() {
         guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
         probeLabel.text = MemoryProbe.stepFixedRead(pid: gpid)
+        probeLabel.textColor = accent
+    }
+
+    /// 区域归属：一次调用问「dump 基址属于哪个文件」。
+    @objc private func onRegionName() {
+        guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
+        probeLabel.text = MemoryProbe.stepRegionName(pid: gpid)
         probeLabel.textColor = accent
     }
 

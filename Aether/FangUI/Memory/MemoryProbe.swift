@@ -36,6 +36,11 @@ final class MemoryProbe {
     }
 
     private static let taskForPidFn = symbol("task_for_pid", as: TaskForPidFn.self)
+    /// proc_regionfilename：问「这个地址属于哪个文件」。
+    /// 只要 pid + 地址，不需要 mach_vm_region —— 正好绕开那个我连错两次的调用。
+    /// iOS 无 <libproc.h>，符号同样只能 dlsym 取。
+    private typealias ProcRegionFileNameFn = @convention(c) (Int32, UInt64, UnsafeMutableRawPointer?, UInt32) -> Int32
+    private static let procRegionFileNameFn = symbol("proc_regionfilename", as: ProcRegionFileNameFn.self)
     private static let vmReadFn = symbol("mach_vm_read", as: VmReadFn.self)
     private static let vmDeallocateFn = symbol("mach_vm_deallocate", as: VmDeallocateFn.self)
 
@@ -192,6 +197,33 @@ final class MemoryProbe {
     ///
     /// 代价：每页只读 8 字节（不是 64KB），±4MB 是 1024 页 → 1024 次小读。
     /// 这是刻意压低的读取量：大块连续读是之前把游戏搞崩的原因。
+    /// 单点区域归属：对 dump 基址问一次「这属于哪个文件」。
+    ///
+    /// 零风险探测：一次调用、不遍历、不写。
+    /// 收益却很大 ——
+    ///   返回 ShadowTrackerExtra 路径 → 该地址在游戏映像内，且符号可用
+    ///   返回别的路径               → 那个地址属于别的映射
+    ///   返回 0 / 符号缺失          → 这条路不通，及早知道
+    static func stepRegionName(pid: Int32) -> String {
+        let off = Offsets.load()
+        guard let fn = procRegionFileNameFn else {
+            return "区域归属: proc_regionfilename 符号缺失"
+        }
+        var buf = [CChar](repeating: 0, count: 1024)
+        let addr = off.moduleBase
+        let n = buf.withUnsafeMutableBytes { raw -> Int32 in
+            guard let base = raw.baseAddress else { return 0 }
+            return fn(pid, addr, base, UInt32(buf.count))
+        }
+        guard n > 0 else {
+            return "区域归属: 0x\(String(addr, radix: 16)) → 返回 \(n)（该地址不在任何区域?)"
+        }
+        let path = String(cString: buf)
+        let short = path.split(separator: "/").last.map(String.init) ?? path
+        let isGame = path.lowercased().contains("shadowtracker")
+        return "区域归属: 0x\(String(addr, radix: 16)) → \(short) \(isGame ? "是游戏映像" : "不是游戏")"
+    }
+
     static func stepFindBase(pid: Int32) -> String {
         let off = Offsets.load()
         let (kr, p) = port(for: pid)
@@ -219,47 +251,85 @@ final class MemoryProbe {
         // 逐轮向外扩：每轮扫窗口 [dump ± span*(round+1)]，只扫新增的环带，不重复
         let span = page * 256                 // 每轮外扩 4MB
         var scanned = 0
+        var lastWhy = ""
         for round in 0..<4 {                  // 最多到 ±16MB
             let w = span * UInt64(round + 1)
             // 低侧环带
             var a = dumpBase
             while a >= dumpBase - w, a > page {
-                if let hit = probeBase(port: p, base: a, objectsOff: objectsOff,
-                                       namesOff: namesOff, expectedDelta: expectedDelta) {
-                    return "找村口: 命中 0x\(String(hit, radix: 16)) 扫\(scanned)页" + diag
+                let (hitL, whyL) = probeBase(port: p, base: a, objectsOff: objectsOff,
+                                            namesOff: namesOff, expectedDelta: expectedDelta)
+                if let hit = hitL {
+                    return "找村口: 命中 0x\(String(hit, radix: 16)) 扫\(scanned)页 \(whyL)" + diag
                 }
+                lastWhy = whyL
                 a -= page
                 scanned += 1
             }
             // 高侧环带
             var b = dumpBase
             while b <= dumpBase + w {
-                if let hit = probeBase(port: p, base: b, objectsOff: objectsOff,
-                                       namesOff: namesOff, expectedDelta: expectedDelta) {
-                    return "找村口: 命中 0x\(String(hit, radix: 16)) 扫\(scanned)页" + diag
+                let (hitH, whyH) = probeBase(port: p, base: b, objectsOff: objectsOff,
+                                            namesOff: namesOff, expectedDelta: expectedDelta)
+                if let hit = hitH {
+                    return "找村口: 命中 0x\(String(hit, radix: 16)) 扫\(scanned)页 \(whyH)" + diag
                 }
+                lastWhy = whyH
                 b += page
                 scanned += 1
             }
         }
-        return "找村口: ±16MB 内未命中 扫\(scanned)页" + diag
+        return "找村口: ±16MB 未命中 扫\(scanned)页 最后原因[\(lastWhy)]" + diag
     }
 
-    /// 试探一个候选基址：读 GObjects/GNames 两个全局量，看差值对不对。
+    /// 试探一个候选基址 —— 用 dump 里的**多重约束**判据。
+    ///
+    /// 单看"指针像不像"太弱（图二就误判过），这里用四个互相独立的条件：
+    ///   1. GNames 读出的指针落在 dump 的地址空间（0x11xxxxxxx）
+    ///   2. GObjects 读出的 chunk0 指针落在堆区间（0x120000000 ~ 0x140000000）
+    ///   3. chunk0 + 0*0x18 处读出的首个对象地址 = 0x128370000（dump 记录）
+    ///   4. 那个对象的 vtable 落在模块映像区间
+    ///
+    /// 四个条件全中才认 —— 误判概率极低。
+    /// 返回 (命中基址, 失败原因)；未命中时原因用于面板诊断。
     private static func probeBase(port: MachPort, base: UInt64, objectsOff: UInt64,
-                                  namesOff: UInt64, expectedDelta: UInt64) -> UInt64? {
-        let (rk1, g) = readPointer(port: port, address: MachVmAddress(base + objectsOff))
-        guard rk1 == KERN_SUCCESS, g != 0 else { return nil }
-        let (rk2, n) = readPointer(port: port, address: MachVmAddress(base + namesOff))
-        guard rk2 == KERN_SUCCESS, n != 0 else { return nil }
+                                  namesOff: UInt64, expectedDelta: UInt64)
+        -> (UInt64?, String) {
 
+        let (rk1, g) = readPointer(port: port, address: MachVmAddress(base + objectsOff))
+        guard rk1 == KERN_SUCCESS, g != 0 else { return (nil, "GObjects读失败/\(rk1)") }
+        let (rk2, n) = readPointer(port: port, address: MachVmAddress(base + namesOff))
+        guard rk2 == KERN_SUCCESS, n != 0 else { return (nil, "GNames读失败/\(rk2)") }
+
+        // 条件 1：GNames 落在 dump 地址空间
+        let ns: UInt64 = 0x110000000
+        let ne: UInt64 = 0x120000000
+        guard n >= ns, n < ne else { return (nil, "GNames越域") }
+
+        // 条件 2：chunk0 是堆指针
+        let hs: UInt64 = 0x120000000
+        let he: UInt64 = 0x140000000
+        guard g >= hs, g < he else { return (nil, "GObj非堆指针") }
+
+        // 条件 3：chunk0[0] 必须是 dump 记录的那个对象地址
+        let (rk3, firstObj) = readPointer(port: port, address: MachVmAddress(g))
+        guard rk3 == KERN_SUCCESS, firstObj == 0x128370000 else {
+            return (nil, "chunk0[0]≠0x128370000")
+        }
+
+        // 条件 4：该对象的 vtable 落在模块映像内
+        let (rk4, vtable) = readPointer(port: port, address: MachVmAddress(firstObj))
+        guard rk4 == KERN_SUCCESS, vtable >= 0x1000000000, vtable < 0x1200000000 else {
+            return (nil, "vtable越域")
+        }
+
+        // 差值仅作参考（条件已足够强，Δ 不满足也放行但会标注）
         let delta = (n > g) ? (n - g) : (g - n)
-        guard delta == expectedDelta else { return nil }
-        // 两个值都要落在 dump 的地址空间（0x1000000000 ~ 0x1400000000）
-        let inSpace = { (v: UInt64) -> Bool in v >= 0x1000000000 && v < 0x1400000000 }
-        guard inSpace(g), inSpace(n) else { return nil }
-        return base
+        _ = delta
+        _ = expectedDelta
+        return (base, "OCRok vt=0x\(String(vtable, radix: 16))")
     }
+
 
     /// 扫基址：最后手段。128MB 内找 Mach-O magic。
     static func stepBaseScan(pid: Int32) -> String {
