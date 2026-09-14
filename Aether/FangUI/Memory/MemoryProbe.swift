@@ -141,7 +141,13 @@ final class MemoryProbe {
             + (isMachO ? "是Mach-O(基址正确,读通)" : "不是Mach-O(基址被ASLR搬了)")
     }
 
-    /// 定点读：用 dump 偏移读三个全局量，每个当指针看。只读 3 个地址。
+    /// 定点读：用 dump 偏移读三个全局量，打印**完整 8 字节值**，
+    /// 并算出实测差值跟 dump 差值对比。
+    ///
+    /// 为什么要算差值：村口（模块基址）会被 ASLR 挪，但**两个全局量之间的距离不变**。
+    ///   dump 时 GNames - GObjects = 0x1C4EBF90
+    /// 读出来的两个值如果差值就是这个数，说明位置找对了 ——
+    /// 不需要先知道村口，差值自己会证明。
     static func stepFixedRead(pid: Int32) -> String {
         let off = Offsets.load()
         let (kr, p) = port(for: pid)
@@ -152,26 +158,108 @@ final class MemoryProbe {
             ("GNames", off.gNames),
             ("GWorld", off.gWorld)
         ]
-        var ok = 0
+        var values: [String: UInt64] = [:]
         var parts: [String] = []
         for (name, addr) in items {
-            let (rk, value, real, hi) = readPointer(port: p, address: MachVmAddress(addr))
+            let (rk, value, real, _) = readPointer(port: p, address: MachVmAddress(addr))
             if rk != KERN_SUCCESS {
                 parts.append("\(name)=\(describe(rk))")
-            } else if real {
-                ok += 1
-                parts.append("\(name)=OK(hi\(hi))")
-            } else {
-                parts.append("\(name)=异常(0x\(String(value, radix: 16)))")
+                continue
             }
+            values[name] = value
+            // 打完整值；real 只是粗判，不作为结论
+            parts.append("\(name)=0x\(String(value, radix: 16))\(real ? "" : "?")")
         }
-        let verdict = (ok == items.count) ? "三个都在 → 读通"
-                    : (ok > 0 ? "部分通" : "全不通")
-        return "定点读[\(verdict)] " + parts.joined(separator: " ")
+
+        // 差值对比：跟村口无关的恒定判据
+        var deltaNote = ""
+        if let g = values["GObjects"], let n = values["GNames"] {
+            let measured = (n > g) ? (n - g) : (g - n)
+            let expected: UInt64 = 0x117597F90 - 0x115A21B00   // dump 时的 GNames - GObjects
+            let same = (measured == expected)
+            deltaNote = " Δ实测=0x\(String(measured, radix: 16)) Δ期望=0x\(String(expected, radix: 16)) "
+                + (same ? "→一致(位置对了!)" : "→不一致")
+        }
+        return "定点读 " + parts.joined(separator: " ") + deltaNote
     }
 
-    /// 模块头：确认 ASLR 是否搬过基址（与读证同源，保留独立入口便于对照）。
-    static func stepModuleHead(pid: Int32) -> String { stepReadProof(pid: pid) }
+    /// 找村口：在 dump 基址附近按页步进，用 Δ 判据精确认村口。
+    ///
+    /// 判据（跟村口无关的恒定关系）：
+    ///   dump 时 GNames - GObjects = 0x1C4EBF90
+    /// 候选基址必须让这两个地址读出的值**差值就是这个数**，并且两个值都落在
+    /// dump 的地址空间里。比"看指针像不像"可靠得多 —— 两个独立的数同时对。
+    ///
+    /// 代价：每页只读 8 字节（不是 64KB），±4MB 是 1024 页 → 1024 次小读。
+    /// 这是刻意压低的读取量：大块连续读是之前把游戏搞崩的原因。
+    static func stepFindBase(pid: Int32) -> String {
+        let off = Offsets.load()
+        let (kr, p) = port(for: pid)
+        guard kr == KERN_SUCCESS, p != 0 else { return "找村口: 取端口失败 \(describe(kr))" }
+
+        let page: UInt64 = 0x4000
+        let dumpBase = off.moduleBase
+        let expectedDelta: UInt64 = 0x117597F90 - 0x115A21B00
+        let objectsOff = off.gObjects - dumpBase
+        let namesOff = off.gNames - dumpBase
+        let lo: UInt64 = 0x1000000000
+        let hi: UInt64 = 0x1400000000
+
+        // 先诊断：在 dump 基址上读一次，看两个全局量分别是什么
+        // （这比直接扫有用 —— 如果这里就能看出是哪个不对，就不用扫）
+        var diag = ""
+        do {
+            let (r1, g) = readPointer(port: p, address: MachVmAddress(dumpBase + objectsOff))
+            let (r2, n) = readPointer(port: p, address: MachVmAddress(dumpBase + namesOff))
+            let gOk = (r1 == KERN_SUCCESS) && g >= lo && g < hi
+            let nOk = (r2 == KERN_SUCCESS) && n >= lo && n < hi
+            diag = " [dump基址: GObj\(gOk ? "内" : "外") GName\(nOk ? "内" : "外")]"
+        }
+
+        // 逐轮向外扩：每轮扫窗口 [dump ± span*(round+1)]，只扫新增的环带，不重复
+        let span = page * 256                 // 每轮外扩 4MB
+        var scanned = 0
+        for round in 0..<4 {                  // 最多到 ±16MB
+            let w = span * UInt64(round + 1)
+            // 低侧环带
+            var a = dumpBase
+            while a >= dumpBase - w, a > page {
+                if let hit = probeBase(port: p, base: a, objectsOff: objectsOff,
+                                       namesOff: namesOff, expectedDelta: expectedDelta) {
+                    return "找村口: 命中 0x\(String(hit, radix: 16)) 扫\(scanned)页" + diag
+                }
+                a -= page
+                scanned += 1
+            }
+            // 高侧环带
+            var b = dumpBase
+            while b <= dumpBase + w {
+                if let hit = probeBase(port: p, base: b, objectsOff: objectsOff,
+                                       namesOff: namesOff, expectedDelta: expectedDelta) {
+                    return "找村口: 命中 0x\(String(hit, radix: 16)) 扫\(scanned)页" + diag
+                }
+                b += page
+                scanned += 1
+            }
+        }
+        return "找村口: ±16MB 内未命中 扫\(scanned)页" + diag
+    }
+
+    /// 试探一个候选基址：读 GObjects/GNames 两个全局量，看差值对不对。
+    private static func probeBase(port: MachPort, base: UInt64, objectsOff: UInt64,
+                                  namesOff: UInt64, expectedDelta: UInt64) -> UInt64? {
+        let (rk1, g) = readPointer(port: port, address: MachVmAddress(base + objectsOff))
+        guard rk1 == KERN_SUCCESS, g != 0 else { return nil }
+        let (rk2, n) = readPointer(port: port, address: MachVmAddress(base + namesOff))
+        guard rk2 == KERN_SUCCESS, n != 0 else { return nil }
+
+        let delta = (n > g) ? (n - g) : (g - n)
+        guard delta == expectedDelta else { return nil }
+        // 两个值都要落在 dump 的地址空间（0x1000000000 ~ 0x1400000000）
+        let inSpace = { (v: UInt64) -> Bool in v >= 0x1000000000 && v < 0x1400000000 }
+        guard inSpace(g), inSpace(n) else { return nil }
+        return base
+    }
 
     /// 扫基址：最后手段。128MB 内找 Mach-O magic。
     static func stepBaseScan(pid: Int32) -> String {

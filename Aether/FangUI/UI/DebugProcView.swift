@@ -30,7 +30,6 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     /// 定点读：用 dump 偏移读 GObjects/GNames/GWorld —— 只读 3 个地址，不扫描
     private let btnFixed = UIButton(type: .system)
     /// 读模块头：dump 基址处读 Mach-O，判断 ASLR 是否搬过基址
-    private let btnHead = UIButton(type: .system)
     /// 扫基址：128MB 内找 Mach-O magic（比上一版范围小）
     private let btnScan = UIButton(type: .system)
 
@@ -57,8 +56,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
             (btnDlsym, "dlsym", #selector(onDlsym)),
             (btnProof, "读证", #selector(onProof)),
             (btnFixed, "定点读", #selector(onFixedRead)),
-            (btnHead, "模块头", #selector(onModuleHead)),
-            (btnScan, "扫基址", #selector(onBaseScan)),
+            (btnScan, "找村口", #selector(onFindBase)),
             (btnRefresh, "刷新", #selector(onRefresh)),
             (btnCrashFile, "崩溃文件", #selector(onCrashFile))
         ]
@@ -93,7 +91,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         probeLabel.frame = CGRect(x: 0, y: 30, width: w, height: 14)
 
         // 八个按钮排成 4×2
-        let all = [btnSym, btnDlsym, btnProof, btnFixed, btnHead, btnScan, btnRefresh, btnCrashFile]
+        let all = [btnSym, btnDlsym, btnProof, btnFixed, btnScan, btnRefresh, btnCrashFile]
         let gap: CGFloat = 4
         let perRow = 4
         let bw = (w - gap * CGFloat(perRow - 1)) / CGFloat(perRow)
@@ -162,17 +160,10 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         probeLabel.textColor = accent
     }
 
-    /// 读模块头：dump 基址处读 Mach-O 头，能判断 ASLR 是否搬过基址。
-    @objc private func onModuleHead() {
+    /// 找村口：小范围页步进 + Δ 判据，每页只读 8 字节。
+    @objc private func onFindBase() {
         guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
-        probeLabel.text = MemoryProbe.stepModuleHead(pid: gpid)
-        probeLabel.textColor = accent
-    }
-
-    /// 扫基址：最后手段，128MB 内找 Mach-O magic。
-    @objc private func onBaseScan() {
-        guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
-        probeLabel.text = MemoryProbe.stepBaseScan(pid: gpid)
+        probeLabel.text = MemoryProbe.stepFindBase(pid: gpid)
         probeLabel.textColor = accent
     }
 
