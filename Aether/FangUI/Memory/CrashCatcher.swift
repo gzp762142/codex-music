@@ -38,7 +38,9 @@ final class CrashCatcher {
                     let fd = open(url.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
                     if fd >= 0 {
                         msg.withCString { ptr in
-                            _ = write(fd, ptr, strlen(ptr))
+                            // 必须写 Darwin.write：UIKit/Foundation 上下文里
+                            // 裸 write 会被解析成实例方法而编译失败。
+                            _ = Darwin.write(fd, ptr, strlen(ptr))
                         }
                         close(fd)
                     }
