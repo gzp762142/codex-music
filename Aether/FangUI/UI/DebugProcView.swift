@@ -27,6 +27,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     private let btnDlsym = UIButton(type: .system)
     private let btnProof = UIButton(type: .system)
     private let btnCrashFile = UIButton(type: .system)
+    private let btnSelf = UIButton(type: .system)
 
     private let accent = UIColor.hex(0x185EE0)
     private let idleText = UIColor.hex(0x5A6A82)
@@ -51,7 +52,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
             (btnDlsym, "dlsym", #selector(onDlsym)),
             (btnProof, "读证", #selector(onProof)),
             (btnRefresh, "刷新", #selector(onRefresh)),
-            (btnCrashFile, "崩溃文件", #selector(onCrashFile))
+            (btnCrashFile, "崩溃文件", #selector(onCrashFile)),
+            (btnSelf, "自测(本进程)", #selector(onSelfTest))
         ]
         for (b, title, sel) in buttons {
             b.setTitle(title, for: .normal)
@@ -83,16 +85,21 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         crashLabel.frame = CGRect(x: w * 0.6, y: 15, width: w * 0.4, height: 14)
         probeLabel.frame = CGRect(x: 0, y: 30, width: w, height: 14)
 
-        // 六个按钮排一行，等宽
-        let all = [btnSym, btnDlsym, btnProof, btnRefresh, btnCrashFile]
-        let gap: CGFloat = 3
-        let bw = (w - gap * CGFloat(all.count - 1)) / CGFloat(all.count)
+        // 六个按钮排成 3×2：单行会窄到放不下"自测(本进程)"这种标签
+        let all = [btnSym, btnDlsym, btnProof, btnRefresh, btnCrashFile, btnSelf]
+        let gap: CGFloat = 4
+        let perRow = 3
+        let bw = (w - gap * CGFloat(perRow - 1)) / CGFloat(perRow)
+        let bh = btnRowH - 6
         for (i, b) in all.enumerated() {
-            b.frame = CGRect(x: CGFloat(i) * (bw + gap), y: headerH, width: bw, height: btnRowH - 6)
+            let col = CGFloat(i % perRow)
+            let row = CGFloat(i / perRow)
+            b.frame = CGRect(x: col * (bw + gap), y: headerH + row * btnRowH,
+                             width: bw, height: bh)
         }
 
-        table.frame = CGRect(x: 0, y: headerH + btnRowH, width: w,
-                             height: max(0, bounds.height - headerH - btnRowH))
+        table.frame = CGRect(x: 0, y: headerH + btnRowH * 2, width: w,
+                             height: max(0, bounds.height - headerH - btnRowH * 2))
     }
 
     func reload() { onRefresh() }
@@ -138,6 +145,13 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
         probeLabel.text = probe.stepReadProof(pid: gpid)
         probeLabel.textColor = accent
+    }
+
+    /// 对照实验：对自己进程跑同一套 vm_region 调用。
+    /// 自己都失败 → 参数写错；自己成功 → 之前对游戏的失败才是权限问题。
+    @objc private func onSelfTest() {
+        probeLabel.text = MemoryProbe.stepSelfTest()
+        probeLabel.textColor = idleText
     }
 
     @objc private func onCrashFile() {
