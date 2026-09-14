@@ -166,6 +166,42 @@ final class MemoryProbe {
         return (kr, p)
     }
 
+    // MARK: - 地址换算（唯一入口）
+
+    /// dump 时 __TEXT.vmaddr 恒为 0x100000000 —— 静态域的零点。
+    private static let staticImageBase: UInt64 = 0x100000000
+
+    /// 本次运行找到的 image base 与 slide。
+    /// 由「找村口」写入；只对同一次进程启动有效（游戏重启后 ASLR 会搬走）。
+    private(set) static var imageBase: UInt64 = 0
+    private(set) static var imageSlide: UInt64 = 0
+
+    /// **唯一**的地址换算入口：OFFSET_*（静态 vmaddr 域地址）→ 本次运行的绝对地址。
+    ///
+    ///     slide   = imageBase − 0x100000000
+    ///     runtime = slide + staticAddr
+    ///
+    /// 全仓约定：不出现 `imageBase + OFFSET` 的写法 —— 那是把"静态域地址"
+    /// 当成"相对基址的 RVA"用了，会整整多算一个 0x100000000。
+    private static func runtime(_ staticAddr: UInt64, slide: UInt64) -> UInt64 {
+        slide &+ staticAddr
+    }
+
+    /// slide = imageBase − 静态基址。
+    private static func slide(ofImageBase base: UInt64) -> UInt64 { base &- staticImageBase }
+
+    /// 候选地址是不是真的 Mach-O 可执行头：magic == 0xFEEDFACF 且 filetype == MH_EXECUTE(2)。
+    /// 两次 4 字节小读，不循环、不扫描。
+    private static func isExecutableMachO(port: MachPort, _ addr: UInt64) -> (Bool, String) {
+        let (rk1, magic) = readAt(port: port, address: MachVmAddress(addr))
+        guard rk1 == KERN_SUCCESS else { return (false, "magic读失败/\(rk1)") }
+        guard magic == 0xFEEDFACF else { return (false, "magic=0x\(String(magic, radix: 16))") }
+        let (rk2, filetype) = readAt(port: port, address: MachVmAddress(addr &+ 12))
+        guard rk2 == KERN_SUCCESS else { return (false, "filetype读失败/\(rk2)") }
+        guard filetype == 2 else { return (false, "filetype=\(filetype)") }
+        return (true, "MH_EXECUTE")
+    }
+
     // MARK: - 面板动作
 
     /// 读证：在 dump 记录的模块基址处读 Mach-O 头。
@@ -184,46 +220,74 @@ final class MemoryProbe {
             + (isMachO ? "是Mach-O(基址正确,读通)" : "不是Mach-O(基址被ASLR搬了)")
     }
 
-    /// 定点读：用 dump 偏移读三个全局量，打印**完整 8 字节值**，
-    /// 并算出实测差值跟 dump 差值对比。
+    /// 定点读：**第一次真实点读**，全部加起来约 20 字节，不写循环、不做扫描。
     ///
-    /// 为什么要算差值：村口（模块基址）会被 ASLR 挪，但**两个全局量之间的距离不变**。
-    ///   dump 时 GNames - GObjects = 0x1C4EBF90
-    /// 读出来的两个值如果差值就是这个数，说明位置找对了 ——
-    /// 不需要先知道村口，差值自己会证明。
+    /// ```
+    /// slot = runtime(OFFSET_GOBJECTS)     // FUObjectArray
+    /// slot + 0x118 → NumElements (UInt32)
+    /// slot + 0xE0  → chunk0      (UInt64)
+    /// chunk0       → 第一个 FUObjectItem 的 Object (UInt64, FUObjectItem::Object = 0)
+    /// ```
+    ///
+    /// 验收：NumElements 是六位数（10 万 ~ 200 万）即表示 image base 与换算公式同时正确。
+    /// 前提：先点过「找村口」—— base/slide 存在这份 static 状态里，不跨进程启动保留。
     static func stepFixedRead(pid: Int32) -> String {
-        let off = Offsets.load()
+        guard imageSlide != 0, imageBase != 0 else {
+            return "定点读: 还没有基址 —— 先点「找村口」"
+        }
         let (kr, p) = port(for: pid)
         guard kr == KERN_SUCCESS, p != 0 else { return "定点读: 取端口失败 \(describe(kr))" }
 
-        let items: [(String, UInt64)] = [
-            ("GObjects", off.gObjects),
-            ("GNames", off.gNames),
-            ("GWorld", off.gWorld)
-        ]
-        var values: [String: UInt64] = [:]
-        var parts: [String] = []
-        for (name, addr) in items {
-            let (rk, value, real, _) = pointerInfo(port: p, address: MachVmAddress(addr))
-            if rk != KERN_SUCCESS {
-                parts.append("\(name)=\(describe(rk))")
-                continue
+        let s = imageSlide
+        let off = Offsets.load()
+        let slot = runtime(off.gObjects, slide: s)
+
+        // ① NumElements（UInt32）—— 唯一的验收数字
+        let (rkNum, num) = readAt(port: p, address: MachVmAddress(slot &+ 0x118))
+        guard rkNum == KERN_SUCCESS else {
+            return "定点读: NumElements 读失败 \(describe(rkNum)) @0x\(String(slot &+ 0x118, radix: 16))"
+        }
+        // ② chunk0 指针（UInt64）
+        let (rkChunk, chunk0) = readRaw(port: p, address: MachVmAddress(slot &+ 0xE0))
+        // ③ 第一个 FUObjectItem 的 Object（UInt64）
+        var obj0: UInt64 = 0
+        var objNote = ""
+        if rkChunk == KERN_SUCCESS, chunk0 != 0 {
+            let (rkObj, v) = readRaw(port: p, address: MachVmAddress(chunk0))
+            if rkObj == KERN_SUCCESS {
+                obj0 = v
+            } else {
+                objNote = "obj0 读失败 \(describe(rkObj))"
             }
-            values[name] = value
-            // 打完整值；real 只是粗判，不作为结论
-            parts.append("\(name)=0x\(String(value, radix: 16))\(real ? "" : "?")")
+        } else {
+            objNote = "chunk0 读失败 \(describe(rkChunk))"
         }
 
-        // 差值对比：跟村口无关的恒定判据
-        var deltaNote = ""
-        if let g = values["GObjects"], let n = values["GNames"] {
-            let measured = (n > g) ? (n - g) : (g - n)
-            let expected: UInt64 = 0x117597F90 - 0x115A21B00   // dump 时的 GNames - GObjects
-            let same = (measured == expected)
-            deltaNote = " Δ实测=0x\(String(measured, radix: 16)) Δ期望=0x\(String(expected, radix: 16)) "
-                + (same ? "→一致(位置对了!)" : "→不一致")
+        let n = Int(num)
+        let hit = (n >= 100_000 && n <= 2_000_000)
+        var lines: [String] = []
+        lines.append("定点读: NumElements=\(n) " + (hit ? "✓ 命中（六位数）" : "✗ 数量异常"))
+        lines.append("base=0x\(String(imageBase, radix: 16)) slide=0x\(String(s, radix: 16))")
+        lines.append("slot=0x\(String(slot, radix: 16)) = slide + OFFSET_GOBJECTS")
+        lines.append(rkChunk == KERN_SUCCESS
+            ? "chunk0=0x\(String(chunk0, radix: 16))"
+            : "chunk0 读失败 \(describe(rkChunk))")
+        lines.append(objNote.isEmpty
+            ? "obj0=0x\(String(obj0, radix: 16))" + (obj0 == 0 ? "（空槽）" : "")
+            : objNote)
+        if !hit {
+            // 数值异常时把两种病因分开：base/slide 错，还是字段偏移错。
+            let hi = imageBase &+ 0x13000000
+            let slotInRange = (slot >= imageBase && slot < hi)
+            let chunkLooksHeap = (chunk0 >= 0x120000000 && chunk0 < 0x140000000)
+            lines.append("诊断: slot" + (slotInRange
+                ? " 在映像区间内 → base/slide 对得上，可疑点转到字段偏移 0x118/0xE0"
+                : " 不在映像区间 → base 或换算公式错"))
+            lines.append("诊断: chunk0" + (chunkLooksHeap
+                ? " 像堆指针（0x12xxxxxxx 段）"
+                : " 不像堆指针（不落在 0x120000000~0x140000000）"))
         }
-        return "定点读 " + parts.joined(separator: " ") + deltaNote
+        return lines.joined(separator: "\n")
     }
 
     /// 找村口：在 dump 基址附近按页步进，用 Δ 判据精确认村口。
@@ -332,20 +396,28 @@ final class MemoryProbe {
         var scanned = 0
         var hitBase: UInt64 = 0
         var hitName = ""
+        /// 被 Mach-O 校验否掉的候选（用于面板诊断：命中条件太宽还是真没找到）
+        var rejects: [String] = []
 
         while scanned < 6000 {
             let (ok, size, prot, offset) = nextRegion(task: p, addr: &addr)
             guard ok else { break }
             scanned += 1
 
-            // 三个条件全中才算 __TEXT
+            // 三个 region 条件全中，只说明「像 __TEXT」
             if let path = regionFile(pid: pid, addr: addr),
                path.lowercased().contains("shadowtracker"),
                (prot & 0x4) != 0,          // VM_PROT_EXECUTE
                offset == 0 {
-                hitBase = addr
-                hitName = path.split(separator: "/").last.map(String.init) ?? "?"
-                break
+                // ① 还得它真的是 Mach-O 可执行头（magic + filetype），
+                //    否则继续找下一个候选，绝不把可疑值当基址返回。
+                let (okMagic, why) = isExecutableMachO(port: p, addr)
+                if okMagic {
+                    hitBase = addr
+                    hitName = path.split(separator: "/").last.map(String.init) ?? "?"
+                    break
+                }
+                rejects.append("0x\(String(addr, radix: 16))(\(why))")
             }
 
             addr += size
@@ -353,91 +425,34 @@ final class MemoryProbe {
         }
 
         guard hitBase != 0 else {
-            return "找基址: 枚举\(scanned)个region，未命中(__TEXT & offset=0)"
-        }
-        return "找基址: base=0x\(String(hitBase, radix: 16)) region=\(scanned) \(hitName)"
-    }
-
-    /// 试探一个候选基址 —— 用 dump 里的**多重约束**判据。
-    ///
-    /// 单看"指针像不像"太弱（图二就误判过），这里用四个互相独立的条件：
-    ///   1. GNames 读出的指针落在 dump 的地址空间（0x11xxxxxxx）
-    ///   2. GObjects 读出的 chunk0 指针落在堆区间（0x120000000 ~ 0x140000000）
-    ///   3. chunk0 + 0*0x18 处读出的首个对象地址 = 0x128370000（dump 记录）
-    ///   4. 那个对象的 vtable 落在模块映像区间
-    ///
-    /// 四个条件全中才认 —— 误判概率极低。
-    /// 返回 (命中基址, 失败原因)；未命中时原因用于面板诊断。
-    private static func probeBase(port: MachPort, base: UInt64, objectsOff: UInt64,
-                                  namesOff: UInt64, expectedDelta: UInt64)
-        -> (UInt64?, String) {
-
-        let (rk1, g) = readRaw(port: port, address: MachVmAddress(base + objectsOff))
-        guard rk1 == KERN_SUCCESS, g != 0 else { return (nil, "GObjects读失败/\(rk1)") }
-        let (rk2, n) = readRaw(port: port, address: MachVmAddress(base + namesOff))
-        guard rk2 == KERN_SUCCESS, n != 0 else { return (nil, "GNames读失败/\(rk2)") }
-
-        // 条件 1：GNames 落在 dump 地址空间
-        let ns: UInt64 = 0x110000000
-        let ne: UInt64 = 0x120000000
-        guard n >= ns, n < ne else { return (nil, "GNames越域") }
-
-        // 条件 2：chunk0 是堆指针
-        let hs: UInt64 = 0x120000000
-        let he: UInt64 = 0x140000000
-        guard g >= hs, g < he else { return (nil, "GObj非堆指针") }
-
-        // 条件 3：chunk0[0] 必须是 dump 记录的那个对象地址
-        let (rk3, firstObj) = readRaw(port: port, address: MachVmAddress(g))
-        guard rk3 == KERN_SUCCESS, firstObj == 0x128370000 else {
-            return (nil, "chunk0[0]≠0x128370000")
+            let why = rejects.isEmpty ? "" : " 否掉:" + rejects.prefix(3).joined(separator: " ")
+            return "找基址: 枚举\(scanned)个region，未命中(__TEXT & offset=0)" + why
         }
 
-        // 条件 4：该对象的 vtable 落在模块映像内
-        let (rk4, vtable) = readRaw(port: port, address: MachVmAddress(firstObj))
-        guard rk4 == KERN_SUCCESS, vtable >= 0x1000000000, vtable < 0x1200000000 else {
-            return (nil, "vtable越域")
+        // ② 记账：base / slide 存下来，后面「定点读」直接用这份状态
+        let s = slide(ofImageBase: hitBase)
+        imageBase = hitBase
+        imageSlide = s
+
+        // ③ 摊开 slide 与三个可用 OFFSET 的运行时落点，目视确认都落在映像区间
+        let off = Offsets.load()
+        let hi = hitBase &+ 0x13000000
+        let slots: [(String, UInt64)] = [
+            ("GObjects", off.gObjects),
+            ("GNames", off.gNames),
+            ("GWorld", off.gWorld)
+        ]
+        var lines: [String] = []
+        lines.append("找基址: ✓ base=0x\(String(hitBase, radix: 16)) region=\(scanned) \(hitName)")
+        lines.append("slide=0x\(String(s, radix: 16)) = base − 0x100000000")
+        lines.append("映像区间 [0x\(String(hitBase, radix: 16)), 0x\(String(hi, radix: 16)))")
+        for (name, staticAddr) in slots {
+            let r = runtime(staticAddr, slide: s)
+            let inside = (r >= hitBase && r < hi)
+            let pad = String(repeating: " ", count: max(0, 9 - name.count))
+            lines.append("\(name)\(pad)0x\(String(staticAddr, radix: 16)) → 0x\(String(r, radix: 16)) "
+                + (inside ? "✓" : "✗越界"))
         }
-
-        // 差值仅作参考（条件已足够强，Δ 不满足也放行但会标注）
-        let delta = (n > g) ? (n - g) : (g - n)
-        _ = delta
-        _ = expectedDelta
-        return (base, "OCRok vt=0x\(String(vtable, radix: 16))")
-    }
-
-
-    /// 扫基址：最后手段。128MB 内找 Mach-O magic。
-    static func stepBaseScan(pid: Int32) -> String {
-        let (kr, p) = port(for: pid)
-        guard kr == KERN_SUCCESS, p != 0 else { return "扫基址: 取端口失败 \(describe(kr))" }
-        guard let vmRead = vmReadFn else { return "扫基址: vm_read 符号缺失" }
-
-        let startAddr: MachVmAddress = 0x100000000
-        let blockSize = 0x10000
-        let blocks = 2048
-        var readable = 0
-        for i in 0..<blocks {
-            let addr = startAddr + MachVmAddress(i * blockSize)
-            var dataPtr: UInt = 0
-            var dataLen: MachVmSize = MachVmSize(blockSize)
-            let rk = vmRead(p, addr, MachVmSize(blockSize), &dataPtr, &dataLen)
-            guard rk == KERN_SUCCESS, dataPtr != 0, dataLen >= 4 else { continue }
-            readable += 1
-            var found: MachVmAddress = 0
-            if let base = UnsafeRawPointer(bitPattern: dataPtr) {
-                let p32 = base.assumingMemoryBound(to: UInt32.self)
-                let words = Int(dataLen) / 4
-                for w in 0..<words where p32[w] == 0xFEEDFACF {
-                    found = addr + MachVmAddress(w * 4)
-                    break
-                }
-            }
-            _ = vmDeallocateFn?(p, dataPtr, dataLen)
-            if found != 0 {
-                return "扫基址: 命中 0x\(String(found, radix: 16)) 块\(i + 1) 可读\(readable)"
-            }
-        }
-        return "扫基址: 128MB 内未命中 可读\(readable)块"
+        return lines.joined(separator: "\n")
     }
 }

@@ -123,6 +123,17 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
 
     func reload() { onRefresh() }
 
+    /// 把多行报告同时放进状态行（第一行）和可滚动列表（全部行）。
+    /// 「找村口」「定点读」的结论是多行的（base/slide/三个落点/链上的值），
+    /// 单行状态栏放不下，必须给列表看。
+    private func showReport(_ text: String) {
+        let lines = text.split(separator: "\n").map(String.init)
+        probeLabel.text = lines.first ?? text
+        probeLabel.textColor = text.contains("✓") ? accent : warnText
+        extraRows = lines
+        table.reloadData()
+    }
+
     // MARK: - 单步动作
 
     @objc private func onRefresh() {
@@ -146,6 +157,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         } else {
             crashLabel.text = "自记:无"
         }
+        // 刷新 = 回进程列表（报告是上一次动作的产物，不该一直占着列表）
+        extraRows = []
         table.reloadData()
     }
 
@@ -166,12 +179,10 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         probeLabel.textColor = accent
     }
 
-    /// 定点读：只用 dump 偏移读 3 个全局量，一次调用读完，不扫描。
-    /// 读到有效指针 → 权限和读链路都没问题，"找不到"是范围/基址问题。
+    /// 定点读：用「找村口」存下的 base/slide 换算后点读 GObjects 链（约 20 字节）。
     @objc private func onFixedRead() {
         guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
-        probeLabel.text = MemoryProbe.stepFixedRead(pid: gpid)
-        probeLabel.textColor = accent
+        showReport(MemoryProbe.stepFixedRead(pid: gpid))
     }
 
     /// 静默测试：拿到端口后什么都不读，看目标会不会自己死。
@@ -220,11 +231,11 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         probeLabel.textColor = accent
     }
 
-    /// 找村口：小范围页步进 + Δ 判据，每页只读 8 字节。
+    /// 找村口：枚举 region（三条件）+ Mach-O 头校验；命中后记下 base/slide。
+    /// 报告多行：第一行进状态行，全部行进可滚动列表。
     @objc private func onFindBase() {
         guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
-        probeLabel.text = MemoryProbe.stepFindBase(pid: gpid)
-        probeLabel.textColor = accent
+        showReport(MemoryProbe.stepFindBase(pid: gpid))
     }
 
     @objc private func onCrashFile() {

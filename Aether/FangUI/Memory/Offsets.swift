@@ -9,8 +9,17 @@ import Foundation
 ///
 ///     模块基址=0x1047D0000
 ///     GObjects=0x111251B00
-///     GNames=0x1176ED520
+///     GNames=0x111FBA198
 ///     GWorld=0x11148B608
+///
+/// **下面这三个 OFFSET 都是「静态 vmaddr 域地址」，不是 RVA**：
+/// dump 时 __TEXT.vmaddr 恒为 0x100000000，所以
+///     运行时地址 = slide + 静态地址,   slide = imageBase − 0x100000000
+/// 换算只允许走 MemoryProbe.runtime()，别处不要自己加减。
+///
+/// GNames 必须给**槽的静态域地址** 0x111FBA198
+/// （= dump 日志里 "GNames ptr addr 0x11678A198" − slide 0x47D0000）；
+/// 日志里那个 0x1176ED520 是 FNamePool 的**堆地址**，跨进程无效。
 ///
 /// 换游戏版本时只改这个文件，不用重新编译 —— 偏移每次更新都会变。
 struct Offsets {
@@ -19,7 +28,7 @@ struct Offsets {
     var moduleBase: UInt64
     /// FUObjectArray 结构体地址
     var gObjects: UInt64
-    /// TNameArray (FNamePool) 地址
+    /// GNames 槽的静态域地址（不是 dump 日志里的 FNamePool 堆地址）
     var gNames: UInt64
     /// UWorld**
     var gWorld: UInt64
@@ -28,7 +37,7 @@ struct Offsets {
 
     static let defaultModuleBase: UInt64 = 0x1047D0000
     static let defaultGObjects: UInt64   = 0x111251B00
-    static let defaultGNames: UInt64     = 0x1176ED520
+    static let defaultGNames: UInt64     = 0x111FBA198
     static let defaultGWorld: UInt64     = 0x11148B608
     static let defaultModuleName         = "ShadowTrackerExtra"
 
