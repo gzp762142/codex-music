@@ -14,6 +14,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     /// 静默测试：只持端口、零读取，看目标是否自己死
     private let silent = SilentProbe()
     private var entries: [ProcessScanner.ProcEntry] = []
+    /// 非空时表格显示这些文本行（Jetsam 报告等），否则显示进程列表
+    private var extraRows: [String] = []
     private var gpid: Int32 = 0
     private let headerH: CGFloat = 50
     private let btnRowH: CGFloat = 26
@@ -196,16 +198,19 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         silent.start(pid: gpid, seconds: 120)
     }
 
-    /// Jetsam 日志：按 JetsamEvent 前缀找（文件名不带进程名）
+    /// Jetsam 日志：完整报告填进表格（可滚动）；再点一次返回进程列表
     @objc private func onJetsam() {
-        if let (summary, hasTarget, _) = JetsamLogReader.latestSummary(target: "ShadowTrackerExtra") {
-            probeLabel.text = "Jetsam: " + summary
-            probeLabel.textColor = hasTarget ? warnText : idleText
-        } else {
-            let n = JetsamLogReader.findLogs().count
-            probeLabel.text = "Jetsam: 未找到 JetsamEvent 日志（已扫 \(n) 个候选目录）"
+        if !extraRows.isEmpty {
+            extraRows = []
+            table.reloadData()
+            probeLabel.text = "已返回进程列表"
             probeLabel.textColor = idleText
+            return
         }
+        extraRows = JetsamLogReader.report()
+        table.reloadData()
+        probeLabel.text = "Jetsam 报告 \(extraRows.count) 行已填入列表（可滚动）"
+        probeLabel.textColor = accent
     }
 
     /// 区域归属：一次调用问「dump 基址属于哪个文件」。
@@ -234,13 +239,31 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     // MARK: - Table
 
     func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-        entries.count
+        extraRows.isEmpty ? entries.count : extraRows.count
     }
 
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
         let cell = tableView.dequeueReusableCell(withIdentifier: "proc", for: indexPath)
         cell.backgroundColor = .clear
         cell.selectionStyle = .none
+
+        // 文本行模式（Jetsam 报告等）：逐行显示，可滚动
+        if !extraRows.isEmpty {
+            guard indexPath.row < extraRows.count else { return cell }
+            let line = extraRows[indexPath.row]
+            cell.textLabel?.text = line
+            cell.textLabel?.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+            cell.textLabel?.lineBreakMode = .byTruncatingTail
+            if line.contains("✓") {
+                cell.textLabel?.textColor = accent
+            } else if line.contains("✗") {
+                cell.textLabel?.textColor = warnText
+            } else {
+                cell.textLabel?.textColor = idleText
+            }
+            return cell
+        }
+
         if indexPath.row >= entries.count { return cell }
 
         let e = entries[indexPath.row]
