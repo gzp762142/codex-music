@@ -11,6 +11,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
 
     private let scanner = ProcessScanner()
     private let probe = MemoryProbe()
+    /// 静默测试：只持端口、零读取，看目标是否自己死
+    private let silent = SilentProbe()
     private var entries: [ProcessScanner.ProcEntry] = []
     private var gpid: Int32 = 0
     private let headerH: CGFloat = 50
@@ -34,6 +36,10 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     private let btnScan = UIButton(type: .system)
     /// 区域归属：问「这个地址属于哪个文件」（零风险探测）
     private let btnRegion = UIButton(type: .system)
+    /// 静默测试：只持端口零读取（切掉"端口本身是否致命"这一类假设）
+    private let btnSilent = UIButton(type: .system)
+    /// Jetsam 日志：文件名不带进程名，必须按 JetsamEvent 前缀扫
+    private let btnJetsam = UIButton(type: .system)
 
     private let accent = UIColor.hex(0x185EE0)
     private let idleText = UIColor.hex(0x5A6A82)
@@ -61,7 +67,9 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
             (btnRegion, "区域归属", #selector(onRegionName)),
             (btnScan, "找村口", #selector(onFindBase)),
             (btnRefresh, "刷新", #selector(onRefresh)),
-            (btnCrashFile, "崩溃文件", #selector(onCrashFile))
+            (btnCrashFile, "崩溃文件", #selector(onCrashFile)),
+            (btnSilent, "静默", #selector(onSilent)),
+            (btnJetsam, "Jetsam", #selector(onJetsam))
         ]
         for (b, title, sel) in buttons {
             b.setTitle(title, for: .normal)
@@ -94,9 +102,10 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         probeLabel.frame = CGRect(x: 0, y: 30, width: w, height: 14)
 
         // 八个按钮排成 4×2
-        let all = [btnSym, btnDlsym, btnProof, btnFixed, btnRegion, btnScan, btnRefresh, btnCrashFile]
+        let all = [btnSym, btnDlsym, btnProof, btnFixed, btnRegion,
+                   btnScan, btnRefresh, btnCrashFile, btnSilent, btnJetsam]
         let gap: CGFloat = 4
-        let perRow = 4
+        let perRow = 5
         let bw = (w - gap * CGFloat(perRow - 1)) / CGFloat(perRow)
         let bh = btnRowH - 6
         for (i, b) in all.enumerated() {
@@ -161,6 +170,42 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
         probeLabel.text = MemoryProbe.stepFixedRead(pid: gpid)
         probeLabel.textColor = accent
+    }
+
+    /// 静默测试：拿到端口后什么都不读，看目标会不会自己死。
+    /// 再点一次 = 手动停止。
+    @objc private func onSilent() {
+        guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
+        if silent.isRunning { silent.stop(); probeLabel.text = "静默测试: 手动停止"; return }
+
+        silent.onTick = { [weak self] sec, alive in
+            guard let s = self else { return }
+            s.probeLabel.text = "静默 \(sec)s · \(alive ? "存活" : "已消失")"
+            s.probeLabel.textColor = alive ? s.idleText : s.warnText
+        }
+        silent.onFinish = { [weak self] sec, aliveAtEnd, gotPort in
+            guard let s = self else { return }
+            let note = gotPort ? "端口已持有" : "端口未拿到"
+            s.probeLabel.text = aliveAtEnd
+                ? "静默\(sec)s 全程存活 → 端口本身不致命[\(note)]"
+                : "静默\(sec)s 时游戏消失 → 病根在端口/进程状态，不在读取[\(note)]"
+            s.probeLabel.textColor = aliveAtEnd ? s.accent : s.warnText
+        }
+        probeLabel.text = "静默测试启动：只持端口，零读取，120s"
+        probeLabel.textColor = idleText
+        silent.start(pid: gpid, seconds: 120)
+    }
+
+    /// Jetsam 日志：按 JetsamEvent 前缀找（文件名不带进程名）
+    @objc private func onJetsam() {
+        if let (summary, hasTarget, _) = JetsamLogReader.latestSummary(target: "ShadowTrackerExtra") {
+            probeLabel.text = "Jetsam: " + summary
+            probeLabel.textColor = hasTarget ? warnText : idleText
+        } else {
+            let n = JetsamLogReader.findLogs().count
+            probeLabel.text = "Jetsam: 未找到 JetsamEvent 日志（已扫 \(n) 个候选目录）"
+            probeLabel.textColor = idleText
+        }
     }
 
     /// 区域归属：一次调用问「dump 基址属于哪个文件」。

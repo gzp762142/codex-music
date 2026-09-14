@@ -67,6 +67,20 @@ final class MemoryProbe {
     // MARK: - 单步动作
 
     /// 第 1 步：只解析符号，不调用任何东西。
+    /// 只取端口并返回它（**不读任何内存**），供静默测试用。
+    /// 返回 nil 表示符号缺失或取端口失败。
+    ///
+    /// 注意返回值写 UInt32 而不是私有别名 MachPort：
+    /// internal 函数的签名不能暴露 private typealias，否则编译报
+    /// "method must be declared private because its parameter uses a private type"。
+    static func acquirePort(pid: Int32) -> (port: UInt32, note: String)? {
+        guard let fn = taskForPidFn else { return nil }
+        var port: MachPort = 0
+        let kr = fn(mach_task_self_, pid, &port)
+        guard kr == KERN_SUCCESS, port != 0 else { return nil }
+        return (port, "port=0x\(String(port, radix: 16))")
+    }
+
     /// 第 1 步：只报告符号解析情况，不调用任何东西。
     static func stepSymbols() -> String { symbolSummary }
 
