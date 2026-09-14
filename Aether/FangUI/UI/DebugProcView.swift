@@ -25,7 +25,6 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     private let btnRefresh = UIButton(type: .system)
     private let btnSym = UIButton(type: .system)
     private let btnDlsym = UIButton(type: .system)
-    private let btnSyscall = UIButton(type: .system)
     private let btnProof = UIButton(type: .system)
     private let btnCrashFile = UIButton(type: .system)
 
@@ -50,7 +49,6 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         let buttons: [(UIButton, String, Selector)] = [
             (btnSym, "符号", #selector(onSym)),
             (btnDlsym, "dlsym", #selector(onDlsym)),
-            (btnSyscall, "syscall45", #selector(onSyscall)),
             (btnProof, "读证", #selector(onProof)),
             (btnRefresh, "刷新", #selector(onRefresh)),
             (btnCrashFile, "崩溃文件", #selector(onCrashFile))
@@ -86,7 +84,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         probeLabel.frame = CGRect(x: 0, y: 30, width: w, height: 14)
 
         // 六个按钮排一行，等宽
-        let all = [btnSym, btnDlsym, btnSyscall, btnProof, btnRefresh, btnCrashFile]
+        let all = [btnSym, btnDlsym, btnProof, btnRefresh, btnCrashFile]
         let gap: CGFloat = 3
         let bw = (w - gap * CGFloat(all.count - 1)) / CGFloat(all.count)
         for (i, b) in all.enumerated() {
@@ -133,12 +131,6 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     @objc private func onDlsym() {
         guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
         probeLabel.text = probe.stepDlsym(pid: gpid)
-        probeLabel.textColor = accent
-    }
-
-    @objc private func onSyscall() {
-        guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
-        probeLabel.text = probe.stepSyscall(pid: gpid)
         probeLabel.textColor = accent
     }
 
