@@ -297,8 +297,8 @@ final class MemoryProbe {
     ///
     /// 三条自我约束：只映射 ≥ minSize 的块（避开碎片）、硬性时间预算、每若干轮确认目标还活着。
     @discardableResult
-    static func mapAllRegions(pid: Int32, minSize: UInt64 = 4 << 20,
-                              budget: TimeInterval = 2.5, maxBlocks: Int = 200) -> String {
+    static func mapAllRegions(pid: Int32, minSize: UInt64 = 1 << 20,
+                              budget: TimeInterval = 2.5, maxBlocks: Int = 400) -> String {
         guard let fn = machVmRemapFn else { return "预映射: mach_vm_remap 符号缺失" }
         let (kr, p) = port(for: pid)
         guard kr == KERN_SUCCESS, p != 0 else { return "预映射: 取端口失败 \(describe(kr))" }
@@ -1197,55 +1197,51 @@ final class MemoryProbe {
             return lines.joined(separator: "\n")
         }
 
-        // ③′ 关卡全景。**PersistentLevel 只有 44 个 actor 是这里的根因**：
-        //     PUBG 这种大场景用流式关卡，地形/建筑/玩家都在 sublevel 里，
-        //     持久关卡只剩下相机、后处理、GameMode 这些框架对象。
-        //     UWorld 自己就有两个更全的视图：
-        //       0x0AB8  ActiveLevelActors  TArray<AActor*>  ← 活动关卡 actor 的合并数组
-        //       0x0AF0  Levels             TArray<ULevel*>  ← 所有关卡，每个再各自持有 Actors
-        //     三个来源都数一遍，谁多就用谁 —— 不猜。
+        // ③′ 关卡全景。**两次都卡在这里**：先只看了 PersistentLevel（44 个，全是框架对象），
+        //     改看最大的子关卡后又只剩射击场物件 —— 因为场景内容分散在 UWorld::Levels 的
+        //     13 个关卡里，玩家在哪个关卡事先并不知道。
+        //       0x0AF0  Levels              TArray<ULevel*>  ← 所有关卡，每个各自持有 Actors
+        //       0x0AB8  ActiveLevelActors   TArray<AActor*>  ← 实测客户端恒为 0，只记录不使用
+        //     **所以这一版把每一个关卡都收进 sources，全都遍历** —— 不再挑一个。
         stageMark("世界 · 关卡全景")
-        var bestData = dataPtr
-        var bestCount = Int(count)
-        var bestLabel = "PersistentLevel"
+        var sources: [(label: String, data: UInt64, count: Int)] = []
+        if dataPtr > 0x100000000, count > 0 {
+            sources.append(("Persistent", dataPtr, Int(count)))
+        }
+        var levelTotal = 0
 
         let (rkAct, actHdr) = readBytes(port: p, address: MachVmAddress(world &+ 0x0AB8), count: 16)
         if rkAct == KERN_SUCCESS, actHdr.count >= 16 {
-            let d = u64le(actHdr, 0)
-            let c = Int(u32le(actHdr, 8))
-            lines.append("ActiveLevelActors: data=\(hexOf(d)) count=\(c)")
-            if d > 0x100000000, c > bestCount, c <= 200_000 {
-                bestData = d; bestCount = c; bestLabel = "ActiveLevelActors"
-            }
+            lines.append("ActiveLevelActors: count=\(Int(u32le(actHdr, 8)))（客户端恒为 0，仅记录）")
         }
 
         let (rkLv, lvHdr) = readBytes(port: p, address: MachVmAddress(world &+ 0x0AF0), count: 16)
         if rkLv == KERN_SUCCESS, lvHdr.count >= 16 {
             let d = u64le(lvHdr, 0)
             let c = Int(u32le(lvHdr, 8))
-            lines.append("UWorld::Levels: data=\(hexOf(d)) count=\(c)")
+            lines.append("UWorld::Levels: count=\(c)")
             if d > 0x100000000, c > 0, c <= 4096 {
-                let probe = min(c, 12)
+                let probe = min(c, 64)                  // 全读完，上次 min(c, 12) 把第 13 个漏了
                 let (rkP, ptrs) = readBytes(port: p, address: MachVmAddress(d), count: probe * 8)
                 if rkP == KERN_SUCCESS, ptrs.count >= probe * 8 {
                     for k in 0..<probe {
                         let lv = u64le(ptrs, k * 8)
                         guard lv > 0x100000000 else { continue }
+                        if lv == level { continue }     // 就是 PersistentLevel，已经在 sources 里
                         let (rkA2, a2) = readBytes(port: p, address: MachVmAddress(lv &+ 0xA0), count: 16)
                         guard rkA2 == KERN_SUCCESS, a2.count >= 16 else { continue }
                         let d2 = u64le(a2, 0)
                         let c2 = Int(u32le(a2, 8))
+                        guard d2 > 0x100000000, c2 > 0, c2 <= 100_000 else { continue }
+                        sources.append(("Level[\(k)]", d2, c2))
+                        levelTotal += c2
                         lines.append("  Level[\(k)] @\(hexOf(lv))  Actors: count=\(c2)")
-                        if d2 > 0x100000000, c2 > bestCount {
-                            bestData = d2; bestCount = c2; bestLabel = "Level[\(k)]"
-                        }
                     }
                 }
             }
         }
-        if bestLabel != "PersistentLevel" {
-            lines.append("→ actor 源改用 \(bestLabel)（\(bestCount) 个，PersistentLevel 只有 \(count) 个）")
-        }
+        lines.append("actor 源: \(sources.count) 个关卡合计 \(sources.reduce(0) { $0 + $1.count }) 个"
+            + "（Persistent \(count) + 子关卡 \(levelTotal)）")
 
         // ④ 遍历全表：按类名统计 + 抓出所有角色坐标
         //
@@ -1256,75 +1252,89 @@ final class MemoryProbe {
         // 第一次先只走 1200 个：本地读虽然不产生内核调用，但未映射过的页首次访问会有
         // page fault（内核要在游戏名下记账一块物理页）。等确认预映射覆盖够、page fault
         // 不成问题，再把这个上限放开。
-        let total = min(bestCount, 1500)
+        let budget = 3000
         var classNames: [UInt64: String] = [:]
         var histogram: [String: Int] = [:]
         var charActors: [UInt64] = []
-        var cursor = 0
-        while cursor < total {
-            // 预算闸门：一旦真的落回 mach_vm_read 太多次，立刻收手。
-            // 上一版没有这道闸门，一路读到底，游戏就没了。
-            if hardReadCalls > 200 {
-                lines.append("⚠ 已用 \(hardReadCalls) 次 mach_vm_read —— 主动停止遍历，保住游戏"
-                    + "（预映射没覆盖到的地址太多，先告诉我这句）")
-                break
-            }
-            let batch = min(500, total - cursor)
-            let (rkBuf, buf) = readBytes(port: p,
-                                         address: MachVmAddress(bestData &+ UInt64(cursor * 8)),
-                                         count: batch * 8)
-            guard rkBuf == KERN_SUCCESS, buf.count >= batch * 8 else {
-                lines.append("读 actor 指针数组失败 @\(cursor) \(describe(rkBuf))")
-                break
-            }
-            for i in 0..<batch {
-                let actor = u64le(buf, i * 8)
-                guard actor > 0x100000000 else { continue }
-                let (rkCls, cls) = readRaw(port: p, address: MachVmAddress(actor &+ 0x10))
-                guard rkCls == KERN_SUCCESS, cls > 0x100000000 else { continue }
+        var charHomes: [UInt64: String] = [:]
+        var seen = 0
+        var stopped = false
 
-                var nm = classNames[cls]
-                if nm == nil {
-                    let (rkIX, clsIX) = readAt(port: p, address: MachVmAddress(cls &+ 0x18))
-                    nm = (rkIX == KERN_SUCCESS)
-                        ? resolveName(port: p, pool: pool, chunk0: nameChunk0, index: clsIX)
-                        : "?"
-                    classNames[cls] = nm
+        sourceLoop: for src in sources {
+            var cursor = 0
+            while cursor < src.count {
+                // 预算闸门：一旦真的落回 mach_vm_read 太多次，立刻收手。
+                // 上一版没有这道闸门，一路读到底，游戏就没了。
+                if hardReadCalls > 200 {
+                    lines.append("⚠ 已用 \(hardReadCalls) 次 mach_vm_read —— 主动停止遍历，保住游戏")
+                    stopped = true
+                    break sourceLoop
                 }
-                let name = nm ?? "?"
-                histogram[name, default: 0] += 1
-                // Pawn 的判定要排除 GamePawnMode 之类 —— 上次它被误当成角色抓进来，
-                // 于是报告里出现了一个 Loc=(0,0,0) 的"角色"。
-                if name.contains("Character") || (name.contains("Pawn") && !name.contains("Mode")) {
-                    charActors.append(actor)
+                if seen >= budget {
+                    stopped = true
+                    break sourceLoop
                 }
+                let batch = min(500, src.count - cursor)
+                let (rkBuf, buf) = readBytes(port: p,
+                                             address: MachVmAddress(src.data &+ UInt64(cursor * 8)),
+                                             count: batch * 8)
+                guard rkBuf == KERN_SUCCESS, buf.count >= batch * 8 else {
+                    lines.append("读 \(src.label) 的 actor 指针失败 @\(cursor) \(describe(rkBuf))")
+                    break
+                }
+                for i in 0..<batch {
+                    let actor = u64le(buf, i * 8)
+                    guard actor > 0x100000000 else { continue }
+                    let (rkCls, cls) = readRaw(port: p, address: MachVmAddress(actor &+ 0x10))
+                    guard rkCls == KERN_SUCCESS, cls > 0x100000000 else { continue }
+
+                    var nm = classNames[cls]
+                    if nm == nil {
+                        let (rkIX, clsIX) = readAt(port: p, address: MachVmAddress(cls &+ 0x18))
+                        nm = (rkIX == KERN_SUCCESS)
+                            ? resolveName(port: p, pool: pool, chunk0: nameChunk0, index: clsIX)
+                            : "?"
+                        classNames[cls] = nm
+                    }
+                    let name = nm ?? "?"
+                    histogram[name, default: 0] += 1
+                    // Pawn 的判定要排除 GamePawnMode 之类 —— 上次它被误当成角色抓进来，
+                    // 于是报告里出现了一个 Loc=(0,0,0) 的"角色"。
+                    if name.contains("Character") || (name.contains("Pawn") && !name.contains("Mode")) {
+                        charActors.append(actor)
+                        charHomes[actor] = src.label
+                    }
+                }
+                cursor += batch
+                seen += batch
             }
-            cursor += batch
         }
 
-        lines.append("类名分布（源 \(bestLabel)，遍历 \(cursor)/\(bestCount) 个 actor，共 \(classNames.count) 种类）:")
+        lines.append("类名分布（\(sources.count) 个关卡 / 遍历 \(seen) 个 actor"
+            + (stopped ? "（未跑完）" : "") + "，共 \(classNames.count) 种类）:")
         for (name, c) in histogram.sorted(by: { $0.value > $1.value }).prefix(18) {
             lines.append("  \(name) × \(c)")
         }
 
         if charActors.isEmpty {
-            lines.append("角色: 0 个（类名里不含 Character/Pawn）")
+            lines.append("角色: 0 个 —— 这 \(sources.count) 个关卡的 \(seen) 个 actor 里没有 Character/Pawn")
         } else {
             lines.append("角色: \(charActors.count) 个 —— 每个都是客户端手上真实存在的身体")
             for (i, a) in charActors.prefix(24).enumerated() {
+                let home = charHomes[a] ?? "?"
                 let (rkR, root) = readRaw(port: p, address: MachVmAddress(a &+ 0x260))
                 guard rkR == KERN_SUCCESS, root > 0x100000000 else {
-                    lines.append("  [\(i)] @\(hexOf(a))  RootComponent 无效")
+                    lines.append("  [\(i)] @\(hexOf(a)) [\(home)]  RootComponent 无效")
                     continue
                 }
                 let (rkT, tf) = readBytes(port: p, address: MachVmAddress(root &+ 0x1F0 + 0x10), count: 12)
                 if rkT == KERN_SUCCESS, tf.count >= 12 {
                     let x = floatAt(tf, 0), y = floatAt(tf, 4), z = floatAt(tf, 8)
                     let ok = (x != 0 || y != 0) && abs(x) < 5e6 && abs(y) < 5e6 && abs(z) < 1e5
-                    lines.append("  [\(i)] @\(hexOf(a))  Loc=(\(fmt1(x)), \(fmt1(y)), \(fmt1(z))) "
+                    lines.append("  [\(i)] @\(hexOf(a)) [\(home)]  Loc=(\(fmt1(x)), \(fmt1(y)), \(fmt1(z))) "
                         + (ok ? "✓" : "✗ 量级不对"))
                 } else {
-                    lines.append("  [\(i)] @\(hexOf(a))  ComponentToWorld 读失败 \(describe(rkT))")
+                    lines.append("  [\(i)] @\(hexOf(a)) [\(home)]  ComponentToWorld 读失败 \(describe(rkT))")
                 }
             }
         }
