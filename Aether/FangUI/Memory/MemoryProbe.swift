@@ -936,6 +936,11 @@ final class MemoryProbe {
     /// "返回该地址所在或**之后第一个** region" —— 对未映射的低地址也会返回
     /// 游戏路径，二分因此完全失效（会出现负 slide 这种不可能的结果）。
     /// 所以必须有 region 边界信息，只能靠枚举。
+    ///
+    /// **枚举代价要有预算**：每轮最多两次内核调用，其中 `proc_regionfilename`
+    /// 还要走 vnode，是最贵的一环。早期版本把 6000 轮跑满、而且把最贵的调用
+    /// 放在最前面判，实测烧穿了 app 的 CPU 配额，被系统以 cpu_resource_fatal
+    /// （bug_type 206）杀掉。现在：条件从便宜到贵排、上限 800 轮、外加 5 秒硬预算。
     static func stepFindBase(pid: Int32) -> String {
         resetCounters()
         stageMark("找村口 开始")
@@ -971,19 +976,33 @@ final class MemoryProbe {
         var hitName = ""
         /// 被 Mach-O 校验否掉的候选（用于面板诊断：命中条件太宽还是真没找到）
         var rejects: [String] = []
+        var timedOut = false
 
-        while scanned < 6000 {
+        // 枚举预算：主二进制几乎总在前几百个 region 里（实测经常是第 1 个）。
+        // 原来定 6000 太宽松了 —— 每轮最多两次内核调用，跑满就是上万次，
+        // `proc_regionfilename` 还要走 vnode，实测直接把 app 的 CPU 配额烧穿，
+        // 被系统以 cpu_resource_fatal（bug_type 206）杀掉。两道限制同时上：
+        // 数量上限 + 硬性时间预算，任何一个先到就停。
+        let scanLimit = 800
+        let deadline = Date().addingTimeInterval(5.0)
+
+        while scanned < scanLimit {
+            if Date() > deadline { timedOut = true; break }
+
             let (ok, size, prot, offset) = nextRegion(task: p, addr: &addr)
             guard ok else { break }
             scanned += 1
+            if scanned % 100 == 0 { stageMark("找村口 · 已枚举 \(scanned) 个 region") }
 
-            // 三个 region 条件全中，只说明「像 __TEXT」
-            if let path = regionFile(pid: pid, addr: addr),
-               path.lowercased().contains("shadowtracker"),
-               (prot & 0x4) != 0,          // VM_PROT_EXECUTE
-               offset == 0 {
-                // ① 还得它真的是 Mach-O 可执行头（magic + filetype），
-                //    否则继续找下一个候选，绝不把可疑值当基址返回。
+            // 条件顺序很重要：prot 和 offset 是 vm_region_recurse 顺手带回来的（免费），
+            // proc_regionfilename 要走 vnode、贵一个量级，所以放到最后再问。
+            // 原来把最贵的调用放在最前面，等于对每个 region 都交一次昂贵开销。
+            if (prot & 0x4) != 0,          // VM_PROT_EXECUTE
+               offset == 0,
+               let path = regionFile(pid: pid, addr: addr),
+               path.lowercased().contains("shadowtracker") {
+                // 还得它真的是 Mach-O 可执行头（magic + filetype），
+                // 否则继续找下一个候选，绝不把可疑值当基址返回。
                 let (okMagic, why) = isExecutableMachO(port: p, addr)
                 if okMagic {
                     hitBase = addr
@@ -999,7 +1018,8 @@ final class MemoryProbe {
 
         guard hitBase != 0 else {
             let why = rejects.isEmpty ? "" : " 否掉:" + rejects.prefix(3).joined(separator: " ")
-            return "找基址: 枚举\(scanned)个region，未命中(__TEXT & offset=0)" + why
+            let stop = timedOut ? "（5 秒预算到，主动停）" : ""
+            return "找基址: 枚举\(scanned)个region，未命中(__TEXT & offset=0)\(stop)" + why
         }
 
         // ② 记账：base / slide 存下来，后面「定点读」直接用这份状态
