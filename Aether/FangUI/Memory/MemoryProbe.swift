@@ -1234,6 +1234,15 @@ final class MemoryProbe {
         return lines.joined(separator: "\n")
     }
 
+    /// 地址格式化（面板显示用）。
+    private static func hexOf(_ v: UInt64) -> String { "0x" + String(v, radix: 16) }
+
+    /// 从字节数组按小端读一个 float。
+    private static func floatAt(_ b: [UInt8], _ o: Int) -> Float {
+        Float(bitPattern: UInt32(b[o]) | (UInt32(b[o + 1]) << 8)
+            | (UInt32(b[o + 2]) << 16) | (UInt32(b[o + 3]) << 24))
+    }
+
     /// 定位自己：UWorld → GameInstance → LocalPlayers[0] → PlayerController
     ///           → AcknowledgedPawn → RootComponent → ComponentToWorld → 坐标
     ///
@@ -1262,18 +1271,13 @@ final class MemoryProbe {
         let off = Offsets.load()
         var lines: [String] = []
 
-        func hex(_ v: UInt64) -> String { "0x" + String(v, radix: 16) }
-        func f32(_ b: [UInt8], _ o: Int) -> Float {
-            Float(bitPattern: UInt32(b[o]) | (UInt32(b[o + 1]) << 8)
-                | (UInt32(b[o + 2]) << 16) | (UInt32(b[o + 3]) << 24))
-        }
 
         // ① UWorld
         let (rkW, world) = readRaw(port: p, address: MachVmAddress(runtime(off.gWorld, slide: s)))
         guard rkW == KERN_SUCCESS, world != 0 else {
             return "自己: 读 GWorld 失败 \(describe(rkW))"
         }
-        lines.append("UWorld=\(hex(world))")
+        lines.append("UWorld=\(hexOf(world))")
 
         // ② GameInstance
         stageMark("自己 · GameInstance")
@@ -1282,7 +1286,7 @@ final class MemoryProbe {
             return lines.joined(separator: "\n")
                 + "\n读 OwningGameInstance 失败 \(describe(rkG)) @UWorld+0xB20"
         }
-        lines.append("GameInstance=\(hex(game))")
+        lines.append("GameInstance=\(hexOf(game))")
 
         // ③ 加密标志 + LocalPlayers
         stageMark("自己 · LocalPlayers")
@@ -1298,7 +1302,7 @@ final class MemoryProbe {
         let lData = u64le(larr, 0)
         let lCount = UInt32(larr[8]) | (UInt32(larr[9]) << 8)
             | (UInt32(larr[10]) << 16) | (UInt32(larr[11]) << 24)
-        lines.append("LocalPlayers: data=\(hex(lData)) count=\(lCount)")
+        lines.append("LocalPlayers: data=\(hexOf(lData)) count=\(lCount)")
         guard lCount > 0, lData != 0 else {
             lines.append("→ LocalPlayers 是空的：多半还在大厅，没进对局")
             lines.append(costLine())
@@ -1311,7 +1315,7 @@ final class MemoryProbe {
         guard rkLP == KERN_SUCCESS, localPlayer != 0 else {
             return lines.joined(separator: "\n") + "\n读 LocalPlayers[0] 失败 \(describe(rkLP))"
         }
-        lines.append("LocalPlayer[0]=\(hex(localPlayer))")
+        lines.append("LocalPlayer[0]=\(hexOf(localPlayer))")
 
         // ⑤ PlayerController（UPlayer::PlayerController 在 0x30）
         stageMark("自己 · PlayerController")
@@ -1321,7 +1325,7 @@ final class MemoryProbe {
             lines.append(costLine())
             return lines.joined(separator: "\n")
         }
-        lines.append("PlayerController=\(hex(pc))")
+        lines.append("PlayerController=\(hexOf(pc))")
 
         // ⑥ AcknowledgedPawn
         stageMark("自己 · Pawn")
@@ -1331,7 +1335,7 @@ final class MemoryProbe {
             lines.append(costLine())
             return lines.joined(separator: "\n")
         }
-        lines.append("Pawn=\(hex(pawn))")
+        lines.append("Pawn=\(hexOf(pawn))")
 
         // ⑦ RootComponent
         stageMark("自己 · 坐标")
@@ -1341,7 +1345,7 @@ final class MemoryProbe {
             lines.append(costLine())
             return lines.joined(separator: "\n")
         }
-        lines.append("RootComponent=\(hex(root))")
+        lines.append("RootComponent=\(hexOf(root))")
 
         // ⑧ ComponentToWorld + 0x10 → FVector
         let (rkT, tf) = readBytes(port: p, address: MachVmAddress(root &+ 0x1F0 + 0x10), count: 12)
@@ -1350,13 +1354,114 @@ final class MemoryProbe {
             lines.append(costLine())
             return lines.joined(separator: "\n")
         }
-        let x = f32(tf, 0), y = f32(tf, 4), z = f32(tf, 8)
+        let x = floatAt(tf, 0), y = floatAt(tf, 4), z = floatAt(tf, 8)
         let sane = abs(x) < 1e7 && abs(y) < 1e7 && abs(z) < 1e7
         lines.append("坐标: X=\(x)  Y=\(y)  Z=\(z) " + (sane ? "✓" : "✗ 数值异常"))
 
         lines.append(costLine())
         return lines.joined(separator: "\n")
     }
+
+    /// 全场玩家：GWorld → GameState → PlayerArray → PlayerState → Pawn → 坐标
+    ///
+    /// **这是绕开 LocalPlayers 那层加密的路，而且比它更好** —— 它给的是全场玩家，
+    /// 不只是自己。而且这一路上全是 public 字段（对比 LocalPlayers 那对是 Protected）：
+    ///   UWorld + 0x630           → GameState (AGameStateBase*)
+    ///   AGameStateBase + 0x5E8   → PlayerArray (TArray<APlayerState*>，BlueprintVisible)
+    ///   APlayerState + 0x5D8     → Pawn (APawn*，Net + RepNotify，公开同步)
+    ///   AActor + 0x260           → RootComponent (USceneComponent*)
+    ///   USceneComponent + 0x1F0  → ComponentToWorld (FTransform)
+    ///   FTransform + 0x10        → Translation (FVector: x, y, z)
+    ///
+    /// 每个玩家 3 次读取，全部走映射（本地内存），所以读一圈不产生内核调用。
+    static func stepPlayers(pid: Int32) -> String {
+        resetCounters()
+        stageMark("玩家")
+        guard baseReady(for: pid) else {
+            return "玩家: 没有当前进程的基址 —— 先点「世界」或「映射」"
+        }
+        let (kr, p) = port(for: pid)
+        guard kr == KERN_SUCCESS, p != 0 else { return "玩家: 取端口失败 \(describe(kr))" }
+        defer { dropPort(p) }
+
+        let s = imageSlide
+        let off = Offsets.load()
+        var lines: [String] = []
+
+        func coord(of actor: UInt64) -> (KernReturn, Float, Float, Float) {
+            let (rkR, root) = readRaw(port: p, address: MachVmAddress(actor &+ 0x260))
+            guard rkR == KERN_SUCCESS, root != 0 else { return (rkR, 0, 0, 0) }
+            let (rkT, tf) = readBytes(port: p,
+                                      address: MachVmAddress(root &+ 0x1F0 + 0x10), count: 12)
+            guard rkT == KERN_SUCCESS, tf.count >= 12 else { return (rkT, 0, 0, 0) }
+            return (KERN_SUCCESS, floatAt(tf, 0), floatAt(tf, 4), floatAt(tf, 8))
+        }
+
+        // ① UWorld
+        let (rkW, world) = readRaw(port: p, address: MachVmAddress(runtime(off.gWorld, slide: s)))
+        guard rkW == KERN_SUCCESS, world != 0 else { return "玩家: 读 GWorld 失败 \(describe(rkW))" }
+        lines.append("UWorld=\(hexOf(world))")
+
+        // ② GameState
+        stageMark("玩家 · GameState")
+        let (rkGS, gameState) = readRaw(port: p, address: MachVmAddress(world &+ 0x630))
+        guard rkGS == KERN_SUCCESS, gameState != 0 else {
+            return lines.joined(separator: "\n")
+                + "\n读 GameState 失败 \(describe(rkGS)) @UWorld+0x630 —— 多半还在大厅"
+        }
+        lines.append("GameState=\(hexOf(gameState))")
+
+        // ③ PlayerArray
+        stageMark("玩家 · PlayerArray")
+        let (rkPA, parr) = readBytes(port: p, address: MachVmAddress(gameState &+ 0x5E8), count: 16)
+        guard rkPA == KERN_SUCCESS, parr.count >= 16 else {
+            return lines.joined(separator: "\n") + "\n读 PlayerArray 失败 \(describe(rkPA))"
+        }
+        let paData = u64le(parr, 0)
+        let paCount = UInt32(parr[8]) | (UInt32(parr[9]) << 8)
+            | (UInt32(parr[10]) << 16) | (UInt32(parr[11]) << 24)
+        let paCap = UInt32(parr[12]) | (UInt32(parr[13]) << 8)
+            | (UInt32(parr[14]) << 16) | (UInt32(parr[15]) << 24)
+        let paOK = (paCount > 0 && paCount <= 200 && paCount <= paCap && paData != 0)
+        lines.append("PlayerArray: data=\(hexOf(paData)) count=\(paCount) max=\(paCap) "
+            + (paOK ? "✓" : "✗ 数量异常（多半没进对局）"))
+        guard paOK else {
+            lines.append(costLine())
+            return lines.joined(separator: "\n")
+        }
+
+        // ④ 逐个玩家：PlayerState → Pawn → 坐标
+        stageMark("玩家 · 遍历")
+        let n = min(Int(paCount), 8)
+        let (rkList, list) = readBytes(port: p, address: MachVmAddress(paData), count: n * 8)
+        guard rkList == KERN_SUCCESS, list.count >= n * 8 else {
+            lines.append("读 PlayerArray 元素失败 \(describe(rkList))")
+            lines.append(costLine())
+            return lines.joined(separator: "\n")
+        }
+        var alive = 0
+        for i in 0..<n {
+            let ps = u64le(list, i * 8)
+            guard ps != 0 else { continue }
+            let (rkP, pawn) = readRaw(port: p, address: MachVmAddress(ps &+ 0x5D8))
+            guard rkP == KERN_SUCCESS, pawn != 0 else {
+                lines.append("[\(i)] PlayerState=\(hexOf(ps))  Pawn=空（离场或未生成）")
+                continue
+            }
+            let (rkC, x, y, z) = coord(of: pawn)
+            if rkC == KERN_SUCCESS {
+                alive += 1
+                lines.append("[\(i)] Pawn=\(hexOf(pawn))  坐标 X=\(Int(x)) Y=\(Int(y)) Z=\(Int(z))")
+            } else {
+                lines.append("[\(i)] Pawn=\(hexOf(pawn))  读坐标失败 \(describe(rkC))")
+            }
+        }
+        lines.append("共 \(n) 个 PlayerState，其中 \(alive) 个拿到了坐标")
+        lines.append(costLine())
+        return lines.joined(separator: "\n")
+    }
+
+    /// 单点区域归属：对 dump 基址问一次「这属于哪个文件」。
 
     /// 单点区域归属：对 dump 基址问一次「这属于哪个文件」。    ///
     /// 零风险探测：一次调用、不遍历、不写。

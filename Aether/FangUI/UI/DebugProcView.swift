@@ -43,6 +43,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     private let btnWorld = UIButton(type: .system)
     /// 自己：LocalPlayer → PlayerController → Pawn → 坐标
     private let btnSelf = UIButton(type: .system)
+    /// 玩家：GameState → PlayerArray → 每个玩家的 Pawn → 坐标（全场，绕开加密）
+    private let btnPlayers = UIButton(type: .system)
     /// 内存：读游戏的内存账本（footprint / compressed），不碰游戏内存
     private let btnMemory = UIButton(type: .system)
     /// 映射：把游戏内存 remap 进我们自己进程，之后本地读（样本的读取方式）
@@ -82,6 +84,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         let buttons: [(UIButton, String, Selector)] = [
             (btnWorld, "世界", #selector(onWorld)),
             (btnSelf, "自己", #selector(onSelf)),
+            (btnPlayers, "玩家", #selector(onPlayers)),
             (btnAuto, "跑一次", #selector(onAutoRun)),
             (btnMap, "映射", #selector(onMapProbe)),
             (btnEnum, "枚举", #selector(onEnumProbe)),
@@ -123,12 +126,11 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         crashLabel.frame = CGRect(x: w * 0.6, y: 15, width: w * 0.4, height: 14)
         probeLabel.frame = CGRect(x: 0, y: 30, width: w, height: 14)
 
-        // 9 个按钮排成 3 列 × 3 行
-        let all = [btnWorld, btnSelf, btnAuto,
-                   btnMap, btnEnum, btnRefresh,
-                   btnObjects, btnCrashFile, btnMemory]
+        // 10 个按钮排成 5 列 × 2 行
+        let all = [btnWorld, btnSelf, btnPlayers, btnAuto, btnMap,
+                   btnEnum, btnRefresh, btnObjects, btnCrashFile, btnMemory]
         let gap: CGFloat = 4
-        let perRow = 3
+        let perRow = 5
         let bw = (w - gap * CGFloat(perRow - 1)) / CGFloat(perRow)
         let bh = btnRowH - 6
         for (i, b) in all.enumerated() {
@@ -404,6 +406,31 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     @objc private func onObjects() {
         guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
         runProbe("对象: 读取中…") { MemoryProbe.stepObjects(pid: $0) }
+    }
+
+    /// 玩家：GameState → PlayerArray → 每个玩家的 Pawn → 坐标。
+    /// 这条路绕开 LocalPlayers 那层加密，而且直接给全场玩家。
+    @objc private func onPlayers() {
+        refreshProcess()
+        guard gpid != 0 else {
+            probeLabel.text = "玩家: 没找到游戏进程"
+            probeLabel.textColor = warnText
+            return
+        }
+        runProbe("玩家: 读取中…") { pid -> String in
+            var out: [String] = []
+            if !MemoryProbe.baseReady(for: pid) {
+                let base = MemoryProbe.stepFindBase(pid: pid)
+                out.append(base)
+                guard base.contains("✓ base=") else {
+                    out.append("→ 没拿到基址，读不了玩家")
+                    return out.joined(separator: "\n")
+                }
+                out.append("")
+            }
+            out.append(MemoryProbe.stepPlayers(pid: pid))
+            return out.joined(separator: "\n")
+        }
     }
 
     /// 自己：LocalPlayer → PlayerController → Pawn → 坐标。
