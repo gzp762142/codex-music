@@ -300,10 +300,23 @@ final class MemoryProbe {
     /// （实测就是这样：状态停在 "映射: 建立中…"，后台却一步都没往下走）。
     private static let stageQueue = DispatchQueue(label: "aether.stage", qos: .utility)
 
+    /// 进度回调：由调用方（UI）挂上来。
+    ///
+    /// 为什么要这条线：进度原本是"写内存 + 主线程 Timer 轮询显示"。
+    /// 主线程一卡（任何一处内核调用堵住它），Timer 就停止触发，面板会永远停在
+    /// 最后一个值上 —— 看起来像"卡在第一步"，其实可能早就走远了，也可能主线程自己
+    /// 卡住了，两种情况在屏幕上长得一模一样。回调这条路由后台直接把每一步推给 UI，
+    /// 不依赖 Timer，也不依赖主线程还在正常跑。
+    static var onStage: ((String) -> Void)?
+
     static func stageMark(_ stage: String) {
         stageLock.lock()
         _currentStage = stage
         stageLock.unlock()
+
+        if let cb = onStage {
+            DispatchQueue.main.async { cb(stage) }
+        }
 
         // DateFormatter 绝不能留在调用线程上 —— 它内部走 ICU 本地化、多线程下要抢锁，
         // 放在读取链的热路径上会把整个后台线程拖住。时间戳改成最廉价的整数形式。

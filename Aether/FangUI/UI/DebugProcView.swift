@@ -167,23 +167,21 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         probeLabel.textColor = idleText
         let pid = gpid
 
-        // 面板上实时显示后台走到哪一步。崩之前那一瞬间屏幕上的字是唯一的现场 ——
-        // 落盘和崩溃日志都可能来不及（被系统直接杀掉时信号处理器根本没机会跑）。
-        stageTimer?.invalidate()
-        stageTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
-            guard let s = self, s.probeBusy else { return }
-            let stage = MemoryProbe.currentStage
-            s.probeLabel.text = stage.isEmpty ? pending : "\(pending) · \(stage)"
+        // 后台每一步都直接推进面板 —— 不走 Timer 轮询。
+        // Timer 跑在主线程，主线程一旦被任何内核调用堵住就再也不触发，
+        // 面板会停在最后一个值上，跟"真的卡住了"长得一样。
+        MemoryProbe.onStage = { [weak self] stage in
+            self?.probeLabel.text = "\(pending) · \(stage)"
         }
 
         DispatchQueue.global(qos: .userInitiated).async {
-            MemoryProbe.stageMark(pending)
+            MemoryProbe.stageMark(pending + " · 后台已启动")
             let t0 = Date()
             let result = work(pid)
             let ms = Int(Date().timeIntervalSince(t0) * 1000)
-            MemoryProbe.stageMark("完成 · \(ms) ms")
             DispatchQueue.main.async { [weak self] in
                 guard let s = self else { return }
+                MemoryProbe.onStage = nil
                 s.probeBusy = false
                 s.stageTimer?.invalidate()
                 s.stageTimer = nil
@@ -387,8 +385,10 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
             return
         }
         runProbe("映射: 建立中…") { pid -> String in
+            MemoryProbe.stageMark("检查基址")
             var out: [String] = []
             if !MemoryProbe.baseReady(for: pid) {
+                MemoryProbe.stageMark("准备找基址")
                 let base = MemoryProbe.stepFindBase(pid: pid)
                 out.append(base)
                 guard base.contains("✓ base=") else {
