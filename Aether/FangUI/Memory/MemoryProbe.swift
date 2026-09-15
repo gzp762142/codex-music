@@ -1467,30 +1467,48 @@ final class MemoryProbe {
         let off = Offsets.load()
         var lines: [String] = []
 
-        func coordRaw(of actor: UInt64) -> String {
+        func coordRaw(of actor: UInt64) -> (text: String, ok: Bool) {
             let (rkR, root) = readRaw(port: p, address: MachVmAddress(actor &+ 0x260))
             guard rkR == KERN_SUCCESS, root != 0 else {
-                return "Pawn=\(hexOf(actor))  读 RootComponent 失败 \(describe(rkR))"
+                return ("Actor=\(hexOf(actor))  读 RootComponent 失败 \(describe(rkR))", false)
             }
             // 两个候选位置都读出来。dump 里 USceneComponent 的定义是：
             //   RelativeLocation   0x01CC (FVector, 0xC)
             //   ComponentToWorld   0x01F0 (FTransform, 0x30)  —— Translation 在 +0x10
-            // 哪个是对的用数据说话，不再靠猜。
+            // 实测过：根组件没有父组件时 UE4 保证两者相等，真机上确实逐位相同。
+            // 以 ToWorld 为准，RelLoc 留作对照 —— 哪天角色挂到载具上时两者会分开。
             let (rkRel, rel) = readBytes(port: p, address: MachVmAddress(root &+ 0x1CC), count: 12)
             let (rkT, tf) = readBytes(port: p, address: MachVmAddress(root &+ 0x1F0 + 0x10), count: 12)
 
             var out = "Actor=\(hexOf(actor))  RootComponent=\(hexOf(root))"
+            var ok = false
             if rkRel == KERN_SUCCESS, rel.count >= 12 {
-                out += "\n      RelLoc(0x1CC):  X=\(floatAt(rel, 0))  Y=\(floatAt(rel, 4))  Z=\(floatAt(rel, 8))"
+                out += "\n      RelLoc(0x1CC):       X=\(fmt1(floatAt(rel, 0)))  Y=\(fmt1(floatAt(rel, 4)))  Z=\(fmt1(floatAt(rel, 8)))"
             } else {
-                out += "\n      RelLoc(0x1CC):  读失败 \(describe(rkRel))"
+                out += "\n      RelLoc(0x1CC):       读失败 \(describe(rkRel))"
             }
             if rkT == KERN_SUCCESS, tf.count >= 12 {
-                out += "\n      ToWorld(0x1F0+0x10): X=\(floatAt(tf, 0))  Y=\(floatAt(tf, 4))  Z=\(floatAt(tf, 8))"
+                let x = floatAt(tf, 0), y = floatAt(tf, 4), z = floatAt(tf, 8)
+                // 地图 8km = 800000 个单位（厘米）。落在这个量级才是真坐标。
+                ok = (x != 0 || y != 0) && abs(x) < 5e6 && abs(y) < 5e6 && abs(z) < 1e5
+                out += "\n      ToWorld(0x1F0+0x10): X=\(fmt1(x))  Y=\(fmt1(y))  Z=\(fmt1(z)) "
+                    + (ok ? "✓" : "✗ 量级不对")
             } else {
                 out += "\n      ToWorld(0x1F0+0x10): 读失败 \(describe(rkT))"
             }
-            return out
+            return (out, ok)
+        }
+
+        /// 这个角色是不是本地玩家的：Character + 0x608 → AController，
+        /// 再读 APlayerController + 0xA8C 的 bIsLocalPlayerController。
+        /// **这条路不碰 LocalPlayers**，所以不受 bUseEncryptLocalPlayerPtr 影响。
+        /// 返回 nil 表示读不到 —— 那时调用方会退回 PlayerState 比对。
+        func localFlag(character: UInt64) -> Int? {
+            let (rkC, ctrl) = readRaw(port: p, address: MachVmAddress(character &+ 0x608))
+            guard rkC == KERN_SUCCESS, ctrl > 0x100000000 else { return nil }
+            let (rkL, v) = readAt(port: p, address: MachVmAddress(ctrl &+ 0xA8C))
+            guard rkL == KERN_SUCCESS else { return nil }
+            return Int(v & 0xFF)
         }
 
         // ① UWorld
@@ -1535,10 +1553,11 @@ final class MemoryProbe {
             return lines.joined(separator: "\n")
         }
         // 顺带标出名单里"哪个是你"：任一环失败就静默跳过，不影响主流程
-        let selfPS = findSelfPlayerState(port: p, world: world)
+        let (selfPS, selfTrace) = findSelfPlayerState(port: p, world: world)
 
         stageMark("玩家 · 遍历")
         var withChar = 0
+        var withCoord = 0
         var withLoc = 0
         for i in 0..<n {
             let ps = u64le(list, i * 8)
@@ -1559,12 +1578,28 @@ final class MemoryProbe {
             let health = floatAt(segB, 0x88)
             let healthMax = floatAt(segB, 0x8C)
 
+            // 「这是不是你」先问角色自己的 Controller；读不到才退回 PlayerState 比对。
+            var selfTag = ""
+            var localNote = ""
+            var coordBlock: (text: String, ok: Bool)?
+            if charOwner > 0x100000000 {
+                withChar += 1
+                if let lf = localFlag(character: charOwner) {
+                    localNote = "   local=\(lf)"
+                    if lf == 1 { selfTag = "   ★这是你" }
+                }
+                let cb = coordRaw(of: charOwner)
+                coordBlock = cb
+                if cb.ok { withCoord += 1 }
+            }
+            if selfTag.isEmpty, selfPS != 0, ps == selfPS { selfTag = "   ★这是你" }
+
             var head = "[\(i)] " + (name.isEmpty ? "(无名)" : "\"\(name)\"")
             head += "  id=\(playerID)  HP=\(fmt1(health))/\(fmt1(healthMax))"
             if ai >= 0 { head += "  AI=\(ai)" }
             if live >= 0 { head += "  Live=\(live)" }
             if ping >= 0 { head += "  ping=\(ping)" }
-            if selfPS != 0 && ps == selfPS { head += "   ★这是你" }
+            head += selfTag
             lines.append(head)
 
             // 坐标路径 ①：PlayerState 自带的 SelfLocAndRot
@@ -1582,16 +1617,17 @@ final class MemoryProbe {
                 lines.append("      读状态段失败 \(describe(rkB)) @PlayerState+0x1648")
             }
 
-            // 坐标路径 ②：Character → RootComponent → ComponentToWorld（交叉验证）
-            if charOwner > 0x100000000 {
-                withChar += 1
-                lines.append("      Char=\(hexOf(charOwner))")
-                lines.append("      " + coordRaw(of: charOwner))
+            // 坐标路径 ②：Character → RootComponent → ComponentToWorld（**真实世界坐标**）
+            if let cb = coordBlock {
+                lines.append("      Char=\(hexOf(charOwner))" + localNote)
+                lines.append("      " + cb.text)
             } else {
                 lines.append("      Char=空（客户端没有这个人的角色对象）")
             }
         }
-        lines.append("共 \(n) 个 PlayerState：\(withChar) 个有角色、\(withLoc) 个坐标非零")
+        lines.append("共 \(n) 个 PlayerState：\(withChar) 个有角色 · \(withCoord) 个拿到真实坐标"
+            + " · SelfLoc 非零 \(withLoc) 个（那条路只喂队友位置）")
+        lines.append("自己的路：\(selfTrace)")
         lines.append(costLine())
         return lines.joined(separator: "\n")
     }
@@ -1601,27 +1637,43 @@ final class MemoryProbe {
     ///
     /// **只用于在名单里打一个 ★ 标记。** 任一环读不到就返回 0，绝不阻塞主流程 ——
     /// LocalPlayers 那条路可能被 bUseEncryptLocalPlayerPtr 挡住，那是它自己的事。
-    private static func findSelfPlayerState(port: MachPort, world: UInt64) -> UInt64 {
+    /// 同时把断在哪一环写成 trace 带回去：失败也要有理由，不靠猜。
+    private static func findSelfPlayerState(port: MachPort, world: UInt64) -> (ps: UInt64, trace: String) {
         func plausible(_ v: UInt64) -> Bool { v > 0x100000000 && v < 0xF000000000000000 }
 
         let (rkG, gi) = readRaw(port: port, address: MachVmAddress(world &+ 0xB20))
-        guard rkG == KERN_SUCCESS, plausible(gi) else { return 0 }
+        guard rkG == KERN_SUCCESS, plausible(gi) else {
+            return (0, "断在 OwningGameInstance（\(describe(rkG)) @UWorld+0xB20）")
+        }
+
+        let (rkE, enc) = readAt(port: port, address: MachVmAddress(gi &+ 0x80))
+        let encFlag = rkE == KERN_SUCCESS ? Int(enc & 0xFF) : -1
 
         let (rkL, lp) = readBytes(port: port, address: MachVmAddress(gi &+ 0x48), count: 16)
-        guard rkL == KERN_SUCCESS, lp.count >= 16 else { return 0 }
+        guard rkL == KERN_SUCCESS, lp.count >= 16 else {
+            return (0, "断在 LocalPlayers（\(describe(rkL)) @GI+0x48，加密标志=\(encFlag)）")
+        }
         let data = u64le(lp, 0)
         let cnt = u32le(lp, 8)
-        guard plausible(data), cnt > 0, cnt <= 8 else { return 0 }
+        guard plausible(data), cnt > 0, cnt <= 8 else {
+            return (0, "LocalPlayers 空（count=\(cnt)，data=\(hexOf(data))，加密标志=\(encFlag)）")
+        }
 
-        let (rkP0, localPlayer) = readRaw(port: port, address: MachVmAddress(data))
-        guard rkP0 == KERN_SUCCESS, plausible(localPlayer) else { return 0 }
+        let (rkP0, lplayer) = readRaw(port: port, address: MachVmAddress(data))
+        guard rkP0 == KERN_SUCCESS, plausible(lplayer) else {
+            return (0, "LocalPlayers[0] 不是有效指针（\(hexOf(u64le(lp, 0)))，加密标志=\(encFlag)）")
+        }
 
-        let (rkPC, pc) = readRaw(port: port, address: MachVmAddress(localPlayer &+ 0x30))
-        guard rkPC == KERN_SUCCESS, plausible(pc) else { return 0 }
+        let (rkPC, pc) = readRaw(port: port, address: MachVmAddress(lplayer &+ 0x30))
+        guard rkPC == KERN_SUCCESS, plausible(pc) else {
+            return (0, "断在 UPlayer+0x30 → PlayerController（\(describe(rkPC))，加密标志=\(encFlag)）")
+        }
 
         let (rkPS, pstate) = readRaw(port: port, address: MachVmAddress(pc &+ 0x5F0))
-        guard rkPS == KERN_SUCCESS, plausible(pstate) else { return 0 }
-        return pstate
+        guard rkPS == KERN_SUCCESS, plausible(pstate) else {
+            return (0, "断在 AController+0x5F0 → PlayerState（\(describe(rkPS))，PC=\(hexOf(pc))）")
+        }
+        return (pstate, "GI=\(hexOf(gi)) LP=\(hexOf(lplayer)) PC=\(hexOf(pc)) PS=\(hexOf(pstate)) 加密标志=\(encFlag)")
     }
 
     /// 坐标打印用：保留 1 位小数，够判断量级又不刷屏。
