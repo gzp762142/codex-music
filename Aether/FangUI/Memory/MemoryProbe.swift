@@ -221,6 +221,66 @@ final class MemoryProbe {
         return nil
     }
 
+    /// 当前会话的 pid —— 按需映射时要用它取端口。
+    private(set) static var activePid: Int32 = 0
+
+    /// 把**包含 address 的那个 region** 整个映射进来。
+    ///
+    /// vm_region_64 从 address 起枚举时会直接返回包含它的那个 region（地址会被写回
+    /// region 起始），所以这里一次枚举 + 一次映射就够 —— 不需要从头扫地址空间。
+    @discardableResult
+    static func mapRegionContaining(pid: Int32, address: UInt64) -> String {
+        let (kr, p) = port(for: pid)
+        guard kr == KERN_SUCCESS, p != 0 else { return "取端口失败 \(describe(kr))" }
+        defer { dropPort(p) }
+
+        var addr: UInt64 = address
+        let (ok, size, _, _) = nextRegion(task: p, addr: &addr)
+        guard ok else { return "枚举失败 @0x\(String(address, radix: 16))" }
+        guard address >= addr, address < addr &+ size else {
+            return "0x\(String(address, radix: 16)) 不在返回的 region(0x\(String(addr, radix: 16)) +0x\(String(size, radix: 16))) 里"
+        }
+        let (local, note) = mapRange(pid: pid, srcAddress: addr, size: size)
+        return local != 0 ? note : note
+    }
+
+    /// **映射优先的读**：命中已建立的映射就本地读（零内核调用）；
+    /// 没命中就按需把那一块映射进来再读；映射也失败才退回 mach_vm_read。
+    ///
+    /// 这是整个方案的核心。`mach_vm_read` 每次都要进内核、抢游戏 vm_map 的读锁，
+    /// 而我们读的每个字段都是一次这样的操作；映射之后读数据就是普通内存访问。
+    private static func readSmart(port: MachPort, address: MachVmAddress, count: Int) -> (KernReturn, [UInt8]) {
+        let n = max(count, 1)
+        guard n <= 0x10000 else { return (KERN_FAILURE, []) }
+
+        if let local = localAddress(for: address), local != 0 {
+            noteRead()
+            if let base = UnsafeRawPointer(bitPattern: UInt(local)) {
+                return (KERN_SUCCESS, Array(UnsafeRawBufferPointer(start: base, count: n)))
+            }
+        }
+
+        // 没命中：按需映射一次（块数设上限，避免地图无限膨胀）
+        if activePid != 0, mappedRanges.count < 24 {
+            mapRegionContaining(pid: activePid, address: address)
+            if let local = localAddress(for: address), local != 0 {
+                noteRead()
+                if let base = UnsafeRawPointer(bitPattern: UInt(local)) {
+                    return (KERN_SUCCESS, Array(UnsafeRawBufferPointer(start: base, count: n)))
+                }
+            }
+        }
+
+        return readBytesDirect(port: port, address: address, count: n)
+    }
+
+    /// 读一段字节：**优先走已建立的映射**，没命中就让 readSmart 按需映射。
+    /// 原来这里直接就是 mach_vm_read —— 所有调用点现在自动升级成映射优先。
+    private static func readBytes(port: MachPort, address: MachVmAddress, count: Int)
+        -> (KernReturn, [UInt8]) {
+        readSmart(port: port, address: address, count: count)
+    }
+
     static var mappedSummary: String {
         mappedRanges.isEmpty ? "无映射" : "\(mappedRanges.count) 块"
     }
@@ -336,41 +396,25 @@ final class MemoryProbe {
     /// mach_vm_region 那条路已被删除：它有两个出参，是之前连续出错的来源，
     /// 而读内存根本不需要枚举内存区。
     private static func readAt(port: MachPort, address: MachVmAddress) -> (KernReturn, UInt32) {
-        guard let vmRead = vmReadFn else { return (KERN_FAILURE, 0) }
-        noteRead()
-        var dataPtr: UInt = 0
-        var dataLen: MachVmSize = 4
-        let kr = vmRead(port, address, 4, &dataPtr, &dataLen)
-        guard kr == KERN_SUCCESS, dataPtr != 0, dataLen >= 4 else { return (kr, 0) }
-        var v: UInt32 = 0
-        if let p = UnsafeRawPointer(bitPattern: dataPtr) {
-            v = p.assumingMemoryBound(to: UInt32.self).pointee
-        }
-        _ = vmDeallocateFn?(port, dataPtr, dataLen)
+        let (kr, bytes) = readSmart(port: port, address: address, count: 4)
+        guard kr == KERN_SUCCESS, bytes.count >= 4 else { return (kr, 0) }
+        let v = UInt32(bytes[0]) | (UInt32(bytes[1]) << 8)
+            | (UInt32(bytes[2]) << 16) | (UInt32(bytes[3]) << 24)
         return (KERN_SUCCESS, v)
     }
 
     /// 按绝对地址读 8 字节 —— 只给值，供程序判断用。
     private static func readRaw(port: MachPort, address: MachVmAddress) -> (KernReturn, UInt64) {
-        guard let vmRead = vmReadFn else { return (KERN_FAILURE, 0) }
-        noteRead()
-        var dataPtr: UInt = 0
-        var dataLen: MachVmSize = 8
-        let kr = vmRead(port, address, 8, &dataPtr, &dataLen)
-        guard kr == KERN_SUCCESS, dataPtr != 0, dataLen >= 8 else { return (kr, 0) }
-        var value: UInt64 = 0
-        if let p = UnsafeRawPointer(bitPattern: dataPtr) {
-            value = p.load(as: UInt64.self)
-        }
-        _ = vmDeallocateFn?(port, dataPtr, dataLen)
-        return (KERN_SUCCESS, value)
+        let (kr, bytes) = readSmart(port: port, address: address, count: 8)
+        guard kr == KERN_SUCCESS, bytes.count >= 8 else { return (kr, 0) }
+        return (KERN_SUCCESS, u64le(bytes, 0))
     }
 
     /// 读一段连续字节（**上限 4096**）。
     ///
     /// 这是唯一允许的块读取，硬上限就卡在 4096：之前用 16KB 步进扫内存
     /// 把目标进程搞成过 jetsam 被杀，连续 fault 太多页是死因。
-    private static func readBytes(port: MachPort, address: MachVmAddress, count: Int)
+    private static func readBytesDirect(port: MachPort, address: MachVmAddress, count: Int)
         -> (KernReturn, [UInt8]) {
         guard let vmRead = vmReadFn else { return (KERN_FAILURE, []) }
         guard count > 0, count <= 4096 else { return (KERN_FAILURE, []) }
@@ -1308,6 +1352,7 @@ final class MemoryProbe {
         imageBase = hitBase
         imageSlide = s
         basePid = pid
+        activePid = pid
 
         // ③ 摊开 slide 与三个可用 OFFSET 的运行时落点，目视确认都落在映像区间
         let off = Offsets.load()
