@@ -318,19 +318,19 @@ final class MemoryProbe {
             DispatchQueue.main.async { cb(stage) }
         }
 
-        // DateFormatter 绝不能留在调用线程上 —— 它内部走 ICU 本地化、多线程下要抢锁，
-        // 放在读取链的热路径上会把整个后台线程拖住。时间戳改成最廉价的整数形式。
+        // **同步**写盘。之前改成异步队列写过，结果进程被系统杀掉时，
+        // 队列里排队的那几行跟着一起丢了 —— 而那是我们唯一的现场
+        // （实测最后一次尝试连"检查基址"都没留下，看起来像没执行，其实执行了）。
+        // 每条只有几十字节，同步追加的代价可以接受。
+        guard let url = stageURL() else { return }
         let stamp = String(Int(Date().timeIntervalSince1970))
         let line = "\(stamp)  \(stage)\n"
-        stageQueue.async {
-            guard let url = stageURL() else { return }
-            if let handle = try? FileHandle(forWritingTo: url) {
-                defer { try? handle.close() }
-                handle.seekToEndOfFile()
-                handle.write(Data(line.utf8))
-            } else {
-                try? line.write(to: url, atomically: true, encoding: .utf8)
-            }
+        if let handle = try? FileHandle(forWritingTo: url) {
+            handle.seekToEndOfFile()
+            handle.write(Data(line.utf8))
+            try? handle.close()
+        } else {
+            try? line.write(to: url, atomically: true, encoding: .utf8)
         }
     }
 
