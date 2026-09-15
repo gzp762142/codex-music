@@ -179,6 +179,8 @@ final class MemoryProbe {
 
     /// 已经建立起来的映射：游戏地址 → 我们的本地地址。
     private static var mappedRanges: [(gameBase: UInt64, size: UInt64, localBase: UInt64)] = []
+    /// mappedRanges 是否已按 gameBase 排好序 —— localAddress 走二分，靠这个标志决定先不先排。
+    private static var rangesSorted = true
 
     private static let vmFlagsAnywhere: Int32 = 0x0001
 
@@ -215,6 +217,7 @@ final class MemoryProbe {
             return (0, "mach_vm_remap 失败 \(describe(rk))")
         }
         mappedRanges.append((alignedStart, total, target))
+        rangesSorted = false
         return (target + head,
                 "映射 0x\(String(alignedStart, radix: 16)) +0x\(String(total, radix: 16)) → 本地 0x\(String(target, radix: 16))")
     }
@@ -222,8 +225,24 @@ final class MemoryProbe {
     /// 本地地址 → 游戏地址：查已建立的映射。
     /// 命中就说明这块内存已经在我们自己地址空间里，读它不需要任何内核调用。
     static func localAddress(for gameAddress: UInt64) -> UInt64? {
-        for m in mappedRanges where gameAddress >= m.gameBase && gameAddress < m.gameBase + m.size {
-            return m.localBase + (gameAddress - m.gameBase)
+        // 热路径：遍历一张 actor 表要查几千次，块数又可能上百 —— 线性扫是上百万次比较。
+        // 这里按 gameBase 二分，排序由 rangesSorted 按需触发（append 时置脏）。
+        if !rangesSorted {
+            mappedRanges.sort { $0.gameBase < $1.gameBase }
+            rangesSorted = true
+        }
+        var lo = 0
+        var hi = mappedRanges.count - 1
+        while lo <= hi {
+            let mid = (lo + hi) / 2
+            let m = mappedRanges[mid]
+            if gameAddress < m.gameBase {
+                hi = mid - 1
+            } else if gameAddress >= m.gameBase &+ m.size {
+                lo = mid + 1
+            } else {
+                return m.localBase &+ (gameAddress &- m.gameBase)
+            }
         }
         return nil
     }
@@ -239,6 +258,7 @@ final class MemoryProbe {
         guard activePid != pid else { return }
         activePid = pid
         mappedRanges.removeAll()
+        rangesSorted = true
         imageBase = 0
         imageSlide = 0
         basePid = 0
@@ -264,11 +284,94 @@ final class MemoryProbe {
         return local != 0 ? note : note
     }
 
+    /// 把游戏进程里**所有值得映射的大 region** 一次性映射进来。
+    ///
+    /// 为什么必须批量：`readSmart` 的按需映射每次要花 1 次 `vm_region_64` + 1 次
+    /// `vm_remap` —— 两次都是内核调用，都要在游戏的 vm_map 上取锁。遍历整张 actor 表
+    /// （几千个对象，散落在几百个 region 里）时块数很快撞上上限，**剩下的读全部退化成
+    /// `mach_vm_read`**，而那正是实测会把游戏读崩的那条路（阈值 128 次）。
+    /// 上一版就是这么崩的 —— 不是「读得多」崩，是「没映射上的读」崩。
+    ///
+    /// 批量映射的代价只有「region 数量」次 vm_remap，之后每次读都是我们自己的页表访问。
+    /// 虚拟地址不心疼（64 位有 128TB），物理页按需 fault —— 只在我们真正碰到的页上分配。
+    ///
+    /// 三条自我约束：只映射 ≥ minSize 的块（避开碎片）、硬性时间预算、每若干轮确认目标还活着。
+    @discardableResult
+    static func mapAllRegions(pid: Int32, minSize: UInt64 = 4 << 20,
+                              budget: TimeInterval = 2.5, maxBlocks: Int = 200) -> String {
+        guard let fn = machVmRemapFn else { return "预映射: mach_vm_remap 符号缺失" }
+        let (kr, p) = port(for: pid)
+        guard kr == KERN_SUCCESS, p != 0 else { return "预映射: 取端口失败 \(describe(kr))" }
+        defer { dropPort(p) }
+
+        let deadline = Date().addingTimeInterval(budget)
+        let pageSize: UInt64 = 0x4000
+        var probe: UInt64 = 0x100000000
+        var mapped = 0
+        var skipped = 0
+        var failed = 0
+        var bytes: UInt64 = 0
+        var rounds = 0
+
+        while rounds < 800, mapped < maxBlocks {
+            if Date() > deadline { break }
+            if rounds % 64 == 0, !targetAlive(pid) { break }
+            rounds += 1
+
+            let ask = probe
+            let (ok, size, prot, _) = nextRegion(task: p, addr: &probe)
+            guard ok, size > 0 else { break }
+            let start = probe                      // nextRegion 会把 probe 写成 region 起始
+            let next = start &+ size
+            guard next > ask else { break }        // 防死循环
+            probe = next
+
+            guard (prot & 0x1) != 0, size >= minSize else { skipped += 1; continue }
+            if localAddress(for: start) != nil { continue }
+
+            // 映射内联在这里，复用同一个 task port —— mapRange 每次都重新 task_for_pid，
+            // 那本身也是一次内核往返，批量做几百次不该这么花。
+            let aligned = start & ~(pageSize - 1)
+            let total = (start - aligned + size + pageSize - 1) & ~(pageSize - 1)
+            var target: UInt64 = 0
+            var curProt: Int32 = 0
+            var maxProt: Int32 = 0
+            let rk = fn(mach_task_self_, &target, total, 0, vmFlagsAnywhere,
+                        p, aligned, 1, &curProt, &maxProt, 0)
+            if rk == KERN_SUCCESS, target != 0 {
+                mappedRanges.append((aligned, total, target))
+                rangesSorted = false
+                mapped += 1
+                bytes += total
+            } else {
+                failed += 1
+            }
+        }
+        if !rangesSorted {
+            mappedRanges.sort { $0.gameBase < $1.gameBase }
+            rangesSorted = true
+        }
+
+        let mb = String(format: "%.0f", Double(bytes) / 1048576.0)
+        return "预映射: \(mapped) 块 / \(mb) MB（扫 \(rounds) 个 region，跳过小块 \(skipped)，失败 \(failed)）"
+    }
+
+    /// 已建立的映射块数 —— 调用方用它判断"要不要先预映射一轮"。
+    static var mappedBlockCount: Int { mappedRanges.count }
+
+    /// 真正落回 mach_vm_read 的次数。遍历类操作要盯着这个数，超预算就该收手。
+    static var hardReadCalls: Int { vmReadCalls }
+
+
     /// **映射优先的读**：命中已建立的映射就本地读（零内核调用）；
     /// 没命中就按需把那一块映射进来再读；映射也失败才退回 mach_vm_read。
     ///
     /// 这是整个方案的核心。`mach_vm_read` 每次都要进内核、抢游戏 vm_map 的读锁，
     /// 而我们读的每个字段都是一次这样的操作；映射之后读数据就是普通内存访问。
+    ///
+    /// **块数上限从 24 提到 512**：原来那个 24 是按「点读几个字段」估的，遍历整张对象表
+    /// 时远远不够，一撞上限剩下的读全变成 mach_vm_read —— 那就是崩游戏的那条路。
+    /// 正常路径是先用 mapAllRegions 把大块一次性铺好，这里只是兜底。
     private static func readSmart(port: MachPort, address: MachVmAddress, count: Int) -> (KernReturn, [UInt8]) {
         let n = max(count, 1)
         guard n <= 0x10000 else { return (KERN_FAILURE, []) }
@@ -282,7 +385,7 @@ final class MemoryProbe {
         }
 
         // 没命中：按需映射一次（块数设上限，避免地图无限膨胀）
-        if activePid != 0, mappedRanges.count < 24 {
+        if activePid != 0, mappedRanges.count < 512 {
             let before = mappedRanges.count
             mapRegionContaining(pid: activePid, address: address)
             if mappedRanges.count > before { onDemandMaps += 1 }
@@ -1042,6 +1145,13 @@ final class MemoryProbe {
         let off = Offsets.load()
         var lines: [String] = []
 
+        // ⓿ 读之前先把大块铺好。**这一步不能省**：遍历整张 actor 表是几千次读取，
+        //    只要有相当一部分没命中映射，就会退化成 mach_vm_read —— 那是会崩游戏的路。
+        if mappedBlockCount < 8 {
+            stageMark("世界 · 预映射")
+            lines.append(mapAllRegions(pid: pid))
+        }
+
         // 解类名要用名字池
         let (rkPool, pool) = readRaw(port: p, address: MachVmAddress(runtime(off.gNames, slide: s)))
         guard rkPool == KERN_SUCCESS, pool != 0 else {
@@ -1093,12 +1203,22 @@ final class MemoryProbe {
         // 成本控制：actor 指针分块读（每块 500 个），Class 指针**去重**后每个类名只解一次
         // （同类对象共享 Class，命中率接近 100%），所以名字池的读取次数只跟「有多少种类」有关。
         stageMark("世界 · 遍历 Actor")
-        let total = min(Int(count), 3000)
+        // 第一次先只走 1200 个：本地读虽然不产生内核调用，但未映射过的页首次访问会有
+        // page fault（内核要在游戏名下记账一块物理页）。等确认预映射覆盖够、page fault
+        // 不成问题，再把这个上限放开。
+        let total = min(Int(count), 1200)
         var classNames: [UInt64: String] = [:]
         var histogram: [String: Int] = [:]
         var charActors: [UInt64] = []
         var cursor = 0
         while cursor < total {
+            // 预算闸门：一旦真的落回 mach_vm_read 太多次，立刻收手。
+            // 上一版没有这道闸门，一路读到底，游戏就没了。
+            if hardReadCalls > 200 {
+                lines.append("⚠ 已用 \(hardReadCalls) 次 mach_vm_read —— 主动停止遍历，保住游戏"
+                    + "（预映射没覆盖到的地址太多，先告诉我这句）")
+                break
+            }
             let batch = min(500, total - cursor)
             let (rkBuf, buf) = readBytes(port: p,
                                          address: MachVmAddress(dataPtr &+ UInt64(cursor * 8)),
@@ -1235,6 +1355,7 @@ final class MemoryProbe {
             return "映射: 没有当前进程的基址 —— 先点「找村口」"
         }
         mappedRanges.removeAll()
+        rangesSorted = true
         let s = imageSlide
         let base = imageBase
         var lines: [String] = []
