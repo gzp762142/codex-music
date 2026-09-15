@@ -135,6 +135,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     private var probeBusy = false
     /// 上一次读取的发起时刻 —— 用来判断它是不是已经被内核永久堵住了。
     private var probeStarted = Date.distantPast
+    /// 轮询后台进度的定时器：面板上实时显示走到哪一步。
+    private var stageTimer: Timer?
 
     /// 所有内存操作都从这里走：**切到后台线程执行，回来后刷 UI**。
     ///
@@ -160,6 +162,16 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         probeLabel.text = pending
         probeLabel.textColor = idleText
         let pid = gpid
+
+        // 面板上实时显示后台走到哪一步。崩之前那一瞬间屏幕上的字是唯一的现场 ——
+        // 落盘和崩溃日志都可能来不及（被系统直接杀掉时信号处理器根本没机会跑）。
+        stageTimer?.invalidate()
+        stageTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
+            guard let s = self, s.probeBusy else { return }
+            let stage = MemoryProbe.currentStage
+            s.probeLabel.text = stage.isEmpty ? pending : "\(pending) · \(stage)"
+        }
+
         DispatchQueue.global(qos: .userInitiated).async {
             MemoryProbe.stageMark(pending)
             let t0 = Date()
@@ -169,6 +181,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
             DispatchQueue.main.async { [weak self] in
                 guard let s = self else { return }
                 s.probeBusy = false
+                s.stageTimer?.invalidate()
+                s.stageTimer = nil
                 s.showReport("[\(ms) ms] " + result)
             }
         }

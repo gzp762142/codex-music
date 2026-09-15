@@ -164,12 +164,28 @@ final class MemoryProbe {
             .appendingPathComponent(stageFileName)
     }
 
-    /// 把当前步骤落盘。
+    /// 当前阶段：后台线程写、UI 轮询读 —— 面板上能实时看到走到哪一步。
+    /// 加锁是因为它跨线程：`String` 是值类型，无锁并发读写可能读到撕裂的值。
+    private static let stageLock = NSLock()
+    private static var _currentStage = ""
+
+    static var currentStage: String {
+        stageLock.lock()
+        defer { stageLock.unlock() }
+        return _currentStage
+    }
+
+    /// 标记当前步骤：一份进内存（UI 实时看），一份落盘（崩了之后还能查）。
     ///
-    /// 进程内的崩溃日志靠不住：被系统直接杀掉时（jetsam、watchdog、SIGKILL）
-    /// 信号处理器没有机会跑，什么都留不下。所以进度必须落盘 ——
-    /// 崩了之后重开 app，读这个文件就知道上一次停在哪一步。
+    /// 为什么落盘也是必须的：被系统直接杀掉时（jetsam、watchdog、SIGKILL、
+    /// cpu_resource_fatal）信号处理器根本没有机会跑，进程内什么都留不下。
+    /// 但落盘也可能来不及 —— 所以内存里那份要能实时显示在面板上，
+    /// 崩之前那一瞬间屏幕上的字，往往是唯一的现场。
     static func stageMark(_ stage: String) {
+        stageLock.lock()
+        _currentStage = stage
+        stageLock.unlock()
+
         guard let url = stageURL() else { return }
         let stamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
         let line = "\(stamp)  \(stage)\n"
@@ -970,7 +986,12 @@ final class MemoryProbe {
         }
         defer { dropPort(p) }
 
-        var addr: UInt64 = 0
+        // 起点直接用 0x100000000，不从 0 开始。
+        // 主可执行文件的 __TEXT 就在那儿 —— dump 里是，真机每次实测也是
+        // （0x102ac4000 / 0x1027c8000 / 0x104708000… 全都是这个基址加 slide）。
+        // 从 0 开始要白白走过几百个低地址 region，每一个都是一次内核调用、
+        // 一次对游戏 vm_map 的加锁 —— 既是我们的 CPU 开销，也是对游戏的打扰。
+        var addr: UInt64 = 0x100000000
         var scanned = 0
         var hitBase: UInt64 = 0
         var hitName = ""
@@ -978,12 +999,11 @@ final class MemoryProbe {
         var rejects: [String] = []
         var timedOut = false
 
-        // 枚举预算：主二进制几乎总在前几百个 region 里（实测经常是第 1 个）。
-        // 原来定 6000 太宽松了 —— 每轮最多两次内核调用，跑满就是上万次，
-        // `proc_regionfilename` 还要走 vnode，实测直接把 app 的 CPU 配额烧穿，
-        // 被系统以 cpu_resource_fatal（bug_type 206）杀掉。两道限制同时上：
-        // 数量上限 + 硬性时间预算，任何一个先到就停。
-        let scanLimit = 800
+    /// 枚举预算：起点已经是 0x100000000，正常一两个 region 就命中，
+    /// 200 轮是给"布局异常"留的余量。原来从 0 起、上限 6000 的版本实测
+    /// 烧穿了 app 的 CPU 配额（被系统以 cpu_resource_fatal 杀掉，bug_type 206），
+    /// 所以数量和时间两道限制同时上。
+        let scanLimit = 200
         let deadline = Date().addingTimeInterval(5.0)
 
         while scanned < scanLimit {
