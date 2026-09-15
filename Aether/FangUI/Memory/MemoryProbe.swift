@@ -1366,7 +1366,7 @@ final class MemoryProbe {
     ///
     /// **这是绕开 LocalPlayers 那层加密的路，而且比它更好** —— 它给的是全场玩家，
     /// 不只是自己。而且这一路上全是 public 字段（对比 LocalPlayers 那对是 Protected）：
-    ///   UWorld + 0x630           → GameState (AGameStateBase*)
+    ///   UWorld + 0xAD8           → GameState (AGameStateBase*)  ← UWorld 自己的字段
     ///   AGameStateBase + 0x5E8   → PlayerArray (TArray<APlayerState*>，BlueprintVisible)
     ///   APlayerState + 0x5D8     → Pawn (APawn*，Net + RepNotify，公开同步)
     ///   AActor + 0x260           → RootComponent (USceneComponent*)
@@ -1404,10 +1404,10 @@ final class MemoryProbe {
 
         // ② GameState
         stageMark("玩家 · GameState")
-        let (rkGS, gameState) = readRaw(port: p, address: MachVmAddress(world &+ 0x630))
+        let (rkGS, gameState) = readRaw(port: p, address: MachVmAddress(world &+ 0xAD8))
         guard rkGS == KERN_SUCCESS, gameState != 0 else {
             return lines.joined(separator: "\n")
-                + "\n读 GameState 失败 \(describe(rkGS)) @UWorld+0x630 —— 多半还在大厅"
+                + "\n读 GameState 失败 \(describe(rkGS)) @UWorld+0xAD8 —— 多半还在大厅"
         }
         lines.append("GameState=\(hexOf(gameState))")
 
