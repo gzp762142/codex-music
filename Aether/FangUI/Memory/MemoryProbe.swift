@@ -424,6 +424,72 @@ final class MemoryProbe {
         return v
     }
 
+    /// 从字节数组里读一个小端 UInt32（越界返回 0）。
+    private static func u32le(_ b: [UInt8], _ offset: Int) -> UInt32 {
+        guard offset >= 0, offset + 4 <= b.count else { return 0 }
+        return UInt32(b[offset]) | (UInt32(b[offset + 1]) << 8)
+            | (UInt32(b[offset + 2]) << 16) | (UInt32(b[offset + 3]) << 24)
+    }
+
+    /// 从字节数组里读一个小端 Int32（越界返回 0）。
+    private static func i32le(_ b: [UInt8], _ offset: Int) -> Int32 {
+        Int32(bitPattern: u32le(b, offset))
+    }
+
+    /// 读 UE4 的 FString：{ TCHAR* Data; int32 Num; int32 Max; }（0x10 字节）。
+    ///
+    /// **字符宽度不假定。** iOS 上 UE4 的 TCHAR 是 4 字节（Apple 平台
+    /// PLATFORM_TCHAR_IS_4_BYTES=1），但定制版可能退回 2 字节。三种宽度各解一遍，
+    /// 用「解出的字符数是否等于 Num−1」这条自洽性判胜负 —— 不靠猜。
+    private static func readText(port: MachPort, addr: UInt64, maxChars: Int = 24) -> String {
+        let (rk, hdr) = readBytes(port: port, address: MachVmAddress(addr), count: 16)
+        guard rk == KERN_SUCCESS, hdr.count >= 16 else { return "" }
+        let data = u64le(hdr, 0)
+        let num = Int(u32le(hdr, 8))
+        guard data > 0x100000000, num > 1, num <= 256 else { return "" }
+
+        let n = min(num, maxChars)
+        let (rk2, raw) = readBytes(port: port, address: MachVmAddress(data), count: n * 4)
+        guard rk2 == KERN_SUCCESS, raw.count >= n * 2 else { return "" }
+
+        func decode(width: Int) -> (String, Int) {
+            var out = ""
+            var idx = 0
+            var seen = 0
+            while idx + width <= raw.count && seen < maxChars {
+                var v: UInt32 = 0
+                for k in 0..<width { v |= UInt32(raw[idx + k]) << (8 * k) }
+                if v == 0 { break }
+                guard let u = UnicodeScalar(v) else { return (out, -1) }
+                out.unicodeScalars.append(u)
+                idx += width
+                seen += 1
+            }
+            return (out, seen)
+        }
+
+        func score(_ s: String, _ seen: Int) -> Int {
+            guard seen > 0 else { return -1 }
+            var sc = seen
+            if seen == num - 1 { sc += 100 }      // 与 Num 完全自洽 → 决定性加分
+            for u in s.unicodeScalars {
+                let v = u.value
+                if (v >= 0x20 && v < 0x7F) || (v >= 0x4E00 && v <= 0x9FFF) { sc += 5 }
+            }
+            return sc
+        }
+
+        var best = ""
+        var bestScore = -1
+        for width in [4, 2, 1] {
+            let (text, seen) = decode(width: width)
+            guard seen > 0, !text.isEmpty else { continue }
+            let sc = score(text, seen)
+            if sc > bestScore { bestScore = sc; best = text }
+        }
+        return best
+    }
+
     /// 按绝对地址读 4 字节。**只有 3 个参数**。
     /// mach_vm_region 那条路已被删除：它有两个出参，是之前连续出错的来源，
     /// 而读内存根本不需要枚举内存区。
@@ -1239,8 +1305,9 @@ final class MemoryProbe {
 
     /// 从字节数组按小端读一个 float。
     private static func floatAt(_ b: [UInt8], _ o: Int) -> Float {
-        Float(bitPattern: UInt32(b[o]) | (UInt32(b[o + 1]) << 8)
-            | (UInt32(b[o + 2]) << 16) | (UInt32(b[o + 3]) << 24))
+        // 越界必须给 0 而不是让 Swift 崩：调用方拿到的可能是读取失败后的空数组。
+        guard o >= 0, o + 4 <= b.count else { return 0 }
+        return Float(bitPattern: u32le(b, o))
     }
 
     /// 定位自己：UWorld → GameInstance → LocalPlayers[0] → PlayerController
@@ -1362,18 +1429,30 @@ final class MemoryProbe {
         return lines.joined(separator: "\n")
     }
 
-    /// 全场玩家：GWorld → GameState → PlayerArray → PlayerState → Pawn → 坐标
+    /// 全场玩家：GWorld → GameState → PlayerArray → ASTExtraPlayerState → 位置 / 血量 / 角色
     ///
-    /// **这是绕开 LocalPlayers 那层加密的路，而且比它更好** —— 它给的是全场玩家，
-    /// 不只是自己。而且这一路上全是 public 字段（对比 LocalPlayers 那对是 Protected）：
-    ///   UWorld + 0xAD8           → GameState (AGameStateBase*)  ← UWorld 自己的字段
-    ///   AGameStateBase + 0x5E8   → PlayerArray (TArray<APlayerState*>，BlueprintVisible)
-    ///   APlayerState + 0x5D8     → Pawn (APawn*，Net + RepNotify，公开同步)
-    ///   AActor + 0x260           → RootComponent (USceneComponent*)
-    ///   USceneComponent + 0x1F0  → ComponentToWorld (FTransform)
-    ///   FTransform + 0x10        → Translation (FVector: x, y, z)
+    /// **这一版的偏移全部回溯过类声明**（上一版把 `AController` 的 `Pawn` 当成了
+    /// `APlayerState` 的字段 —— 那个 `0x5D8` 实际是 `FString PlayerName`；而
+    /// `APlayerState` 整个类体里**根本没有 Pawn 字段**，只有 score/Ping/PlayerName/
+    /// PlayerID/StartTime）。所以「PlayerState → Pawn → 坐标」这条链从来不存在：
+    ///   UWorld + 0x0AD8                 → GameState (AGameStateBase*)   [UWorld 自己的字段]
+    ///   AGameStateBase + 0x05E8         → PlayerArray (TArray<APlayerState*>)
+    ///   APlayerState + 0x05D0           → score (float)
+    ///   APlayerState + 0x05D4           → Ping (uint8)
+    ///   APlayerState + 0x05D8           → FString PlayerName (0x10)      ★不是 Pawn
+    ///   APlayerState + 0x05F8           → PlayerID (int32)
+    ///   ASTExtraPlayerState + 0x1648    → LiveState (EExtraPlayerLiveState)
+    ///   ASTExtraPlayerState + 0x1649    → AILiveState (EEAILiveState)    ← 人 / AI
+    ///   ASTExtraPlayerState + 0x16C0    → CharacterOwner (ASTExtraBaseCharacter*)
+    ///   ASTExtraPlayerState + 0x16D0    → PlayerHealth / +0x16D4 HealthMax
+    ///   ASTExtraPlayerState + 0x16E0    → SelfLocAndRot (FCharacterLocAndRot)
+    ///                                     = FVector Loc(0x0C) + FRotator Rot(0x0C)
     ///
-    /// 每个玩家 3 次读取，全部走映射（本地内存），所以读一圈不产生内核调用。
+    /// `PlayerState` 是 always-relevant 的，**位置就挂在它自己身上** —— 不需要遍历
+    /// actor 表，也不需要从一个不存在的 Pawn 字段反查。每个玩家 2 次读取。
+    ///
+    /// 坐标走两条独立路径交叉验证：PlayerState 的 `SelfLocAndRot`，
+    /// 以及 `CharacterOwner → RootComponent → ComponentToWorld`。两条一致才敢用。
     static func stepPlayers(pid: Int32) -> String {
         resetCounters()
         stageMark("玩家")
@@ -1400,7 +1479,7 @@ final class MemoryProbe {
             let (rkRel, rel) = readBytes(port: p, address: MachVmAddress(root &+ 0x1CC), count: 12)
             let (rkT, tf) = readBytes(port: p, address: MachVmAddress(root &+ 0x1F0 + 0x10), count: 12)
 
-            var out = "Pawn=\(hexOf(actor))  RootComponent=\(hexOf(root))"
+            var out = "Actor=\(hexOf(actor))  RootComponent=\(hexOf(root))"
             if rkRel == KERN_SUCCESS, rel.count >= 12 {
                 out += "\n      RelLoc(0x1CC):  X=\(floatAt(rel, 0))  Y=\(floatAt(rel, 4))  Z=\(floatAt(rel, 8))"
             } else {
@@ -1447,8 +1526,7 @@ final class MemoryProbe {
             return lines.joined(separator: "\n")
         }
 
-        // ④ 逐个玩家：PlayerState → Pawn → 坐标
-        stageMark("玩家 · 遍历")
+        // ④ 逐个玩家：所有数据都挂在 PlayerState 自己身上
         let n = min(Int(paCount), 8)
         let (rkList, list) = readBytes(port: p, address: MachVmAddress(paData), count: n * 8)
         guard rkList == KERN_SUCCESS, list.count >= n * 8 else {
@@ -1456,21 +1534,100 @@ final class MemoryProbe {
             lines.append(costLine())
             return lines.joined(separator: "\n")
         }
-        var alive = 0
+        // 顺带标出名单里"哪个是你"：任一环失败就静默跳过，不影响主流程
+        let selfPS = findSelfPlayerState(port: p, world: world)
+
+        stageMark("玩家 · 遍历")
+        var withChar = 0
+        var withLoc = 0
         for i in 0..<n {
             let ps = u64le(list, i * 8)
             guard ps != 0 else { continue }
-            let (rkP, pawn) = readRaw(port: p, address: MachVmAddress(ps &+ 0x5D8))
-            guard rkP == KERN_SUCCESS, pawn != 0 else {
-                lines.append("[\(i)] PlayerState=\(hexOf(ps))  Pawn=空（离场或未生成）")
-                continue
+
+            // 段 A 身份：0x5D0 score · 0x5D4 Ping · 0x5D8 PlayerName · 0x5F8 PlayerID
+            let (rkA, segA) = readBytes(port: p, address: MachVmAddress(ps &+ 0x5D0), count: 0x30)
+            // 段 B 状态：0x1648 LiveState · 0x1649 AILiveState · 0x16C0 CharacterOwner
+            //           0x16D0 Health · 0x16D4 HealthMax · 0x16E0 SelfLocAndRot(0x18)
+            let (rkB, segB) = readBytes(port: p, address: MachVmAddress(ps &+ 0x1648), count: 0xB8)
+
+            let name = readText(port: p, addr: ps &+ 0x5D8)
+            let playerID = i32le(segA, 0x28)
+            let ping = (rkA == KERN_SUCCESS && segA.count > 4) ? Int(segA[4]) : -1
+            let live = (rkB == KERN_SUCCESS && segB.count > 0) ? Int(segB[0]) : -1
+            let ai = (rkB == KERN_SUCCESS && segB.count > 1) ? Int(segB[1]) : -1
+            let charOwner = u64le(segB, 0x78)
+            let health = floatAt(segB, 0x88)
+            let healthMax = floatAt(segB, 0x8C)
+
+            var head = "[\(i)] " + (name.isEmpty ? "(无名)" : "\"\(name)\"")
+            head += "  id=\(playerID)  HP=\(fmt1(health))/\(fmt1(healthMax))"
+            if ai >= 0 { head += "  AI=\(ai)" }
+            if live >= 0 { head += "  Live=\(live)" }
+            if ping >= 0 { head += "  ping=\(ping)" }
+            if selfPS != 0 && ps == selfPS { head += "   ★这是你" }
+            lines.append(head)
+
+            // 坐标路径 ①：PlayerState 自带的 SelfLocAndRot
+            if rkB == KERN_SUCCESS, segB.count >= 0xB0 {
+                let lx = floatAt(segB, 0x98), ly = floatAt(segB, 0x9C), lz = floatAt(segB, 0xA0)
+                let rx = floatAt(segB, 0xA4), ry = floatAt(segB, 0xA8), rz = floatAt(segB, 0xAC)
+                let zero = (lx == 0 && ly == 0 && lz == 0)
+                let wild = abs(lx) > 1e7 || abs(ly) > 1e7 || abs(lz) > 1e7
+                if !zero && !wild { withLoc += 1 }
+                lines.append("      SelfLoc=(\(fmt1(lx)), \(fmt1(ly)), \(fmt1(lz)))"
+                    + "   Rot=(\(fmt1(rx)), \(fmt1(ry)), \(fmt1(rz)))"
+                    + (zero ? "   ← 全零：这个人的位置没同步过来"
+                            : (wild ? "   ⚠ 量级异常" : "   ✓")))
+            } else {
+                lines.append("      读状态段失败 \(describe(rkB)) @PlayerState+0x1648")
             }
-            alive += 1
-            lines.append("[\(i)] " + coordRaw(of: pawn))
+
+            // 坐标路径 ②：Character → RootComponent → ComponentToWorld（交叉验证）
+            if charOwner > 0x100000000 {
+                withChar += 1
+                lines.append("      Char=\(hexOf(charOwner))")
+                lines.append("      " + coordRaw(of: charOwner))
+            } else {
+                lines.append("      Char=空（客户端没有这个人的角色对象）")
+            }
         }
-        lines.append("共 \(n) 个 PlayerState，其中 \(alive) 个 Pawn 非空")
+        lines.append("共 \(n) 个 PlayerState：\(withChar) 个有角色、\(withLoc) 个坐标非零")
         lines.append(costLine())
         return lines.joined(separator: "\n")
+    }
+
+    /// 找出"自己的 PlayerState"：GWorld + 0xB20 → GameInstance + 0x48 → LocalPlayers[0]
+    ///   → UPlayer + 0x30 PlayerController → AController + 0x5F0 PlayerState
+    ///
+    /// **只用于在名单里打一个 ★ 标记。** 任一环读不到就返回 0，绝不阻塞主流程 ——
+    /// LocalPlayers 那条路可能被 bUseEncryptLocalPlayerPtr 挡住，那是它自己的事。
+    private static func findSelfPlayerState(port: MachPort, world: UInt64) -> UInt64 {
+        func plausible(_ v: UInt64) -> Bool { v > 0x100000000 && v < 0xF000000000000000 }
+
+        let (rkG, gi) = readRaw(port: port, address: MachVmAddress(world &+ 0xB20))
+        guard rkG == KERN_SUCCESS, plausible(gi) else { return 0 }
+
+        let (rkL, lp) = readBytes(port: port, address: MachVmAddress(gi &+ 0x48), count: 16)
+        guard rkL == KERN_SUCCESS, lp.count >= 16 else { return 0 }
+        let data = u64le(lp, 0)
+        let cnt = u32le(lp, 8)
+        guard plausible(data), cnt > 0, cnt <= 8 else { return 0 }
+
+        let (rkP0, localPlayer) = readRaw(port: port, address: MachVmAddress(data))
+        guard rkP0 == KERN_SUCCESS, plausible(localPlayer) else { return 0 }
+
+        let (rkPC, pc) = readRaw(port: port, address: MachVmAddress(localPlayer &+ 0x30))
+        guard rkPC == KERN_SUCCESS, plausible(pc) else { return 0 }
+
+        let (rkPS, pstate) = readRaw(port: port, address: MachVmAddress(pc &+ 0x5F0))
+        guard rkPS == KERN_SUCCESS, plausible(pstate) else { return 0 }
+        return pstate
+    }
+
+    /// 坐标打印用：保留 1 位小数，够判断量级又不刷屏。
+    private static func fmt1(_ v: Float) -> String {
+        guard v.isFinite else { return "NaN" }
+        return String(format: "%.1f", v)
     }
 
     /// 单点区域归属：对 dump 基址问一次「这属于哪个文件」。
