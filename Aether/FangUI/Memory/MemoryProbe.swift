@@ -1388,13 +1388,30 @@ final class MemoryProbe {
         let off = Offsets.load()
         var lines: [String] = []
 
-        func coord(of actor: UInt64) -> (KernReturn, Float, Float, Float) {
+        func coordRaw(of actor: UInt64) -> String {
             let (rkR, root) = readRaw(port: p, address: MachVmAddress(actor &+ 0x260))
-            guard rkR == KERN_SUCCESS, root != 0 else { return (rkR, 0, 0, 0) }
-            let (rkT, tf) = readBytes(port: p,
-                                      address: MachVmAddress(root &+ 0x1F0 + 0x10), count: 12)
-            guard rkT == KERN_SUCCESS, tf.count >= 12 else { return (rkT, 0, 0, 0) }
-            return (KERN_SUCCESS, floatAt(tf, 0), floatAt(tf, 4), floatAt(tf, 8))
+            guard rkR == KERN_SUCCESS, root != 0 else {
+                return "Pawn=\(hexOf(actor))  读 RootComponent 失败 \(describe(rkR))"
+            }
+            // 两个候选位置都读出来。dump 里 USceneComponent 的定义是：
+            //   RelativeLocation   0x01CC (FVector, 0xC)
+            //   ComponentToWorld   0x01F0 (FTransform, 0x30)  —— Translation 在 +0x10
+            // 哪个是对的用数据说话，不再靠猜。
+            let (rkRel, rel) = readBytes(port: p, address: MachVmAddress(root &+ 0x1CC), count: 12)
+            let (rkT, tf) = readBytes(port: p, address: MachVmAddress(root &+ 0x1F0 + 0x10), count: 12)
+
+            var out = "Pawn=\(hexOf(actor))  RootComponent=\(hexOf(root))"
+            if rkRel == KERN_SUCCESS, rel.count >= 12 {
+                out += "\n      RelLoc(0x1CC):  X=\(floatAt(rel, 0))  Y=\(floatAt(rel, 4))  Z=\(floatAt(rel, 8))"
+            } else {
+                out += "\n      RelLoc(0x1CC):  读失败 \(describe(rkRel))"
+            }
+            if rkT == KERN_SUCCESS, tf.count >= 12 {
+                out += "\n      ToWorld(0x1F0+0x10): X=\(floatAt(tf, 0))  Y=\(floatAt(tf, 4))  Z=\(floatAt(tf, 8))"
+            } else {
+                out += "\n      ToWorld(0x1F0+0x10): 读失败 \(describe(rkT))"
+            }
+            return out
         }
 
         // ① UWorld
@@ -1448,15 +1465,10 @@ final class MemoryProbe {
                 lines.append("[\(i)] PlayerState=\(hexOf(ps))  Pawn=空（离场或未生成）")
                 continue
             }
-            let (rkC, x, y, z) = coord(of: pawn)
-            if rkC == KERN_SUCCESS {
-                alive += 1
-                lines.append("[\(i)] Pawn=\(hexOf(pawn))  坐标 X=\(Int(x)) Y=\(Int(y)) Z=\(Int(z))")
-            } else {
-                lines.append("[\(i)] Pawn=\(hexOf(pawn))  读坐标失败 \(describe(rkC))")
-            }
+            alive += 1
+            lines.append("[\(i)] " + coordRaw(of: pawn))
         }
-        lines.append("共 \(n) 个 PlayerState，其中 \(alive) 个拿到了坐标")
+        lines.append("共 \(n) 个 PlayerState，其中 \(alive) 个 Pawn 非空")
         lines.append(costLine())
         return lines.joined(separator: "\n")
     }
