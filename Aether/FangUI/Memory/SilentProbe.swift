@@ -69,5 +69,11 @@ final class SilentProbe {
     func stop() {
         timer?.invalidate()
         timer = nil
+        // 端口是 task_for_pid 拿到的 send right，不释放就会一直累积 ——
+        // 每个 right 都让游戏的 task 对象多背一个引用，崩了也回收不掉。
+        if heldPort != 0 {
+            MemoryProbe.releasePort(heldPort)
+            heldPort = 0
+        }
     }
 }

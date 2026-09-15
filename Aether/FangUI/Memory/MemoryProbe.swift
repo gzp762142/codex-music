@@ -36,6 +36,10 @@ final class MemoryProbe {
     }
 
     private static let taskForPidFn = symbol("task_for_pid", as: TaskForPidFn.self)
+
+    /// mach_port_deallocate：释放我们自己持有的 port right。
+    private typealias PortDeallocateFn = @convention(c) (MachPort, MachPort) -> KernReturn
+    private static let portDeallocateFn = symbol("mach_port_deallocate", as: PortDeallocateFn.self)
     /// vm_region_recurse_64：枚举目标地址空间里的 region（**不读内存内容**）。
     ///
     /// 比 mach_vm_region 少一个 flavor 参数、多一个 nesting_depth，
@@ -107,6 +111,7 @@ final class MemoryProbe {
         guard let fn = taskForPidFn else { return "dlsym: 符号缺失" }
         var port: MachPort = 0
         let kr = fn(mach_task_self_, pid, &port)
+        defer { dropPort(port) }
         if kr == KERN_SUCCESS, port != 0 {
             return "dlsym: 成功 port=0x\(String(port, radix: 16))"
         }
@@ -225,6 +230,23 @@ final class MemoryProbe {
         return (kr, p)
     }
 
+    /// 释放一个 task port。
+    ///
+    /// **每次 `task_for_pid` 都会新建一个 send right**，不释放就一直累积。
+    /// 之前的版本从来没释放过：每点一次按钮泄漏一个 right，而每个 right 都让
+    /// 游戏的 task 对象多背一个引用 —— 游戏崩掉之后那个 task 对象也回收不掉，
+    /// 反复"崩→重开→读"会把内核里堆一串收不掉的 task。
+    /// 取端口的地方一律用 `defer { dropPort(p) }` 配对。
+    private static func dropPort(_ p: MachPort) {
+        guard p != 0, let fn = portDeallocateFn else { return }
+        _ = fn(mach_task_self_, p)
+    }
+
+    /// 给面板调用方用的释放入口（SilentProbe 这类需要跨回调持有端口的场景）。
+    static func releasePort(_ p: UInt32) {
+        dropPort(MachPort(p))
+    }
+
     // MARK: - 地址换算（唯一入口）
 
     /// dump 时 __TEXT.vmaddr 恒为 0x100000000 —— 静态域的零点。
@@ -269,6 +291,7 @@ final class MemoryProbe {
         let off = Offsets.load()
         let (kr, p) = port(for: pid)
         guard kr == KERN_SUCCESS, p != 0 else { return "读证: 取端口失败 \(describe(kr))" }
+        defer { dropPort(p) }
 
         let (rk, magic) = readAt(port: p, address: MachVmAddress(off.moduleBase))
         guard rk == KERN_SUCCESS else {
@@ -297,6 +320,7 @@ final class MemoryProbe {
         }
         let (kr, p) = port(for: pid)
         guard kr == KERN_SUCCESS, p != 0 else { return "定点读: 取端口失败 \(describe(kr))" }
+        defer { dropPort(p) }
 
         let s = imageSlide
         let off = Offsets.load()
@@ -435,6 +459,7 @@ final class MemoryProbe {
         }
         let (kr, p) = port(for: pid)
         guard kr == KERN_SUCCESS, p != 0 else { return "GNames: 取端口失败 \(describe(kr))" }
+        defer { dropPort(p) }
 
         let s = imageSlide
         let slotAddr = runtime(Offsets.load().gNames, slide: s)
@@ -561,6 +586,7 @@ final class MemoryProbe {
         }
         let (kr, p) = port(for: pid)
         guard kr == KERN_SUCCESS, p != 0 else { return "对象: 取端口失败 \(describe(kr))" }
+        defer { dropPort(p) }
 
         let s = imageSlide
         let off = Offsets.load()
@@ -662,6 +688,7 @@ final class MemoryProbe {
         }
         let (kr, p) = port(for: pid)
         guard kr == KERN_SUCCESS, p != 0 else { return "世界: 取端口失败 \(describe(kr))" }
+        defer { dropPort(p) }
 
         let s = imageSlide
         let slot = runtime(Offsets.load().gWorld, slide: s)
@@ -790,11 +817,21 @@ final class MemoryProbe {
             return "找基址: 参数自检失败（对自己枚举就不成功），未碰游戏"
         }
 
+        // ---- 先确认这个 pid 还是游戏 ----
+        // 游戏重启会换 pid。拿一个已经失效、又被系统复用给别人的 pid 去
+        // task_for_pid，就会变成读另一个进程的内存 —— 这一步零内存读取，
+        // 只是问「0x100000000 这个地址属于哪个文件」。
+        guard let gamePath = regionFile(pid: pid, addr: 0x100000000),
+              gamePath.lowercased().contains("shadowtracker") else {
+            return "找基址: pid \(pid) 不是游戏映像（游戏可能重启过）—— 先点「刷新」"
+        }
+
         // ---- 拿游戏的 task port ----
         let (kr, p) = port(for: pid)
         guard kr == KERN_SUCCESS, p != 0 else {
             return "找基址: 取端口失败 \(describe(kr))"
         }
+        defer { dropPort(p) }
 
         var addr: UInt64 = 0
         var scanned = 0
