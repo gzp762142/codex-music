@@ -139,6 +139,47 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
 
     func reload() { onRefresh() }
 
+    /// 上一次读取还没回来：挡住重复点击，避免后台堆积多个操作。
+    private var probeBusy = false
+    /// 上一次读取的发起时刻 —— 用来判断它是不是已经被内核永久堵住了。
+    private var probeStarted = Date.distantPast
+
+    /// 所有内存操作都从这里走：**切到后台线程执行，回来后刷 UI**。
+    ///
+    /// 绝不能在主线程直接调 `mach_vm_read`。它进内核后要等目标进程 vm_map 的锁，
+    /// 游戏主线程每帧都在分配内存（持写锁），我们可能排很久；如果那一页还要从
+    /// 磁盘换入（__DATA 是文件映射），还得等 I/O。而且这个等待**不可中断、没有超时**。
+    /// 实测点「世界」把整个面板卡死过一次 —— 游戏毫发无伤，卡住的是我们自己。
+    ///
+    /// 顺带把耗时打出来：那是判断"一次读取到底多贵"最直接的数。
+    private func runProbe(_ pending: String, _ work: @escaping (Int32) -> String) {
+        guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
+        if probeBusy {
+            // 被内核堵死的话不会自己回来，30 秒后放行新的请求，免得面板只能用一次
+            if Date().timeIntervalSince(probeStarted) > 30 {
+                probeBusy = false
+            } else {
+                probeLabel.text = "上一个读取还没回来（被内核堵住了），等它"
+                return
+            }
+        }
+        probeBusy = true
+        probeStarted = Date()
+        probeLabel.text = pending
+        probeLabel.textColor = idleText
+        let pid = gpid
+        DispatchQueue.global(qos: .userInitiated).async {
+            let t0 = Date()
+            let result = work(pid)
+            let ms = Int(Date().timeIntervalSince(t0) * 1000)
+            DispatchQueue.main.async { [weak self] in
+                guard let s = self else { return }
+                s.probeBusy = false
+                s.showReport("[\(ms) ms] " + result)
+            }
+        }
+    }
+
     /// 把多行报告同时放进状态行（第一行）和可滚动列表（全部行）。
     /// 「找村口」「定点读」的结论是多行的（base/slide/三个落点/链上的值），
     /// 单行状态栏放不下，必须给列表看。
@@ -185,20 +226,18 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
 
     @objc private func onDlsym() {
         guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
-        probeLabel.text = MemoryProbe.stepDlsym(pid: gpid)
-        probeLabel.textColor = accent
+        runProbe("dlsym: 读取中…") { MemoryProbe.stepDlsym(pid: $0) }
     }
 
     @objc private func onProof() {
         guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
-        probeLabel.text = MemoryProbe.stepReadProof(pid: gpid)
-        probeLabel.textColor = accent
+        runProbe("读证: 读取中…") { MemoryProbe.stepReadProof(pid: $0) }
     }
 
     /// 定点读：用「找村口」存下的 base/slide 换算后点读 GObjects 链（约 20 字节）。
     @objc private func onFixedRead() {
         guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
-        showReport(MemoryProbe.stepFixedRead(pid: gpid))
+        runProbe("定点读: 读取中…") { MemoryProbe.stepFixedRead(pid: $0) }
     }
 
     /// 静默测试：拿到端口后什么都不读，看目标会不会自己死。
@@ -243,39 +282,38 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     /// 区域归属：一次调用问「dump 基址属于哪个文件」。
     @objc private func onRegionName() {
         guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
-        probeLabel.text = MemoryProbe.stepRegionName(pid: gpid)
-        probeLabel.textColor = accent
+        runProbe("区域归属: 读取中…") { MemoryProbe.stepRegionName(pid: $0) }
     }
 
     /// 找村口：枚举 region（三条件）+ Mach-O 头校验；命中后记下 base/slide。
     /// 报告多行：第一行进状态行，全部行进可滚动列表。
     @objc private func onFindBase() {
         guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
-        showReport(MemoryProbe.stepFindBase(pid: gpid))
+        runProbe("找村口: 读取中…") { MemoryProbe.stepFindBase(pid: $0) }
     }
 
     /// 名字：解 FName 索引（验收点：0/1/2 → None / ByteProperty / IntProperty）。
     @objc private func onNames() {
         guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
-        showReport(MemoryProbe.stepGNames(pid: gpid))
+        runProbe("名字: 读取中…") { MemoryProbe.stepGNames(pid: $0) }
     }
 
     /// 对象：对象表前 16 个的「类名 + 对象名」（验证 Class/Name 这条链）。
     @objc private func onObjects() {
         guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
-        showReport(MemoryProbe.stepObjects(pid: gpid))
+        runProbe("对象: 读取中…") { MemoryProbe.stepObjects(pid: $0) }
     }
 
     /// 世界：GWorld → PersistentLevel → Actors（三次小读，走热页）。
     @objc private func onWorld() {
         guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
-        showReport(MemoryProbe.stepWorld(pid: gpid))
+        runProbe("世界: 读取中…") { MemoryProbe.stepWorld(pid: $0) }
     }
 
     /// 内存：游戏的内存账本（不碰游戏内存），用来看操作前后 footprint/compressed 的差值。
     @objc private func onMemory() {
         guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
-        showReport(MemoryProbe.stepMemory(pid: gpid))
+        runProbe("内存: 读取中…") { MemoryProbe.stepMemory(pid: $0) }
     }
 
     @objc private func onCrashFile() {
