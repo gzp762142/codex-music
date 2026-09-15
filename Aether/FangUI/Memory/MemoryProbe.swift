@@ -315,6 +315,20 @@ final class MemoryProbe {
     /// 不依赖 Timer，也不依赖主线程还在正常跑。
     static var onStage: ((String) -> Void)?
 
+    /// 标记当前步骤。**只写内存 + 推 UI，一个文件系统调用都不做。**
+    ///
+    /// 这里原来还有一份同步落盘（给"崩溃后回查"用）。实测它把整条链卡死了：
+    /// 面板停在 `枚举 · A 函数已进入` 再也不动 —— `_currentStage` 在函数开头就写好了
+    /// （所以面板显示得出来），然后函数卡死在后面的文件写入里没返回，
+    /// 于是它之后的 `lines.append` / `resetCounters()` 一行都没执行。
+    ///
+    /// 每次要过 `FileManager.urls` → `fileExists` → `FileHandle` 开/寻址/写/关，
+    /// 这些在后台 app 里任何一步都可能阻塞。第一次调用时文件不存在（走 createFile
+    /// 分支）反而顺利，后面"文件已存在"的那几次才卡 —— 这就是为什么每次都能看到
+    /// 第一行、后面全无。
+    ///
+    /// 结论：观测工具不能长在被观测的路径上，尤其是带 I/O 的那种。
+    /// 落盘可以去，实时进度看面板（onStage 推的那条线，不碰文件系统）。
     static func stageMark(_ stage: String) {
         stageLock.lock()
         _currentStage = stage
@@ -322,32 +336,6 @@ final class MemoryProbe {
 
         if let cb = onStage {
             DispatchQueue.main.async { cb(stage) }
-        }
-
-        // **同步**写盘。之前改成异步队列写过，结果进程被系统杀掉时，
-        // 队列里排队的那几行跟着一起丢了。每条只有几十字节，同步的代价可以接受。
-        let stamp = String(Int(Date().timeIntervalSince1970))
-        let line = "\(stamp)  \(stage)\n"
-
-        // ① 追加日志。
-        // **绝不能走 atomically:true 那条分支** —— 它是用一行覆盖整个文件，
-        // 把之前所有现场一起抹掉。实测就出现过"文件里只剩最后一行"，
-        // 让人误以为代码没往下走。这里先保证文件存在，再老老实实追加。
-        if let url = stageURL() {
-            if !FileManager.default.fileExists(atPath: url.path) {
-                FileManager.default.createFile(atPath: url.path, contents: nil)
-            }
-            if let handle = try? FileHandle(forWritingTo: url) {
-                defer { try? handle.close() }
-                handle.seekToEndOfFile()
-                handle.write(Data(line.utf8))
-            }
-        }
-
-        // ② 覆盖写的"最新状态"文件：里面永远只有最后一行。
-        // 追加那条路不管因为什么出问题，读这个文件都能知道停在哪一步。
-        if let latest = stageLatestURL() {
-            try? line.write(to: latest, atomically: false, encoding: .utf8)
         }
     }
 
