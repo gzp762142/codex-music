@@ -437,21 +437,29 @@ final class MemoryProbe {
                 lines.append("\(label): 指针无效 \(describe(rk))")
                 continue
             }
-            var got: [String] = []
+            var names: [String] = []
+            var detail: [String] = []
             for i in 0..<3 {
                 let (rke, entry) = readRaw(port: p, address: MachVmAddress(chunk &+ UInt64(i) * 8))
-                if rke == KERN_SUCCESS, entry != 0 {
-                    got.append(readName(port: p, entry: entry))
-                } else {
-                    got.append("(取entry失败 \(describe(rke)))")
+                guard rke == KERN_SUCCESS, entry != 0 else {
+                    names.append("(失败)")
+                    detail.append("   [\(i)] 取 entry 失败 \(describe(rke))")
+                    continue
                 }
+                let nm = readName(port: p, entry: entry)
+                names.append(nm)
+                // entry 自报的索引（dump: FNameEntry::Index = 0x8）：
+                // 名字若带 "_0" 之类的后缀，看这行就知道索引基准偏了多少
+                let (rkIdx, idxV) = readAt(port: p, address: MachVmAddress(entry &+ 0x8))
+                let idxNote = (rkIdx == KERN_SUCCESS)
+                    ? "selfIdx=\(Int32(bitPattern: idxV))"
+                    : "selfIdx=?"
+                detail.append("   [\(i)] \(nm)   @0x\(String(entry, radix: 16)) \(idxNote)")
             }
-            let ok = (got == expect)
+            let ok = (names == expect)
             passed = passed || ok
             lines.append("\(label) chunk=0x\(String(chunk, radix: 16))")
-            for (i, name) in got.enumerated() {
-                lines.append("   [\(i)] \(name)")
-            }
+            lines.append(contentsOf: detail)
             if ok { lines.append("   → 验收通过：0/1/2 三个名字全对") }
         }
         if !passed {
