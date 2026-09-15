@@ -443,7 +443,7 @@ final class MemoryProbe {
     /// 当前这个进程的基址是否已经准备好。
     /// 少了 pid 这一条，游戏重启后会拿旧 slide 去拼地址 —— 算出来的东西看着像地址，
     /// 读回来全是垃圾，白白消耗调用次数。
-    private static func baseReady(for pid: Int32) -> Bool {
+    static func baseReady(for pid: Int32) -> Bool {
         imageSlide != 0 && imageBase != 0 && basePid == pid
     }
 

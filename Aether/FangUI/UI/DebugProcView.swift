@@ -375,9 +375,31 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     }
 
     /// 映射：把游戏内存 remap 进我们自己进程，之后从本地内存读（样本的读取方式）。
+    ///
+    /// **自包含**：先自己刷新拿 pid，缺基址就自己找一次（找基址本身几乎不读游戏内存，
+    /// 只有 Mach-O 头校验那两次调用）。所以这一步不需要你先点别的按钮 ——
+    /// 前面手动串联的步骤，凡是能自动的都自动掉。
     @objc private func onMapProbe() {
-        guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
-        runProbe("映射: 建立中…") { MemoryProbe.stepRemapProbe(pid: $0) }
+        refreshProcess()
+        guard gpid != 0 else {
+            probeLabel.text = "映射: 没找到游戏进程"
+            probeLabel.textColor = warnText
+            return
+        }
+        runProbe("映射: 建立中…") { pid -> String in
+            var out: [String] = []
+            if !MemoryProbe.baseReady(for: pid) {
+                let base = MemoryProbe.stepFindBase(pid: pid)
+                out.append(base)
+                guard base.contains("✓ base=") else {
+                    out.append("→ 没拿到基址，映射没得做")
+                    return out.joined(separator: "\n")
+                }
+                out.append("")
+            }
+            out.append(MemoryProbe.stepRemapProbe(pid: pid))
+            return out.joined(separator: "\n")
+        }
     }
 
     @objc private func onCrashFile() {
