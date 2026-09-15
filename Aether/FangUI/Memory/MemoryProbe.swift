@@ -1237,17 +1237,12 @@ final class MemoryProbe {
         }
         defer { dropPort(p) }
 
-        // ---- 先确认这个 pid 还是游戏 ----
-        // 直接读 0x100000000 处的 Mach-O 头（2 次小读，很便宜）。
-        // 原来这里调 proc_regionfilename 走 vnode 查路径 —— 那是整条流程里最贵的一步，
-        // 而且它会在游戏的 vm_map 上停很久，实测把后台线程直接卡死在那里。
-        let hdrAddr: UInt64 = 0x100000000
-        stageMark("找村口 · 校验映像头")
-        let (pidOK, pidWhy) = isExecutableMachO(port: p, hdrAddr)
-        guard pidOK else {
-            return "找基址: 0x\(String(hdrAddr, radix: 16)) 处不是游戏映像（\(pidWhy)）"
-                + "—— 游戏可能重启过，先点「刷新」"
-        }
+        // ---- 不在这里预先校验"这是不是游戏" ----
+        // 原来这里读 0x100000000 处的 Mach-O 头做 pid 校验，那是个错误假设：
+        // 0x100000000 落在 __PAGEZERO 里（dump 里 [00] 段 0x047D0000~0x1047D0000），
+        // 而 __PAGEZERO 是不可读的（prot = 0），在那儿读必然拿到 KERN_INVALID_ADDRESS。
+        // 真正的 __TEXT 是 0x100000000 + slide（每次 ASLR 都不同）。
+        // 判断"这是不是游戏"交给下面枚举里的 Mach-O 校验 —— 那才是它该在的位置。
 
         // 起点直接用 0x100000000，不从 0 开始。
         // 主可执行文件的 __TEXT 就在那儿 —— dump 里是，真机每次实测也是
