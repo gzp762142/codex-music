@@ -1133,22 +1133,45 @@ final class MemoryProbe {
 
     // MARK: - 找基址（枚举 region，零内存读取）
 
+    /// **vm_region_64** —— 样本用的就是这个，不是 `vm_region_recurse_64`。
+    ///
+    /// 差别是实质性的：recurse 版本要处理 submap 嵌套（一个 nesting_depth 出参）
+    /// 和 19 个字的 `vm_region_submap_info_64`；这个版本是老的、扁平的，
+    /// flavor = VM_REGION_BASIC_INFO_64(9)，info 只有 8 个字。
+    ///
+    /// info 的布局（按 32 位字）：
+    ///   0: protection    1: max_protection   2: inheritance   3: shared
+    ///   4: reserved      5: offset           ← offset 在第 5 个字，不是第 3 个
+    /// 出参 object_name 是内核给的引用，用完必须还回去，否则泄漏内核对象。
+    private typealias VmRegion64Fn = @convention(c) (
+        UInt32,                              // target_task
+        UnsafeMutablePointer<UInt64>,        // *address
+        UnsafeMutablePointer<UInt64>,        // *size
+        Int32,                               // flavor
+        UnsafeMutableRawPointer,             // info
+        UnsafeMutablePointer<UInt32>,        // *infoCnt
+        UnsafeMutablePointer<UInt32>         // *object_name
+    ) -> KernReturn
+
+    private static let vmRegion64Fn = symbol("vm_region_64", as: VmRegion64Fn.self)
+
     /// 枚举下一个 region。会把 addr 更新为该 region 的实际起始。
     /// 返回 (成功, size, protection, 文件偏移)
     private static func nextRegion(task: UInt32, addr: inout UInt64)
         -> (ok: Bool, size: UInt64, prot: Int32, offset: UInt32) {
-        guard let fn = vmRegionRecurseFn else { return (false, 0, 0, 0) }
+        guard let fn = vmRegion64Fn else { return (false, 0, 0, 0) }
         var size: UInt64 = 0
-        var depth: UInt32 = 0
-        var info = [Int32](repeating: 0, count: 32)
-        var count: UInt32 = 19          // VM_REGION_SUBMAP_INFO_COUNT_64
+        var objectName: UInt32 = 0
+        var info = [Int32](repeating: 0, count: 16)
+        var count: UInt32 = 8               // VM_REGION_BASIC_INFO_COUNT_64
         let kr = info.withUnsafeMutableBytes { buf -> Int32 in
             guard let base = buf.baseAddress else { return KERN_FAILURE }
-            return fn(task, &addr, &size, &depth, base, &count)
+            return fn(task, &addr, &size, 9, base, &count, &objectName)
         }
+        // object_name 是内核引用，不还回去就是内核对象泄漏 —— 跑几百轮就能看出来
+        if objectName != 0 { dropPort(objectName) }
         guard kr == KERN_SUCCESS, size > 0 else { return (false, 0, 0, 0) }
-        // vm_region_submap_info_64 开头四个字：protection, max_protection, inheritance, offset
-        return (true, size, info[0], UInt32(bitPattern: info[3]))
+        return (true, size, info[0], UInt32(bitPattern: info[5]))
     }
 
     /// 问某地址属于哪个文件（proc_regionfilename 封装）
@@ -1184,7 +1207,7 @@ final class MemoryProbe {
     static func stepFindBase(pid: Int32) -> String {
         resetCounters()
         stageMark("找村口 开始")
-        guard vmRegionRecurseFn != nil else { return "找基址: vm_region_recurse_64 符号缺失" }
+        guard vmRegion64Fn != nil else { return "找基址: vm_region_64 符号缺失" }
 
         // ---- 参数自检：先对自己进程枚举一次，参数错就停在这里，绝不碰游戏 ----
         stageMark("找村口 · 参数自检")
