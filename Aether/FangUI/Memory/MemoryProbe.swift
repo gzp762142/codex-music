@@ -1197,6 +1197,56 @@ final class MemoryProbe {
             return lines.joined(separator: "\n")
         }
 
+        // ③′ 关卡全景。**PersistentLevel 只有 44 个 actor 是这里的根因**：
+        //     PUBG 这种大场景用流式关卡，地形/建筑/玩家都在 sublevel 里，
+        //     持久关卡只剩下相机、后处理、GameMode 这些框架对象。
+        //     UWorld 自己就有两个更全的视图：
+        //       0x0AB8  ActiveLevelActors  TArray<AActor*>  ← 活动关卡 actor 的合并数组
+        //       0x0AF0  Levels             TArray<ULevel*>  ← 所有关卡，每个再各自持有 Actors
+        //     三个来源都数一遍，谁多就用谁 —— 不猜。
+        stageMark("世界 · 关卡全景")
+        var bestData = dataPtr
+        var bestCount = Int(count)
+        var bestLabel = "PersistentLevel"
+
+        let (rkAct, actHdr) = readBytes(port: p, address: MachVmAddress(world &+ 0x0AB8), count: 16)
+        if rkAct == KERN_SUCCESS, actHdr.count >= 16 {
+            let d = u64le(actHdr, 0)
+            let c = Int(u32le(actHdr, 8))
+            lines.append("ActiveLevelActors: data=\(hexOf(d)) count=\(c)")
+            if d > 0x100000000, c > bestCount, c <= 200_000 {
+                bestData = d; bestCount = c; bestLabel = "ActiveLevelActors"
+            }
+        }
+
+        let (rkLv, lvHdr) = readBytes(port: p, address: MachVmAddress(world &+ 0x0AF0), count: 16)
+        if rkLv == KERN_SUCCESS, lvHdr.count >= 16 {
+            let d = u64le(lvHdr, 0)
+            let c = Int(u32le(lvHdr, 8))
+            lines.append("UWorld::Levels: data=\(hexOf(d)) count=\(c)")
+            if d > 0x100000000, c > 0, c <= 4096 {
+                let probe = min(c, 12)
+                let (rkP, ptrs) = readBytes(port: p, address: MachVmAddress(d), count: probe * 8)
+                if rkP == KERN_SUCCESS, ptrs.count >= probe * 8 {
+                    for k in 0..<probe {
+                        let lv = u64le(ptrs, k * 8)
+                        guard lv > 0x100000000 else { continue }
+                        let (rkA2, a2) = readBytes(port: p, address: MachVmAddress(lv &+ 0xA0), count: 16)
+                        guard rkA2 == KERN_SUCCESS, a2.count >= 16 else { continue }
+                        let d2 = u64le(a2, 0)
+                        let c2 = Int(u32le(a2, 8))
+                        lines.append("  Level[\(k)] @\(hexOf(lv))  Actors: count=\(c2)")
+                        if d2 > 0x100000000, c2 > bestCount {
+                            bestData = d2; bestCount = c2; bestLabel = "Level[\(k)]"
+                        }
+                    }
+                }
+            }
+        }
+        if bestLabel != "PersistentLevel" {
+            lines.append("→ actor 源改用 \(bestLabel)（\(bestCount) 个，PersistentLevel 只有 \(count) 个）")
+        }
+
         // ④ 遍历全表：按类名统计 + 抓出所有角色坐标
         //
         // 这一步直接回答「现场有多少人」——不依赖 PlayerArray 被裁剪了多少。
@@ -1206,7 +1256,7 @@ final class MemoryProbe {
         // 第一次先只走 1200 个：本地读虽然不产生内核调用，但未映射过的页首次访问会有
         // page fault（内核要在游戏名下记账一块物理页）。等确认预映射覆盖够、page fault
         // 不成问题，再把这个上限放开。
-        let total = min(Int(count), 1200)
+        let total = min(bestCount, 1500)
         var classNames: [UInt64: String] = [:]
         var histogram: [String: Int] = [:]
         var charActors: [UInt64] = []
@@ -1221,7 +1271,7 @@ final class MemoryProbe {
             }
             let batch = min(500, total - cursor)
             let (rkBuf, buf) = readBytes(port: p,
-                                         address: MachVmAddress(dataPtr &+ UInt64(cursor * 8)),
+                                         address: MachVmAddress(bestData &+ UInt64(cursor * 8)),
                                          count: batch * 8)
             guard rkBuf == KERN_SUCCESS, buf.count >= batch * 8 else {
                 lines.append("读 actor 指针数组失败 @\(cursor) \(describe(rkBuf))")
@@ -1243,15 +1293,17 @@ final class MemoryProbe {
                 }
                 let name = nm ?? "?"
                 histogram[name, default: 0] += 1
-                if name.contains("Character") || name.contains("Pawn") {
+                // Pawn 的判定要排除 GamePawnMode 之类 —— 上次它被误当成角色抓进来，
+                // 于是报告里出现了一个 Loc=(0,0,0) 的"角色"。
+                if name.contains("Character") || (name.contains("Pawn") && !name.contains("Mode")) {
                     charActors.append(actor)
                 }
             }
             cursor += batch
         }
 
-        lines.append("类名分布（遍历 \(cursor)/\(count) 个 actor，共 \(classNames.count) 种类）:")
-        for (name, c) in histogram.sorted(by: { $0.value > $1.value }).prefix(12) {
+        lines.append("类名分布（源 \(bestLabel)，遍历 \(cursor)/\(bestCount) 个 actor，共 \(classNames.count) 种类）:")
+        for (name, c) in histogram.sorted(by: { $0.value > $1.value }).prefix(18) {
             lines.append("  \(name) × \(c)")
         }
 
