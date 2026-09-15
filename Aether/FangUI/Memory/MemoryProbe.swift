@@ -265,9 +265,18 @@ final class MemoryProbe {
     private static let staticImageBase: UInt64 = 0x100000000
 
     /// 本次运行找到的 image base 与 slide。
-    /// 由「找村口」写入；只对同一次进程启动有效（游戏重启后 ASLR 会搬走）。
+    /// 由「找村口」写入；**只对这个 pid 有效** —— 游戏重启会换 pid，
+    /// ASLR 也会把基址搬走，所以还要记住它是给哪个 pid 找的。
     private(set) static var imageBase: UInt64 = 0
     private(set) static var imageSlide: UInt64 = 0
+    private(set) static var basePid: Int32 = 0
+
+    /// 当前这个进程的基址是否已经准备好。
+    /// 少了 pid 这一条，游戏重启后会拿旧 slide 去拼地址 —— 算出来的东西看着像地址，
+    /// 读回来全是垃圾，白白消耗调用次数。
+    private static func baseReady(for pid: Int32) -> Bool {
+        imageSlide != 0 && imageBase != 0 && basePid == pid
+    }
 
     /// **唯一**的地址换算入口：OFFSET_*（静态 vmaddr 域地址）→ 本次运行的绝对地址。
     ///
@@ -327,8 +336,8 @@ final class MemoryProbe {
     /// 前提：先点过「找村口」—— base/slide 存在这份 static 状态里，不跨进程启动保留。
     static func stepFixedRead(pid: Int32) -> String {
         resetCounters()
-        guard imageSlide != 0, imageBase != 0 else {
-            return "定点读: 还没有基址 —— 先点「找村口」"
+        guard baseReady(for: pid) else {
+            return "定点读: 没有当前进程的基址 —— 先点「找村口」"
         }
         let (kr, p) = port(for: pid)
         guard kr == KERN_SUCCESS, p != 0 else { return "定点读: 取端口失败 \(describe(kr))" }
@@ -466,8 +475,8 @@ final class MemoryProbe {
     /// 所以两种布局各解一遍，用上面三个已知答案判定 —— 不照抄、不猜。
     static func stepGNames(pid: Int32) -> String {
         resetCounters()
-        guard imageSlide != 0, imageBase != 0 else {
-            return "GNames: 还没有基址 —— 先点「找村口」"
+        guard baseReady(for: pid) else {
+            return "GNames: 没有当前进程的基址 —— 先点「找村口」"
         }
         let (kr, p) = port(for: pid)
         guard kr == KERN_SUCCESS, p != 0 else { return "GNames: 取端口失败 \(describe(kr))" }
@@ -593,8 +602,8 @@ final class MemoryProbe {
     /// 每次点击的代价降到 1/4 以下，且报告里直接把触及页数打出来。
     static func stepObjects(pid: Int32) -> String {
         resetCounters()
-        guard imageSlide != 0, imageBase != 0 else {
-            return "对象: 还没有基址 —— 先点「找村口」"
+        guard baseReady(for: pid) else {
+            return "对象: 没有当前进程的基址 —— 先点「找村口」"
         }
         let (kr, p) = port(for: pid)
         guard kr == KERN_SUCCESS, p != 0 else { return "对象: 取端口失败 \(describe(kr))" }
@@ -695,8 +704,8 @@ final class MemoryProbe {
     ///   ULevel + 0xA0 → Actors TArray { data*(8) count(4) max(4) }
     static func stepWorld(pid: Int32) -> String {
         resetCounters()
-        guard imageSlide != 0, imageBase != 0 else {
-            return "世界: 还没有基址 —— 先点「找村口」"
+        guard baseReady(for: pid) else {
+            return "世界: 没有当前进程的基址 —— 先点「找村口」"
         }
         let (kr, p) = port(for: pid)
         guard kr == KERN_SUCCESS, p != 0 else { return "世界: 取端口失败 \(describe(kr))" }
@@ -949,6 +958,7 @@ final class MemoryProbe {
         let s = slide(ofImageBase: hitBase)
         imageBase = hitBase
         imageSlide = s
+        basePid = pid
 
         // ③ 摊开 slide 与三个可用 OFFSET 的运行时落点，目视确认都落在映像区间
         let off = Offsets.load()
