@@ -120,16 +120,20 @@ final class MemoryProbe {
 
     // MARK: - 读（全部 static：纯函数，不需要实例）
 
-    /// 本次动作触及的内存页（4KB 对齐去重）。
+    /// 本次动作触及的内存页（4KB 对齐去重）+ 发起的 mach_vm_read 次数。
     ///
-    /// 这是排查"读到游戏闪退"的唯一量化指标：
-    ///   名字池那步约 10 页 → 安全
-    ///   对象表 16 个全解（逐个读字段 + 两次名字解析）约 80 页 → 点完游戏闪退
-    /// 每次动作开头清空，报告里把页数打出来，阈值靠这个数收敛。
+    /// **真正的成本指标是调用次数，不是页数。**
+    /// 读 384 字节一次读完，和读 8 字节读 48 次，占的页数完全一样，
+    /// 但后者要抢 48 次目标进程 vm_map 的锁 —— 游戏主线程每帧都在做内存分配，
+    /// 我们每多抢一次读锁，就多打断它一次。
+    ///
+    /// 实测对照：找村口 2 次调用不崩；对象表 16 个全解约 128 次调用后游戏闪退。
     private static var touchedPages = Set<UInt64>()
+    private static var probeCalls = 0
 
-    /// 记一次「将要读这段地址」。按 4KB 页对齐去重。
-    private static func notePages(_ addr: UInt64, _ bytes: Int) {
+    /// 记一次读取：调用次数 + 触及的页。
+    private static func noteRead(_ addr: UInt64, _ bytes: Int) {
+        probeCalls += 1
         let first = addr >> 12
         let last = (addr &+ UInt64(bytes > 0 ? bytes - 1 : 0)) >> 12
         var p = first
@@ -140,8 +144,16 @@ final class MemoryProbe {
         }
     }
 
-    /// 本次动作已触及的页数。
-    private static func pageCount() -> Int { touchedPages.count }
+    /// 每次动作开头清零。
+    private static func resetCounters() {
+        probeCalls = 0
+        resetCounters()
+    }
+
+    /// 本次动作的成本：调用次数是主指标，页数作参考。
+    private static func costLine() -> String {
+        "本次读取: \(probeCalls) 次 mach_vm_read · 触及 \(touchedPages.count) 页（4KB 去重）"
+    }
 
     /// 从字节数组里读一个小端 UInt64（越界返回 0）。
     private static func u64le(_ b: [UInt8], _ offset: Int) -> UInt64 {
@@ -156,7 +168,7 @@ final class MemoryProbe {
     /// 而读内存根本不需要枚举内存区。
     private static func readAt(port: MachPort, address: MachVmAddress) -> (KernReturn, UInt32) {
         guard let vmRead = vmReadFn else { return (KERN_FAILURE, 0) }
-        notePages(address, 4)
+        noteRead(address, 4)
         var dataPtr: UInt = 0
         var dataLen: MachVmSize = 4
         let kr = vmRead(port, address, 4, &dataPtr, &dataLen)
@@ -172,7 +184,7 @@ final class MemoryProbe {
     /// 按绝对地址读 8 字节 —— 只给值，供程序判断用。
     private static func readRaw(port: MachPort, address: MachVmAddress) -> (KernReturn, UInt64) {
         guard let vmRead = vmReadFn else { return (KERN_FAILURE, 0) }
-        notePages(address, 8)
+        noteRead(address, 8)
         var dataPtr: UInt = 0
         var dataLen: MachVmSize = 8
         let kr = vmRead(port, address, 8, &dataPtr, &dataLen)
@@ -193,7 +205,7 @@ final class MemoryProbe {
         -> (KernReturn, [UInt8]) {
         guard let vmRead = vmReadFn else { return (KERN_FAILURE, []) }
         guard count > 0, count <= 4096 else { return (KERN_FAILURE, []) }
-        notePages(address, count)
+        noteRead(address, count)
         var dataPtr: UInt = 0
         var dataLen: MachVmSize = MachVmSize(count)
         let kr = vmRead(port, address, MachVmSize(count), &dataPtr, &dataLen)
@@ -314,7 +326,7 @@ final class MemoryProbe {
     /// 验收：NumElements 是六位数（10 万 ~ 200 万）即表示 image base 与换算公式同时正确。
     /// 前提：先点过「找村口」—— base/slide 存在这份 static 状态里，不跨进程启动保留。
     static func stepFixedRead(pid: Int32) -> String {
-        touchedPages.removeAll()
+        resetCounters()
         guard imageSlide != 0, imageBase != 0 else {
             return "定点读: 还没有基址 —— 先点「找村口」"
         }
@@ -371,7 +383,7 @@ final class MemoryProbe {
                 ? " 像堆指针（0x12xxxxxxx 段）"
                 : " 不像堆指针（不落在 0x120000000~0x140000000）"))
         }
-        lines.append("本次读取触及 \(pageCount()) 页（4KB 去重）")
+        lines.append(costLine())
         return lines.joined(separator: "\n")
     }
 
@@ -453,7 +465,7 @@ final class MemoryProbe {
     /// `Chunks` 是「内联指针数组」还是「指向指针数组」，各 UE4 版本不一致，
     /// 所以两种布局各解一遍，用上面三个已知答案判定 —— 不照抄、不猜。
     static func stepGNames(pid: Int32) -> String {
-        touchedPages.removeAll()
+        resetCounters()
         guard imageSlide != 0, imageBase != 0 else {
             return "GNames: 还没有基址 —— 先点「找村口」"
         }
@@ -543,7 +555,7 @@ final class MemoryProbe {
             lines.append("两个布局都没命中验收标准 —— 按池头 hex 决定下一步")
         }
         lines.append("（chunk 容量 \(namesPerChunk) 条/块，索引 0/1/2 都在第 0 块，暂不需要跨块）")
-        lines.append("本次读取触及 \(pageCount()) 页（4KB 去重）")
+        lines.append(costLine())
         return lines.joined(separator: "\n")
     }
 
@@ -580,7 +592,7 @@ final class MemoryProbe {
     ///   ② 每批只详解 4 个，点一次往下走一批（游标存在 static 里）
     /// 每次点击的代价降到 1/4 以下，且报告里直接把触及页数打出来。
     static func stepObjects(pid: Int32) -> String {
-        touchedPages.removeAll()
+        resetCounters()
         guard imageSlide != 0, imageBase != 0 else {
             return "对象: 还没有基址 —— 先点「找村口」"
         }
@@ -668,7 +680,7 @@ final class MemoryProbe {
             }
             lines.append("[\(i)] \(clsName)  \(objName)   @0x\(String(obj, radix: 16))")
         }
-        lines.append("本批触及 \(pageCount()) 页（4KB 去重）· 再点一次继续下一批")
+        lines.append(costLine() + " · 再点一次继续下一批")
         return lines.joined(separator: "\n")
     }
 
@@ -682,7 +694,7 @@ final class MemoryProbe {
     ///   UWorld + 0xB8 → PersistentLevel (ULevel*)
     ///   ULevel + 0xA0 → Actors TArray { data*(8) count(4) max(4) }
     static func stepWorld(pid: Int32) -> String {
-        touchedPages.removeAll()
+        resetCounters()
         guard imageSlide != 0, imageBase != 0 else {
             return "世界: 还没有基址 —— 先点「找村口」"
         }
@@ -722,7 +734,7 @@ final class MemoryProbe {
         let sane = (count > 0 && count <= 200_000 && count <= cap)
         lines.append("  Actors: data=0x\(String(dataPtr, radix: 16))  count=\(count)  max=\(cap)  "
             + (sane ? "✓ 数量合理" : "✗ 数量异常"))
-        lines.append("本次读取触及 \(pageCount()) 页（4KB 去重）· 对照：对象表那步约 80 页")
+        lines.append(costLine() + " · 对照：对象表那步约 128 次调用")
         return lines.joined(separator: "\n")
     }
 
@@ -869,7 +881,7 @@ final class MemoryProbe {
     /// 游戏路径，二分因此完全失效（会出现负 slide 这种不可能的结果）。
     /// 所以必须有 region 边界信息，只能靠枚举。
     static func stepFindBase(pid: Int32) -> String {
-        touchedPages.removeAll()
+        resetCounters()
         guard vmRegionRecurseFn != nil else { return "找基址: vm_region_recurse_64 符号缺失" }
         guard procRegionFileNameFn != nil else { return "找基址: proc_regionfilename 符号缺失" }
 
@@ -957,7 +969,7 @@ final class MemoryProbe {
             lines.append("\(name)\(pad)0x\(String(staticAddr, radix: 16)) → 0x\(String(r, radix: 16)) "
                 + (inside ? "✓" : "✗越界"))
         }
-        lines.append("（找基址本身不读游戏内存，这里只统计 Mach-O 头校验的 \(pageCount()) 页）")
+        lines.append("（找基址本身不读游戏内存，这里只统计 Mach-O 头校验：" + costLine() + "）")
         return lines.joined(separator: "\n")
     }
 }
