@@ -47,6 +47,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     private let btnMap = UIButton(type: .system)
     /// 枚举：只枚举几个 region 打原始字段，验证 vm_region_64 这个调用本身
     private let btnEnum = UIButton(type: .system)
+    /// 世界：GWorld → PersistentLevel → Actors → 认类名（通往玩家的正路）
+    private let btnWorld = UIButton(type: .system)
     /// 读模块头：dump 基址处读 Mach-O，判断 ASLR 是否搬过基址
     /// 扫基址：128MB 内找 Mach-O magic（比上一版范围小）
     private let btnScan = UIButton(type: .system)
@@ -78,6 +80,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         // 面板只留 5 个。主链已经验证过了，不需要再一步步点 ——
         // 其余按钮的声明和 action 都还留在文件里（只是不接线），要单独排查时接回来即可。
         let buttons: [(UIButton, String, Selector)] = [
+            (btnWorld, "世界", #selector(onWorld)),
             (btnAuto, "跑一次", #selector(onAutoRun)),
             (btnMap, "映射", #selector(onMapProbe)),
             (btnEnum, "枚举", #selector(onEnumProbe)),
@@ -119,8 +122,9 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         crashLabel.frame = CGRect(x: w * 0.6, y: 15, width: w * 0.4, height: 14)
         probeLabel.frame = CGRect(x: 0, y: 30, width: w, height: 14)
 
-        // 7 个按钮排成 4 列 × 2 行
-        let all = [btnAuto, btnMap, btnEnum, btnRefresh, btnObjects, btnCrashFile, btnMemory]
+        // 8 个按钮排成 4 列 × 2 行
+        let all = [btnWorld, btnAuto, btnMap, btnEnum,
+                   btnRefresh, btnObjects, btnCrashFile, btnMemory]
         let gap: CGFloat = 4
         let perRow = 4
         let bw = (w - gap * CGFloat(perRow - 1)) / CGFloat(perRow)
@@ -400,10 +404,31 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         runProbe("对象: 读取中…") { MemoryProbe.stepObjects(pid: $0) }
     }
 
-    /// 世界：GWorld → PersistentLevel → Actors（三次小读，走热页）。
+    /// 世界：GWorld → PersistentLevel → Actors → 认类名。
+    ///
+    /// **自包含**：缺基址就自己找一次（跟「映射」一样）。所以正常只用点这一个按钮，
+    /// 不必先「枚举」「映射」「对象」走一圈 —— 那些是排查阶段的产物，现在留着手动用。
     @objc private func onWorld() {
-        guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
-        runProbe("世界: 读取中…") { MemoryProbe.stepWorld(pid: $0) }
+        refreshProcess()
+        guard gpid != 0 else {
+            probeLabel.text = "世界: 没找到游戏进程"
+            probeLabel.textColor = warnText
+            return
+        }
+        runProbe("世界: 读取中…") { pid -> String in
+            var out: [String] = []
+            if !MemoryProbe.baseReady(for: pid) {
+                let base = MemoryProbe.stepFindBase(pid: pid)
+                out.append(base)
+                guard base.contains("✓ base=") else {
+                    out.append("→ 没拿到基址，世界链没得走")
+                    return out.joined(separator: "\n")
+                }
+                out.append("")
+            }
+            out.append(MemoryProbe.stepWorld(pid: pid))
+            return out.joined(separator: "\n")
+        }
     }
 
     /// 枚举：只枚举几个 region 打原始字段，验证 vm_region_64 这个调用本身。
