@@ -293,26 +293,31 @@ final class MemoryProbe {
         return _currentStage
     }
 
-    /// 标记当前步骤：一份进内存（UI 实时看），一份落盘（崩了之后还能查）。
+    /// 标记当前步骤：一份进内存（UI 实时看），一份**异步**落盘。
     ///
-    /// 为什么落盘也是必须的：被系统直接杀掉时（jetsam、watchdog、SIGKILL、
-    /// cpu_resource_fatal）信号处理器根本没有机会跑，进程内什么都留不下。
-    /// 但落盘也可能来不及 —— 所以内存里那份要能实时显示在面板上，
-    /// 崩之前那一瞬间屏幕上的字，往往是唯一的现场。
+    /// 落盘必须异步 —— 它是给"崩了之后回查"用的，绝不能反过来拖住调用它的读取线程。
+    /// 一旦文件 I/O 卡住，整个读取链就停在原地，而面板上只会看到进度停在第一步
+    /// （实测就是这样：状态停在 "映射: 建立中…"，后台却一步都没往下走）。
+    private static let stageQueue = DispatchQueue(label: "aether.stage", qos: .utility)
+
     static func stageMark(_ stage: String) {
         stageLock.lock()
         _currentStage = stage
         stageLock.unlock()
 
-        guard let url = stageURL() else { return }
-        let stamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+        // DateFormatter 绝不能留在调用线程上 —— 它内部走 ICU 本地化、多线程下要抢锁，
+        // 放在读取链的热路径上会把整个后台线程拖住。时间戳改成最廉价的整数形式。
+        let stamp = String(Int(Date().timeIntervalSince1970))
         let line = "\(stamp)  \(stage)\n"
-        if let handle = try? FileHandle(forWritingTo: url) {
-            defer { try? handle.close() }
-            handle.seekToEndOfFile()
-            handle.write(Data(line.utf8))
-        } else {
-            try? line.write(to: url, atomically: true, encoding: .utf8)
+        stageQueue.async {
+            guard let url = stageURL() else { return }
+            if let handle = try? FileHandle(forWritingTo: url) {
+                defer { try? handle.close() }
+                handle.seekToEndOfFile()
+                handle.write(Data(line.utf8))
+            } else {
+                try? line.write(to: url, atomically: true, encoding: .utf8)
+            }
         }
     }
 
@@ -1125,31 +1130,24 @@ final class MemoryProbe {
         return s.isEmpty ? nil : s
     }
 
-    /// 找基址（主二进制），**全程不读游戏内存内容**。
+    /// 找基址（主二进制）。**只用 vm_region_recurse_64 枚举 + 两次 Mach-O 小读。**
     ///
     /// 判据（三个条件同时成立才认）：
-    ///   1. proc_regionfilename 返回的路径匹配 ShadowTracker
-    ///   2. protection 含 VM_PROT_EXECUTE(0x4)  → 可执行段
-    ///   3. offset == 0                          → 从文件头映射 = Mach-O 头所在段
-    /// 满足这三条的就是 __TEXT 段，它的起始地址 = image base。
-    /// 命中后还要读 4 字节校验 magic == 0xFEEDFACF、再读 +12 的 filetype == 2：
-    /// 三个 region 条件只说明"像 __TEXT"，最终裁决权在 Mach-O 头上，
-    /// 校验不过就继续枚举下一个候选，不把可疑值返回给上层。
+    ///   1. protection 含 VM_PROT_EXECUTE(0x4)  → 可执行段
+    ///   2. offset == 0                          → 从文件头映射 = Mach-O 头所在段
+    ///   3. size ≥ 16MB                          → 主二进制的映像有几百 MB
+    /// 命中后再读 4 字节校验 magic == 0xFEEDFACF、+12 的 filetype == 2。
     ///
-    /// 为什么不用"二分 proc_regionfilename"：实测它的语义是
-    /// "返回该地址所在或**之后第一个** region" —— 对未映射的低地址也会返回
-    /// 游戏路径，二分因此完全失效（会出现负 slide 这种不可能的结果）。
-    /// 所以必须有 region 边界信息，只能靠枚举。
+    /// **不再调用 proc_regionfilename。** 它要走 vnode 查路径，是整个枚举里最贵的一步，
+    /// 而且会在游戏的 vm_map 上停很久 —— 实测直接把后台线程卡死在第一次调用上
+    /// （面板停在"映射: 建立中…"再也不动，然后被 cpu_resource_fatal 杀掉）。
+    /// 前两条判据是 vm_region_recurse 顺手带回来的，免费；Mach-O 那两次小读很便宜。
     ///
-    /// **枚举代价要有预算**：每轮最多两次内核调用，其中 `proc_regionfilename`
-    /// 还要走 vnode，是最贵的一环。早期版本把 6000 轮跑满、而且把最贵的调用
-    /// 放在最前面判，实测烧穿了 app 的 CPU 配额，被系统以 cpu_resource_fatal
-    /// （bug_type 206）杀掉。现在：条件从便宜到贵排、上限 800 轮、外加 5 秒硬预算。
+    /// 起点直接用 0x100000000：主可执行文件的 __TEXT 就在那儿，正常一两个 region 就命中。
     static func stepFindBase(pid: Int32) -> String {
         resetCounters()
         stageMark("找村口 开始")
         guard vmRegionRecurseFn != nil else { return "找基址: vm_region_recurse_64 符号缺失" }
-        guard procRegionFileNameFn != nil else { return "找基址: proc_regionfilename 符号缺失" }
 
         // ---- 参数自检：先对自己进程枚举一次，参数错就停在这里，绝不碰游戏 ----
         var selfAddr: UInt64 = 0
@@ -1158,21 +1156,23 @@ final class MemoryProbe {
             return "找基址: 参数自检失败（对自己枚举就不成功），未碰游戏"
         }
 
-        // ---- 先确认这个 pid 还是游戏 ----
-        // 游戏重启会换 pid。拿一个已经失效、又被系统复用给别人的 pid 去
-        // task_for_pid，就会变成读另一个进程的内存 —— 这一步零内存读取，
-        // 只是问「0x100000000 这个地址属于哪个文件」。
-        guard let gamePath = regionFile(pid: pid, addr: 0x100000000),
-              gamePath.lowercased().contains("shadowtracker") else {
-            return "找基址: pid \(pid) 不是游戏映像（游戏可能重启过）—— 先点「刷新」"
-        }
-
         // ---- 拿游戏的 task port ----
         let (kr, p) = port(for: pid)
         guard kr == KERN_SUCCESS, p != 0 else {
             return "找基址: 取端口失败 \(describe(kr))"
         }
         defer { dropPort(p) }
+
+        // ---- 先确认这个 pid 还是游戏 ----
+        // 直接读 0x100000000 处的 Mach-O 头（2 次小读，很便宜）。
+        // 原来这里调 proc_regionfilename 走 vnode 查路径 —— 那是整条流程里最贵的一步，
+        // 而且它会在游戏的 vm_map 上停很久，实测把后台线程直接卡死在那里。
+        let hdrAddr: UInt64 = 0x100000000
+        let (pidOK, pidWhy) = isExecutableMachO(port: p, hdrAddr)
+        guard pidOK else {
+            return "找基址: 0x\(String(hdrAddr, radix: 16)) 处不是游戏映像（\(pidWhy)）"
+                + "—— 游戏可能重启过，先点「刷新」"
+        }
 
         // 起点直接用 0x100000000，不从 0 开始。
         // 主可执行文件的 __TEXT 就在那儿 —— dump 里是，真机每次实测也是
@@ -1202,19 +1202,17 @@ final class MemoryProbe {
             scanned += 1
             if scanned % 100 == 0 { stageMark("找村口 · 已枚举 \(scanned) 个 region") }
 
-            // 条件顺序很重要：prot 和 offset 是 vm_region_recurse 顺手带回来的（免费），
-            // proc_regionfilename 要走 vnode、贵一个量级，所以放到最后再问。
-            // 原来把最贵的调用放在最前面，等于对每个 region 都交一次昂贵开销。
+            // 这里不再调 proc_regionfilename：它要走 vnode 查路径，是整个枚举里最贵的一步，
+            // 而且会在游戏的 vm_map 上停很久。判定改成三条便宜条件 ——
+            // 可执行 + 从文件头映射 + 区域够大（主二进制的映像有几百 MB）——
+            // 最后再用 Mach-O 头做裁决。三条里前两条是 vm_region_recurse 顺手带回来的，免费。
             if (prot & 0x4) != 0,          // VM_PROT_EXECUTE
                offset == 0,
-               let path = regionFile(pid: pid, addr: addr),
-               path.lowercased().contains("shadowtracker") {
-                // 还得它真的是 Mach-O 可执行头（magic + filetype），
-                // 否则继续找下一个候选，绝不把可疑值当基址返回。
+               size >= 0x1000000 {          // ≥16MB 的可执行映像才可能是主二进制
                 let (okMagic, why) = isExecutableMachO(port: p, addr)
                 if okMagic {
                     hitBase = addr
-                    hitName = path.split(separator: "/").last.map(String.init) ?? "?"
+                    hitName = "MH_EXECUTE \(size / 1048576)MB"
                     break
                 }
                 rejects.append("0x\(String(addr, radix: 16))(\(why))")
