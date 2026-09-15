@@ -181,6 +181,87 @@ final class MemoryProbe {
         return n > 0
     }
 
+    // MARK: - 跨进程映射（这是样本用的读取方式）
+
+    private typealias MachVmRemapFn = @convention(c) (
+        UInt32,                              // target_task
+        UnsafeMutablePointer<UInt64>,        // *target_address
+        UInt64,                              // size
+        UInt64,                              // mask
+        Int32,                               // flags
+        UInt32,                              // src_task
+        UInt64,                              // src_address
+        Int32,                               // copy
+        UnsafeMutablePointer<Int32>,         // *cur_protection
+        UnsafeMutablePointer<Int32>,         // *max_protection
+        Int32                                // inheritance
+    ) -> KernReturn
+
+    private static let machVmRemapFn = symbol("mach_vm_remap", as: MachVmRemapFn.self)
+
+    /// 已经建立起来的映射：游戏地址 → 我们的本地地址。
+    private static var mappedRanges: [(gameBase: UInt64, size: UInt64, localBase: UInt64)] = []
+
+    private static let vmFlagsAnywhere: Int32 = 0x0001
+
+    /// 把游戏的一段内存**映射进我们自己的地址空间**。
+    ///
+    /// 这是样本（Music）用的原语，也是我们必须换过去的那一步：
+    ///
+    ///   `mach_vm_read`  每次都要进内核、抢游戏 vm_map 的**读锁**、再拷一份出来。
+    ///   `mach_vm_remap` 只在**建立映射**时进一次内核，之后读数据就是普通内存访问
+    ///                   —— 零内核调用、零锁、零拷贝。
+    ///
+    /// 游戏的 vm_map 锁是读写互斥的：它主线程每帧写坐标拿写锁，我们每读一次拿一次读锁，
+    /// 两者不能同时进行。映射建立之后我们不再碰它的 map，读的是自己的页表。
+    ///
+    /// `copy = TRUE` 是写时复制 —— 我们只读，永远不会改到游戏的页。
+    static func mapRange(pid: Int32, srcAddress: UInt64, size: UInt64) -> (local: UInt64, note: String) {
+        guard let fn = machVmRemapFn else { return (0, "mach_vm_remap 符号缺失") }
+        let (kr, p) = port(for: pid)
+        guard kr == KERN_SUCCESS, p != 0 else { return (0, "取端口失败 \(describe(kr))") }
+        defer { dropPort(p) }
+
+        // iOS 上物理页是 16KB，映射必须页对齐
+        let pageSize: UInt64 = 0x4000
+        let alignedStart = srcAddress & ~(pageSize - 1)
+        let head = srcAddress - alignedStart
+        let total = (head + size + pageSize - 1) & ~(pageSize - 1)
+
+        var target: UInt64 = 0
+        var curProt: Int32 = 0
+        var maxProt: Int32 = 0
+        let rk = fn(mach_task_self_, &target, total, 0, vmFlagsAnywhere,
+                    p, alignedStart, 1, &curProt, &maxProt, 0)
+        guard rk == KERN_SUCCESS, target != 0 else {
+            return (0, "mach_vm_remap 失败 \(describe(rk))")
+        }
+        mappedRanges.append((alignedStart, total, target))
+        return (target + head,
+                "映射 0x\(String(alignedStart, radix: 16)) +0x\(String(total, radix: 16)) → 本地 0x\(String(target, radix: 16))")
+    }
+
+    /// 本地地址 → 游戏地址：查已建立的映射。
+    /// 命中就说明这块内存已经在我们自己地址空间里，读它不需要任何内核调用。
+    static func localAddress(for gameAddress: UInt64) -> UInt64? {
+        for m in mappedRanges where gameAddress >= m.gameBase && gameAddress < m.gameBase + m.size {
+            return m.localBase + (gameAddress - m.gameBase)
+        }
+        return nil
+    }
+
+    static var mappedSummary: String {
+        mappedRanges.isEmpty ? "无映射" : "\(mappedRanges.count) 块"
+    }
+
+    /// 从已映射的本地内存读，**零内核调用**。
+    /// 只有确认过地址落在映射区间内才允许调用 —— 传错地址会直接让我们自己 SIGSEGV。
+    private static func readMapped(_ localAddr: UInt64, _ count: Int) -> [UInt8] {
+        guard count > 0, count <= 4096 else { return [] }
+        guard let base = UnsafeRawPointer(bitPattern: UInt(localAddr)) else { return [] }
+        return Array(UnsafeRawBufferPointer(start: base, count: count))
+    }
+
     /// 每次动作开头清零。
     private static func resetCounters() {
         probeCalls = 0
@@ -905,6 +986,76 @@ final class MemoryProbe {
         lines.append("  virtual        = \(mb(virt)) MB")
         lines.append("用法：动作前后各点一次这个按钮，差值直接说明读取给游戏加了多少内存")
         lastMem = (phys, comp, resi)
+        return lines.joined(separator: "\n")
+    }
+
+    /// 映射读取的原型验证：把游戏内存映射进我们自己的地址空间，然后**从本地内存直接读**。
+    ///
+    /// 验收：本地读到的 Mach-O 头（magic + filetype）与 `mach_vm_read` 的结果一致，
+    /// 且 GObjects 的 NumElements 是同一个六位数 —— 那就证明"共享书架"这条路通。
+    /// 之后所有读取都可以走这里，调用次数从"每次读一次调用"降到"每块映射一次"。
+    static func stepRemapProbe(pid: Int32) -> String {
+        resetCounters()
+        stageMark("映射 · 开始")
+        guard baseReady(for: pid) else {
+            return "映射: 没有当前进程的基址 —— 先点「找村口」"
+        }
+        mappedRanges.removeAll()
+        let s = imageSlide
+        let base = imageBase
+        var lines: [String] = []
+
+        // ① 映射映像头 1MB
+        stageMark("映射 · 映像头")
+        let (localHead, noteHead) = mapRange(pid: pid, srcAddress: base, size: 0x100000)
+        guard localHead != 0 else { return "映射: \(noteHead)" }
+        lines.append("① \(noteHead)")
+
+        // ② 直接从本地内存读 Mach-O 头 —— 这一步零内核调用
+        let header = readMapped(localHead, 16)
+        guard header.count >= 16 else {
+            lines.append("② 本地读失败")
+            return lines.joined(separator: "\n")
+        }
+        let magic = UInt32(header[0]) | (UInt32(header[1]) << 8) | (UInt32(header[2]) << 16) | (UInt32(header[3]) << 24)
+        let filetype = UInt32(header[12]) | (UInt32(header[13]) << 8) | (UInt32(header[14]) << 16) | (UInt32(header[15]) << 24)
+        let headOK = (magic == 0xFEEDFACF && filetype == 2)
+        lines.append("② 本地读头: magic=0x\(String(magic, radix: 16)) filetype=\(filetype) "
+            + (headOK ? "✓ 映射读取成立" : "✗ 不对"))
+
+        // ③ 映射 __DATA 那段窗口（GObjects / GNames / GWorld 都住在里面）
+        //    只映射一个 32MB 窗口，物理页按需 fault —— 我们只碰其中几个地址。
+        let off = Offsets.load()
+        let gob = runtime(off.gObjects, slide: s)
+        let mapStart = gob & ~0x1FFFFFF             // 32MB 向下对齐
+        let mapSize: UInt64 = 0x2000000
+        stageMark("映射 · __DATA 窗口")
+        let (localData, noteData) = mapRange(pid: pid, srcAddress: mapStart, size: mapSize)
+        guard localData != 0 else {
+            lines.append("③ \(noteData)")
+            return lines.joined(separator: "\n")
+        }
+        lines.append("③ \(noteData)")
+
+        // ④ 从映射里读 GObjects 头 —— 零内核调用
+        if gob >= mapStart, gob + 0x120 <= mapStart + mapSize {
+            let buf = readMapped(localData + (gob - mapStart), 0x120)
+            if buf.count >= 0x120 {
+                let num = UInt32(buf[0x118]) | (UInt32(buf[0x119]) << 8)
+                    | (UInt32(buf[0x11A]) << 16) | (UInt32(buf[0x11B]) << 24)
+                let items = u64le(buf, 0xE0)
+                let sane = (num > 100_000 && num < 2_000_000)
+                lines.append("④ 映射读 GObjects: NumElements=\(num) items=0x\(String(items, radix: 16)) "
+                    + (sane ? "✓ 应当与「定点读」的数字一致" : "✗ 数量异常"))
+            } else {
+                lines.append("④ 映射窗口读取不足（拿到 \(buf.count) 字节）")
+            }
+        } else {
+            lines.append("④ GObjects 不在窗口内")
+        }
+
+        lines.append("已建立 \(mappedSummary) · " + costLine())
+        lines.append("→ 映射建好之后，读这块内存不再产生任何 mach_vm_read 调用")
         return lines.joined(separator: "\n")
     }
 
