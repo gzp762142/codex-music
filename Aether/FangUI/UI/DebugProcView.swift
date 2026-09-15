@@ -35,6 +35,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     private let btnFixed = UIButton(type: .system)
     /// GNames：把 FName 索引解成字符串（验收：0/1/2 → None/ByteProperty/IntProperty）
     private let btnNames = UIButton(type: .system)
+    /// 对象：从对象表取前 16 个，解出「类名 + 对象名」
+    private let btnObjects = UIButton(type: .system)
     /// 读模块头：dump 基址处读 Mach-O，判断 ASLR 是否搬过基址
     /// 扫基址：128MB 内找 Mach-O magic（比上一版范围小）
     private let btnScan = UIButton(type: .system)
@@ -69,6 +71,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
             (btnProof, "读证", #selector(onProof)),
             (btnFixed, "定点读", #selector(onFixedRead)),
             (btnNames, "名字", #selector(onNames)),
+            (btnObjects, "对象", #selector(onObjects)),
             (btnRegion, "区域归属", #selector(onRegionName)),
             (btnScan, "找村口", #selector(onFindBase)),
             (btnRefresh, "刷新", #selector(onRefresh)),
@@ -109,9 +112,9 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         crashLabel.frame = CGRect(x: w * 0.6, y: 15, width: w * 0.4, height: 14)
         probeLabel.frame = CGRect(x: 0, y: 30, width: w, height: 14)
 
-        // 11 个按钮排成 6 列 × 2 行
-        let all = [btnSym, btnDlsym, btnProof, btnFixed, btnNames, btnRegion,
-                   btnScan, btnRefresh, btnCrashFile, btnSilent, btnJetsam]
+        // 12 个按钮排成 6 列 × 2 行
+        let all = [btnSym, btnDlsym, btnProof, btnFixed, btnNames, btnObjects,
+                   btnScan, btnRefresh, btnCrashFile, btnSilent, btnJetsam, btnRegion]
         let gap: CGFloat = 4
         let perRow = 6
         let bw = (w - gap * CGFloat(perRow - 1)) / CGFloat(perRow)
@@ -248,6 +251,12 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     @objc private func onNames() {
         guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
         showReport(MemoryProbe.stepGNames(pid: gpid))
+    }
+
+    /// 对象：对象表前 16 个的「类名 + 对象名」（验证 Class/Name 这条链）。
+    @objc private func onObjects() {
+        guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
+        showReport(MemoryProbe.stepObjects(pid: gpid))
     }
 
     @objc private func onCrashFile() {

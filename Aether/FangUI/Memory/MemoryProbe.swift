@@ -350,12 +350,13 @@ final class MemoryProbe {
         return zeros >= 3
     }
 
-    /// 从 FNameEntry + 0xE 读名字，按 looksWide 自动选 2 字节或 1 字节解码。
-    private static func readName(port: MachPort, entry: UInt64) -> String {
+    /// 从 FNameEntry + 0xE 读名字，同时报出用的是哪种字符宽度。
+    /// 宽度是逐 entry 判断的：同一个池里窄字符和 UCS-2 可以混存。
+    private static func readNameDetail(port: MachPort, entry: UInt64) -> (name: String, width: String) {
         let (rk, bytes) = readBytes(port: port,
                                     address: MachVmAddress(entry &+ nameEntryStringOffset),
                                     count: 96)
-        guard rk == KERN_SUCCESS, !bytes.isEmpty else { return "(读失败)" }
+        guard rk == KERN_SUCCESS, !bytes.isEmpty else { return ("(读失败)", "?") }
         if looksWide(bytes) {
             var units: [UInt16] = []
             var i = 0
@@ -365,7 +366,7 @@ final class MemoryProbe {
                 units.append(u)
                 i += 2
             }
-            return units.isEmpty ? "(空)" : String(decoding: units, as: UTF16.self)
+            return (units.isEmpty ? "(空)" : String(decoding: units, as: UTF16.self), "宽")
         }
         var raw: [UInt8] = []
         for b in bytes {
@@ -373,7 +374,12 @@ final class MemoryProbe {
             raw.append(b)
             if raw.count >= 40 { break }
         }
-        return raw.isEmpty ? "(空)" : String(decoding: raw, as: UTF8.self)
+        return (raw.isEmpty ? "(空)" : String(decoding: raw, as: UTF8.self), "窄")
+    }
+
+    /// 从 FNameEntry + 0xE 读名字（不带宽度信息）。
+    private static func readName(port: MachPort, entry: UInt64) -> String {
+        readNameDetail(port: port, entry: entry).name
     }
 
     /// GNames：把 FName 索引解成字符串。
@@ -439,6 +445,7 @@ final class MemoryProbe {
             }
             var names: [String] = []
             var detail: [String] = []
+            var prevEntry: UInt64 = 0
             for i in 0..<3 {
                 let (rke, entry) = readRaw(port: p, address: MachVmAddress(chunk &+ UInt64(i) * 8))
                 guard rke == KERN_SUCCESS, entry != 0 else {
@@ -446,7 +453,7 @@ final class MemoryProbe {
                     detail.append("   [\(i)] 取 entry 失败 \(describe(rke))")
                     continue
                 }
-                let nm = readName(port: p, entry: entry)
+                let (nm, width) = readNameDetail(port: p, entry: entry)
                 names.append(nm)
                 // entry 自报的索引（dump: FNameEntry::Index = 0x8）：
                 // 名字若带 "_0" 之类的后缀，看这行就知道索引基准偏了多少
@@ -454,7 +461,12 @@ final class MemoryProbe {
                 let idxNote = (rkIdx == KERN_SUCCESS)
                     ? "selfIdx=\(Int32(bitPattern: idxV))"
                     : "selfIdx=?"
-                detail.append("   [\(i)] \(nm)   @0x\(String(entry, radix: 16)) \(idxNote)")
+                // entry 之间的实际间隔：和字符串长度对一下就能确认字符宽度
+                let gapNote = (prevEntry == 0)
+                    ? ""
+                    : " Δ+0x" + String(entry &- prevEntry, radix: 16)
+                prevEntry = entry
+                detail.append("   [\(i)] \(nm)   @0x\(String(entry, radix: 16)) \(idxNote)\(gapNote) [\(width)]")
             }
             let ok = (names == expect)
             passed = passed || ok
@@ -466,6 +478,106 @@ final class MemoryProbe {
             lines.append("两个布局都没命中验收标准 —— 按池头 hex 决定下一步")
         }
         lines.append("（chunk 容量 \(namesPerChunk) 条/块，索引 0/1/2 都在第 0 块，暂不需要跨块）")
+        return lines.joined(separator: "\n")
+    }
+
+    /// 把 FName 索引解成字符串。布局用「名字」那步已经验收过的一层结构：
+    ///   chunk_k = *(pool + k*8)     k = index / ElementsPerChunk
+    ///   entry   = *(chunk_k + (index % ElementsPerChunk) * 8)
+    /// chunk0 由调用方传入，索引落在第 0 块时省掉一次小读。
+    private static func resolveName(port: MachPort, pool: UInt64, chunk0: UInt64, index: UInt32) -> String {
+        let k = UInt64(index) / namesPerChunk
+        let within = UInt64(index) % namesPerChunk
+        var chunk = chunk0
+        if k != 0 {
+            let (rkC, c) = readRaw(port: port, address: MachVmAddress(pool &+ k * 8))
+            guard rkC == KERN_SUCCESS, c != 0 else { return "(chunk\(k)读失败 \(describe(rkC)))" }
+            chunk = c
+        }
+        let (rkE, entry) = readRaw(port: port, address: MachVmAddress(chunk &+ within * 8))
+        guard rkE == KERN_SUCCESS, entry != 0 else { return "(entry读失败 \(describe(rkE)))" }
+        return readName(port: port, entry: entry)
+    }
+
+    /// 对象表：从 chunk0 取前 16 个 FUObjectItem，逐个解出「类名 + 对象名」。
+    ///
+    /// 链（偏移全部来自同一份 dump）：
+    ///   item_i = items + i*0x18        FUObjectItem::Size = 0x18, Object = 0x0
+    ///   class  = *(obj + 0x10)         UObject::Class
+    ///   nameIX = *(obj + 0x18)         UObject::Name（FName::ComparisonIndex）
+    ///   number = *(obj + 0x1C)         FName::Number（>1 时名字显示成 Name_(Number-1)）
+    ///   clsIX  = *(class + 0x18)       类的 FName
+    ///
+    /// 读取量：每个对象 5 次小读 + 每次名字解析 1～2 次 —— 16 个对象约 100 次点读，
+    /// 不移动指针、不遍历全表（47 万个对象逐个读会把游戏读崩）。
+    static func stepObjects(pid: Int32) -> String {
+        guard imageSlide != 0, imageBase != 0 else {
+            return "对象: 还没有基址 —— 先点「找村口」"
+        }
+        let (kr, p) = port(for: pid)
+        guard kr == KERN_SUCCESS, p != 0 else { return "对象: 取端口失败 \(describe(kr))" }
+
+        let s = imageSlide
+        let off = Offsets.load()
+
+        // 名字池（布局已由「名字」按钮验收确认：一层，pool+0 就是 chunk0）
+        let (rkPool, pool) = readRaw(port: p, address: MachVmAddress(runtime(off.gNames, slide: s)))
+        guard rkPool == KERN_SUCCESS, pool != 0 else {
+            return "对象: 名字池槽读取失败 \(describe(rkPool))"
+        }
+        let (rkChunk, nameChunk0) = readRaw(port: p, address: MachVmAddress(pool))
+        guard rkChunk == KERN_SUCCESS, nameChunk0 != 0 else {
+            return "对象: 名字池 chunk0 读取失败 \(describe(rkChunk))"
+        }
+
+        // 对象表头
+        let slot = runtime(off.gObjects, slide: s)
+        let (rkNum, num) = readAt(port: p, address: MachVmAddress(slot &+ 0x118))
+        guard rkNum == KERN_SUCCESS else { return "对象: NumElements 读失败 \(describe(rkNum))" }
+        let (rkItems, items) = readRaw(port: p, address: MachVmAddress(slot &+ 0xE0))
+        guard rkItems == KERN_SUCCESS, items != 0 else {
+            return "对象: items 指针读失败 \(describe(rkItems))"
+        }
+
+        let n = min(Int(num), 16)
+        var lines: [String] = []
+        lines.append("对象: NumElements=\(num)  items=0x\(String(items, radix: 16))  取前 \(n) 个")
+
+        for i in 0..<n {
+            let itemAddr = items &+ UInt64(i) * 0x18
+            let (rkObj, obj) = readRaw(port: p, address: MachVmAddress(itemAddr))
+            guard rkObj == KERN_SUCCESS, obj != 0 else {
+                lines.append("[\(i)] 空槽或读失败 \(describe(rkObj))")
+                continue
+            }
+            let (rkCls, cls) = readRaw(port: p, address: MachVmAddress(obj &+ 0x10))
+            let (rkName, nameIX) = readAt(port: p, address: MachVmAddress(obj &+ 0x18))
+            let (rkNo, number) = readAt(port: p, address: MachVmAddress(obj &+ 0x1C))
+
+            var clsName = "类名?"
+            if rkCls == KERN_SUCCESS, cls != 0 {
+                let (rkCIX, clsIX) = readAt(port: p, address: MachVmAddress(cls &+ 0x18))
+                if rkCIX == KERN_SUCCESS {
+                    clsName = resolveName(port: p, pool: pool, chunk0: nameChunk0, index: clsIX)
+                } else {
+                    clsName = "类名读失败 \(describe(rkCIX))"
+                }
+            } else if rkCls != KERN_SUCCESS {
+                clsName = "Class读失败 \(describe(rkCls))"
+            }
+
+            var objName = "名字?"
+            if rkName == KERN_SUCCESS {
+                objName = resolveName(port: p, pool: pool, chunk0: nameChunk0, index: nameIX)
+                if rkNo == KERN_SUCCESS, number > 1 {
+                    objName += "_\(number - 1)"
+                }
+            } else {
+                objName = "Name读失败 \(describe(rkName))"
+            }
+
+            lines.append("[\(i)] \(clsName)  \(objName)   @0x\(String(obj, radix: 16))")
+        }
         return lines.joined(separator: "\n")
     }
 
