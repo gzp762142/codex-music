@@ -47,8 +47,6 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     private let btnMap = UIButton(type: .system)
     /// 枚举：只枚举几个 region 打原始字段，验证 vm_region_64 这个调用本身
     private let btnEnum = UIButton(type: .system)
-    /// 世界：GWorld → PersistentLevel → Actors → 认类名（通往玩家的正路）
-    private let btnWorld = UIButton(type: .system)
     /// 读模块头：dump 基址处读 Mach-O，判断 ASLR 是否搬过基址
     /// 扫基址：128MB 内找 Mach-O magic（比上一版范围小）
     private let btnScan = UIButton(type: .system)
