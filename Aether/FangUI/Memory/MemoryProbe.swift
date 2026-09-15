@@ -1087,27 +1087,74 @@ final class MemoryProbe {
             return lines.joined(separator: "\n")
         }
 
-        // ④ 逐个认类名（最多 12 个）
+        // ④ 遍历全表：按类名统计 + 抓出所有角色坐标
+        //
+        // 这一步直接回答「现场有多少人」——不依赖 PlayerArray 被裁剪了多少。
+        // 成本控制：actor 指针分块读（每块 500 个），Class 指针**去重**后每个类名只解一次
+        // （同类对象共享 Class，命中率接近 100%），所以名字池的读取次数只跟「有多少种类」有关。
         stageMark("世界 · 遍历 Actor")
-        let n = min(Int(count), 12)
-        let (rkBuf, buf) = readBytes(port: p, address: MachVmAddress(dataPtr), count: n * 8)
-        guard rkBuf == KERN_SUCCESS, buf.count >= n * 8 else {
-            lines.append("读 actor 指针数组失败 \(describe(rkBuf))")
-            lines.append(costLine())
-            return lines.joined(separator: "\n")
-        }
-        for i in 0..<n {
-            let actor = u64le(buf, i * 8)
-            guard actor != 0 else { continue }
-            let (rkCls, cls) = readRaw(port: p, address: MachVmAddress(actor &+ 0x10))
-            var clsName = "(类指针无效)"
-            if rkCls == KERN_SUCCESS, cls != 0 {
-                let (rkIX, clsIX) = readAt(port: p, address: MachVmAddress(cls &+ 0x18))
-                if rkIX == KERN_SUCCESS {
-                    clsName = resolveName(port: p, pool: pool, chunk0: nameChunk0, index: clsIX)
+        let total = min(Int(count), 3000)
+        var classNames: [UInt64: String] = [:]
+        var histogram: [String: Int] = [:]
+        var charActors: [UInt64] = []
+        var cursor = 0
+        while cursor < total {
+            let batch = min(500, total - cursor)
+            let (rkBuf, buf) = readBytes(port: p,
+                                         address: MachVmAddress(dataPtr &+ UInt64(cursor * 8)),
+                                         count: batch * 8)
+            guard rkBuf == KERN_SUCCESS, buf.count >= batch * 8 else {
+                lines.append("读 actor 指针数组失败 @\(cursor) \(describe(rkBuf))")
+                break
+            }
+            for i in 0..<batch {
+                let actor = u64le(buf, i * 8)
+                guard actor > 0x100000000 else { continue }
+                let (rkCls, cls) = readRaw(port: p, address: MachVmAddress(actor &+ 0x10))
+                guard rkCls == KERN_SUCCESS, cls > 0x100000000 else { continue }
+
+                var nm = classNames[cls]
+                if nm == nil {
+                    let (rkIX, clsIX) = readAt(port: p, address: MachVmAddress(cls &+ 0x18))
+                    nm = (rkIX == KERN_SUCCESS)
+                        ? resolveName(port: p, pool: pool, chunk0: nameChunk0, index: clsIX)
+                        : "?"
+                    classNames[cls] = nm
+                }
+                let name = nm ?? "?"
+                histogram[name, default: 0] += 1
+                if name.contains("Character") || name.contains("Pawn") {
+                    charActors.append(actor)
                 }
             }
-            lines.append("[\(i)] \(clsName)  @0x\(String(actor, radix: 16))")
+            cursor += batch
+        }
+
+        lines.append("类名分布（遍历 \(cursor)/\(count) 个 actor，共 \(classNames.count) 种类）:")
+        for (name, c) in histogram.sorted(by: { $0.value > $1.value }).prefix(12) {
+            lines.append("  \(name) × \(c)")
+        }
+
+        if charActors.isEmpty {
+            lines.append("角色: 0 个（类名里不含 Character/Pawn）")
+        } else {
+            lines.append("角色: \(charActors.count) 个 —— 每个都是客户端手上真实存在的身体")
+            for (i, a) in charActors.prefix(24).enumerated() {
+                let (rkR, root) = readRaw(port: p, address: MachVmAddress(a &+ 0x260))
+                guard rkR == KERN_SUCCESS, root > 0x100000000 else {
+                    lines.append("  [\(i)] @\(hexOf(a))  RootComponent 无效")
+                    continue
+                }
+                let (rkT, tf) = readBytes(port: p, address: MachVmAddress(root &+ 0x1F0 + 0x10), count: 12)
+                if rkT == KERN_SUCCESS, tf.count >= 12 {
+                    let x = floatAt(tf, 0), y = floatAt(tf, 4), z = floatAt(tf, 8)
+                    let ok = (x != 0 || y != 0) && abs(x) < 5e6 && abs(y) < 5e6 && abs(z) < 1e5
+                    lines.append("  [\(i)] @\(hexOf(a))  Loc=(\(fmt1(x)), \(fmt1(y)), \(fmt1(z))) "
+                        + (ok ? "✓" : "✗ 量级不对"))
+                } else {
+                    lines.append("  [\(i)] @\(hexOf(a))  ComponentToWorld 读失败 \(describe(rkT))")
+                }
+            }
         }
         lines.append(costLine())
         return lines.joined(separator: "\n")
@@ -1524,6 +1571,24 @@ final class MemoryProbe {
                 + "\n读 GameState 失败 \(describe(rkGS)) @UWorld+0xAD8 —— 多半还在大厅"
         }
         lines.append("GameState=\(hexOf(gameState))")
+
+        // ②′ GameState 自己的玩家计数（ASTExtraGameStateBase，偏移同样回溯过类声明）：
+        //     0x0D98 TotalPlayerNum · 0x0D9C PlayerNum
+        //     0x141C AlivePlayerNum · 0x1420 AliveRealPlayerNum
+        //   这几个数是服务器给的**权威人数**。拿它和下面 PlayerArray.count 一比，
+        //   就能直接看出服务器把玩家列表裁剪了多少 —— 不用再靠推测。
+        let (rkN1, n1) = readBytes(port: p, address: MachVmAddress(gameState &+ 0x0D98), count: 8)
+        if rkN1 == KERN_SUCCESS, n1.count >= 8 {
+            lines.append("  人数(总): TotalPlayerNum=\(i32le(n1, 0))   PlayerNum=\(i32le(n1, 4))")
+        } else {
+            lines.append("  人数(总): 读失败 \(describe(rkN1)) @GameState+0x0D98")
+        }
+        let (rkN2, n2) = readBytes(port: p, address: MachVmAddress(gameState &+ 0x141C), count: 8)
+        if rkN2 == KERN_SUCCESS, n2.count >= 8 {
+            lines.append("  人数(存活): AlivePlayerNum=\(i32le(n2, 0))   AliveRealPlayerNum=\(i32le(n2, 4))")
+        } else {
+            lines.append("  人数(存活): 读失败 \(describe(rkN2)) @GameState+0x141C")
+        }
 
         // ③ PlayerArray
         stageMark("玩家 · PlayerArray")
