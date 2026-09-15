@@ -39,6 +39,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     private let btnObjects = UIButton(type: .system)
     /// 世界：GWorld → PersistentLevel → Actors（三次小读，走热页）
     private let btnWorld = UIButton(type: .system)
+    /// 内存：读游戏的内存账本（footprint / compressed），不碰游戏内存
+    private let btnMemory = UIButton(type: .system)
     /// 读模块头：dump 基址处读 Mach-O，判断 ASLR 是否搬过基址
     /// 扫基址：128MB 内找 Mach-O magic（比上一版范围小）
     private let btnScan = UIButton(type: .system)
@@ -75,6 +77,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
             (btnNames, "名字", #selector(onNames)),
             (btnObjects, "对象", #selector(onObjects)),
             (btnWorld, "世界", #selector(onWorld)),
+            (btnMemory, "内存", #selector(onMemory)),
             (btnRegion, "区域归属", #selector(onRegionName)),
             (btnScan, "找村口", #selector(onFindBase)),
             (btnRefresh, "刷新", #selector(onRefresh)),
@@ -115,10 +118,10 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         crashLabel.frame = CGRect(x: w * 0.6, y: 15, width: w * 0.4, height: 14)
         probeLabel.frame = CGRect(x: 0, y: 30, width: w, height: 14)
 
-        // 13 个按钮排成 5 列 × 3 行（列变宽，长标题「崩溃文件」不再被压）
+        // 14 个按钮排成 5 列 × 3 行
         let all = [btnSym, btnDlsym, btnProof, btnFixed, btnNames,
-                   btnObjects, btnWorld, btnScan, btnRefresh, btnCrashFile,
-                   btnSilent, btnJetsam, btnRegion]
+                   btnObjects, btnWorld, btnMemory, btnScan, btnRefresh,
+                   btnCrashFile, btnSilent, btnJetsam, btnRegion]
         let gap: CGFloat = 4
         let perRow = 5
         let bw = (w - gap * CGFloat(perRow - 1)) / CGFloat(perRow)
@@ -267,6 +270,12 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     @objc private func onWorld() {
         guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
         showReport(MemoryProbe.stepWorld(pid: gpid))
+    }
+
+    /// 内存：游戏的内存账本（不碰游戏内存），用来看操作前后 footprint/compressed 的差值。
+    @objc private func onMemory() {
+        guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
+        showReport(MemoryProbe.stepMemory(pid: gpid))
     }
 
     @objc private func onCrashFile() {

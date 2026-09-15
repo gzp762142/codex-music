@@ -726,6 +726,69 @@ final class MemoryProbe {
         return lines.joined(separator: "\n")
     }
 
+    // MARK: - 内存账本（验证读取是否在给游戏加内存）
+
+    private typealias TaskInfoFn = @convention(c) (UInt32, Int32,
+                                                   UnsafeMutablePointer<Int32>,
+                                                   UnsafeMutablePointer<UInt32>) -> KernReturn
+    private static let taskInfoFn = symbol("task_info", as: TaskInfoFn.self)
+
+    /// 上一次读到的内存账本，用来算差值。
+    private static var lastMem: (footprint: UInt64, compressed: UInt64, resident: UInt64)?
+
+    /// 读游戏进程的内存账本。**一个字节的游戏内存都不碰** —— 只是让内核查一下它自己的记账。
+    ///
+    /// 这是把「读冷页 → 给游戏加内存 → 崩」这条假说变成数字的唯一直接手段：
+    ///   phys_footprint  是 jetsam 判定用的那个数（决定游戏会不会被杀）
+    ///   compressed      是当前被压缩的内存量 —— 我们读冷页会强制解压，这个数应该往下掉
+    /// 在「对象」这类动作前后各点一次，差值自己会说话。
+    static func stepMemory(pid: Int32) -> String {
+        guard let fn = taskInfoFn else { return "内存: task_info 符号缺失" }
+        let (kr, p) = port(for: pid)
+        guard kr == KERN_SUCCESS, p != 0 else { return "内存: 取端口失败 \(describe(kr))" }
+        defer { dropPort(p) }
+
+        var raw = [UInt8](repeating: 0, count: 512)
+        var count = UInt32(raw.count / 4)
+        let rk = raw.withUnsafeMutableBytes { rb -> Int32 in
+            guard let base = rb.baseAddress?.assumingMemoryBound(to: Int32.self) else {
+                return KERN_FAILURE
+            }
+            return fn(p, 22, base, &count)          // TASK_VM_INFO = 22
+        }
+        guard rk == KERN_SUCCESS, count > 0 else {
+            return "内存: task_info 失败 \(describe(rk))"
+        }
+
+        func field(_ off: Int) -> UInt64 { u64le(raw, off) }
+        func mb(_ v: UInt64) -> String { String(format: "%.1f", Double(v) / 1048576.0) }
+
+        let virt = field(0)              // virtual_size
+        let resi = field(16)             // resident_size
+        let comp = field(120)            // compressed
+        let phys = field(144)            // phys_footprint
+
+        // 结构布局是按 task_vm_info 的公开字段顺序取的；数值明显不合理说明偏移不对，
+        // 这一行就是给这种情况准备的。
+        let sane = (phys > 1_048_576 && phys < (64 * 1024 * 1024 * 1024))
+        var lines: [String] = []
+        lines.append("内存: pid=\(pid)" + (sane ? "" : "  ✗ 数值不合理（结构偏移可能不匹配这个系统版本）"))
+        var delta = ""
+        if let last = lastMem {
+            let df = Int64(bitPattern: phys) - Int64(bitPattern: last.footprint)
+            let dc = Int64(bitPattern: comp) - Int64(bitPattern: last.compressed)
+            delta = String(format: "   较上次 %+.1f MB / %+.1f MB",
+                           Double(df) / 1048576.0, Double(dc) / 1048576.0)
+        }
+        lines.append("  phys_footprint = \(mb(phys)) MB   ← jetsam 判定的就是它" + delta)
+        lines.append("  compressed     = \(mb(comp)) MB   ← 读冷页会让它往下掉")
+        lines.append("  resident       = \(mb(resi)) MB")
+        lines.append("  virtual        = \(mb(virt)) MB")
+        lines.append("用法：动作前后各点一次这个按钮，差值直接说明读取给游戏加了多少内存")
+        lastMem = (phys, comp, resi)
+        return lines.joined(separator: "\n")
+    }
+
     /// 单点区域归属：对 dump 基址问一次「这属于哪个文件」。
     ///
     /// 零风险探测：一次调用、不遍历、不写。
