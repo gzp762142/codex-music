@@ -1101,6 +1101,48 @@ final class MemoryProbe {
         return lines.joined(separator: "\n")
     }
 
+    /// 只枚举 6 个 region，把原始字段全打出来 —— 专门验证这次调用本身对不对。
+    ///
+    /// 它不找基址、不读内存、不做任何多余的事。判断规则：
+    ///   能返回 → vm_region_64 本身没问题，卡点在别处，继续往下切
+    ///   卡住   → 就是这次调用的问题（参数 / 符号 / 这个 API 在本机的行为）
+    ///
+    /// 先对自己进程来一次：参数写错的话会立刻暴露，而且完全不碰游戏。
+    static func stepRegionProbe(pid: Int32) -> String {
+        resetCounters()
+        stageMark("枚举 · 开始")
+        guard vmRegion64Fn != nil else { return "枚举: vm_region_64 符号缺失" }
+
+        var lines: [String] = []
+        lines.append("枚举自检: flavor=9(BASIC_INFO_64) infoCnt=8 object_name 走出参")
+
+        stageMark("枚举 · 对自己进程")
+        var selfAddr: UInt64 = 0x100000000
+        let selfR = nextRegion(task: mach_task_self_, addr: &selfAddr)
+        lines.append("对自己(0x100000000): ok=\(selfR.ok) size=0x\(String(selfR.size, radix: 16)) "
+            + "prot=\(selfR.prot) off=0x\(String(selfR.offset, radix: 16))")
+
+        stageMark("枚举 · 取端口")
+        let (kr, p) = port(for: pid)
+        guard kr == KERN_SUCCESS, p != 0 else {
+            return lines.joined(separator: "\n") + "\n取端口失败 \(describe(kr))"
+        }
+        defer { dropPort(p) }
+
+        var addr: UInt64 = 0x100000000
+        for i in 0..<6 {
+            stageMark("枚举 · 第 \(i) 个")
+            let r = nextRegion(task: p, addr: &addr)
+            lines.append("[\(i)] addr=0x\(String(addr, radix: 16)) ok=\(r.ok) "
+                + "size=0x\(String(r.size, radix: 16)) prot=\(r.prot) off=0x\(String(r.offset, radix: 16))")
+            if !r.ok { break }
+            addr += r.size
+            if addr < r.size { break }
+        }
+        lines.append(costLine())
+        return lines.joined(separator: "\n")
+    }
+
     /// 单点区域归属：对 dump 基址问一次「这属于哪个文件」。
     ///
     /// 零风险探测：一次调用、不遍历、不写。

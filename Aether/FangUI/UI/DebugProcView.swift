@@ -45,6 +45,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     private let btnMemory = UIButton(type: .system)
     /// 映射：把游戏内存 remap 进我们自己进程，之后本地读（样本的读取方式）
     private let btnMap = UIButton(type: .system)
+    /// 枚举：只枚举几个 region 打原始字段，验证 vm_region_64 这个调用本身
+    private let btnEnum = UIButton(type: .system)
     /// 读模块头：dump 基址处读 Mach-O，判断 ASLR 是否搬过基址
     /// 扫基址：128MB 内找 Mach-O magic（比上一版范围小）
     private let btnScan = UIButton(type: .system)
@@ -78,6 +80,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         let buttons: [(UIButton, String, Selector)] = [
             (btnAuto, "跑一次", #selector(onAutoRun)),
             (btnMap, "映射", #selector(onMapProbe)),
+            (btnEnum, "枚举", #selector(onEnumProbe)),
             (btnRefresh, "刷新", #selector(onRefresh)),
             (btnObjects, "对象", #selector(onObjects)),
             (btnCrashFile, "崩溃文件", #selector(onCrashFile)),
@@ -116,10 +119,10 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         crashLabel.frame = CGRect(x: w * 0.6, y: 15, width: w * 0.4, height: 14)
         probeLabel.frame = CGRect(x: 0, y: 30, width: w, height: 14)
 
-        // 6 个按钮排成 3 列 × 2 行
-        let all = [btnAuto, btnMap, btnRefresh, btnObjects, btnCrashFile, btnMemory]
+        // 7 个按钮排成 4 列 × 2 行
+        let all = [btnAuto, btnMap, btnEnum, btnRefresh, btnObjects, btnCrashFile, btnMemory]
         let gap: CGFloat = 4
-        let perRow = 3
+        let perRow = 4
         let bw = (w - gap * CGFloat(perRow - 1)) / CGFloat(perRow)
         let bh = btnRowH - 6
         for (i, b) in all.enumerated() {
@@ -398,6 +401,12 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     @objc private func onWorld() {
         guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
         runProbe("世界: 读取中…") { MemoryProbe.stepWorld(pid: $0) }
+    }
+
+    /// 枚举：只枚举几个 region 打原始字段，验证 vm_region_64 这个调用本身。
+    @objc private func onEnumProbe() {
+        guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
+        runProbe("枚举: 读取中…") { MemoryProbe.stepRegionProbe(pid: $0) }
     }
 
     /// 内存：游戏的内存账本（不碰游戏内存），用来看操作前后 footprint/compressed 的差值。
