@@ -167,6 +167,27 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         probeLabel.textColor = idleText
         let pid = gpid
 
+        // Music 是悬浮窗形态（窗口浮在游戏之上），它很可能**根本不在前台**。
+        // 而后台 app 的线程会被 iOS 挂起 —— 挂起之后读取链就停在原地，
+        // 面板表现正好是"卡在第一步不动"，几秒后整个进程被系统终止。
+        // 这里把 app 状态记下来，并且申请一段后台执行时间（没有它的话，
+        // 任务可能在第一秒就被挂起）。
+        var appState = "未知"
+        switch UIApplication.shared.applicationState {
+        case .active: appState = "前台"
+        case .inactive: appState = "非活跃"
+        case .background: appState = "后台"
+        @unknown default: appState = "未知"
+        }
+
+        var bgTask = UIBackgroundTaskIdentifier.invalid
+        bgTask = UIApplication.shared.beginBackgroundTask(withName: "aether.read") {
+            if bgTask != .invalid {
+                UIApplication.shared.endBackgroundTask(bgTask)
+                bgTask = .invalid
+            }
+        }
+
         // 后台每一步都直接推进面板 —— 不走 Timer 轮询。
         // Timer 跑在主线程，主线程一旦被任何内核调用堵住就再也不触发，
         // 面板会停在最后一个值上，跟"真的卡住了"长得一样。
@@ -175,7 +196,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         }
 
         DispatchQueue.global(qos: .userInitiated).async {
-            MemoryProbe.stageMark(pending + " · 后台已启动")
+            MemoryProbe.stageMark(pending + " · 后台已启动[app \(appState)]")
             let t0 = Date()
             let result = work(pid)
             let ms = Int(Date().timeIntervalSince(t0) * 1000)
@@ -185,7 +206,11 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
                 s.probeBusy = false
                 s.stageTimer?.invalidate()
                 s.stageTimer = nil
-                s.showReport("[\(ms) ms] " + result)
+                if bgTask != .invalid {
+                    UIApplication.shared.endBackgroundTask(bgTask)
+                    bgTask = .invalid
+                }
+                s.showReport("[\(ms) ms][app \(appState)] " + result)
             }
         }
     }
@@ -211,7 +236,16 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
 
         let exact = entries.filter { $0.exact }.count
         let loose = entries.filter { $0.matched && !$0.exact }.count
-        countLabel.text = "共 \(entries.count) · 精确\(exact) · 疑似\(loose) · \(ProcessScanner.channelSummary)"
+        // app 自己在前台还是后台必须一眼能看到：后台意味着线程随时会被挂起，
+        // 那之后的任何"卡住"都不能算在读取头上。
+        var stateText = "?"
+        switch UIApplication.shared.applicationState {
+        case .active: stateText = "前台"
+        case .inactive: stateText = "非活跃"
+        case .background: stateText = "★后台"
+        @unknown default: stateText = "?"
+        }
+        countLabel.text = "共 \(entries.count) · 精确\(exact) · 疑似\(loose) · \(ProcessScanner.channelSummary) · app:\(stateText)"
         if gpid != 0 {
             hitLabel.text = "pid=\(gpid)"
             hitLabel.textColor = accent
