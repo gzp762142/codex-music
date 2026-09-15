@@ -147,6 +147,31 @@ final class MemoryProbe {
         return (KERN_SUCCESS, value)
     }
 
+    /// 读一段连续字节（**上限 4096**）。
+    ///
+    /// 这是唯一允许的块读取，硬上限就卡在 4096：之前用 16KB 步进扫内存
+    /// 把目标进程搞成过 jetsam 被杀，连续 fault 太多页是死因。
+    private static func readBytes(port: MachPort, address: MachVmAddress, count: Int)
+        -> (KernReturn, [UInt8]) {
+        guard let vmRead = vmReadFn else { return (KERN_FAILURE, []) }
+        guard count > 0, count <= 4096 else { return (KERN_FAILURE, []) }
+        var dataPtr: UInt = 0
+        var dataLen: MachVmSize = MachVmSize(count)
+        let kr = vmRead(port, address, MachVmSize(count), &dataPtr, &dataLen)
+        guard kr == KERN_SUCCESS, dataPtr != 0, dataLen > 0 else { return (kr, []) }
+        let n = min(Int(dataLen), count)
+        var out = [UInt8](repeating: 0, count: n)
+        if let src = UnsafeRawPointer(bitPattern: dataPtr) {
+            out.withUnsafeMutableBytes { dst in
+                if let d = dst.baseAddress {
+                    d.copyMemory(from: src, byteCount: n)
+                }
+            }
+        }
+        _ = vmDeallocateFn?(port, dataPtr, dataLen)
+        return (KERN_SUCCESS, out)
+    }
+
     /// 给面板用的指针解读：值 + 是否像有效指针 + 高位（便于看落在哪个地址段）。
     private static func pointerInfo(port: MachPort, address: MachVmAddress)
         -> (KernReturn, UInt64, Bool, String) {
@@ -290,15 +315,152 @@ final class MemoryProbe {
         return lines.joined(separator: "\n")
     }
 
-    /// 找村口：在 dump 基址附近按页步进，用 Δ 判据精确认村口。
+    // MARK: - GNames（名字表）
+
+    /// FNameEntry 的字符串起点（dump：FNameEntry::String = 0xE）。
+    private static let nameEntryStringOffset: UInt64 = 0xE
+    /// TNameArray 每个 chunk 的条目数（dump：ElementsPerChunk = 0x4000）。
+    private static let namesPerChunk: UInt64 = 0x4000
+
+    /// 把一段字节按 hex 分行打印，偏移相对段首。
+    private static func hexLines(_ bytes: [UInt8], perLine: Int = 16) -> [String] {
+        var out: [String] = []
+        var i = 0
+        while i < bytes.count {
+            let end = min(i + perLine, bytes.count)
+            var hex = ""
+            for j in i..<end {
+                hex += String(format: "%02x", bytes[j])
+                if j != end - 1 { hex += " " }
+            }
+            out.append("+" + String(i, radix: 16) + "  " + hex)
+            i = end
+        }
+        return out
+    }
+
+    /// 字符串是 2 字节 UCS-2 还是 1 字节窄字符？
+    /// ASCII 字符在 UCS-2 里高字节为 0，看第 2/4/6 字节是不是连续的 0。
+    private static func looksWide(_ bytes: [UInt8]) -> Bool {
+        guard bytes.count >= 8 else { return false }
+        var zeros = 0
+        for i in stride(from: 1, to: min(bytes.count, 8), by: 2) where bytes[i] == 0 {
+            zeros += 1
+        }
+        return zeros >= 3
+    }
+
+    /// 从 FNameEntry + 0xE 读名字，按 looksWide 自动选 2 字节或 1 字节解码。
+    private static func readName(port: MachPort, entry: UInt64) -> String {
+        let (rk, bytes) = readBytes(port: port,
+                                    address: MachVmAddress(entry &+ nameEntryStringOffset),
+                                    count: 96)
+        guard rk == KERN_SUCCESS, !bytes.isEmpty else { return "(读失败)" }
+        if looksWide(bytes) {
+            var units: [UInt16] = []
+            var i = 0
+            while i + 1 < bytes.count, units.count < 40 {
+                let u = UInt16(bytes[i]) | (UInt16(bytes[i + 1]) << 8)
+                if u == 0 { break }
+                units.append(u)
+                i += 2
+            }
+            return units.isEmpty ? "(空)" : String(decoding: units, as: UTF16.self)
+        }
+        var raw: [UInt8] = []
+        for b in bytes {
+            if b == 0 { break }
+            raw.append(b)
+            if raw.count >= 40 { break }
+        }
+        return raw.isEmpty ? "(空)" : String(decoding: raw, as: UTF8.self)
+    }
+
+    /// GNames：把 FName 索引解成字符串。
     ///
-    /// 判据（跟村口无关的恒定关系）：
-    ///   dump 时 GNames - GObjects = 0x1C4EBF90
-    /// 候选基址必须让这两个地址读出的值**差值就是这个数**，并且两个值都落在
-    /// dump 的地址空间里。比"看指针像不像"可靠得多 —— 两个独立的数同时对。
+    /// 验收标准（三个全中才算通过）：
+    ///   索引 0 → "None"    索引 1 → "ByteProperty"    索引 2 → "IntProperty"
     ///
-    /// 代价：每页只读 8 字节（不是 64KB），±4MB 是 1024 页 → 1024 次小读。
-    /// 这是刻意压低的读取量：大块连续读是之前把游戏搞崩的原因。
+    /// `Chunks` 是「内联指针数组」还是「指向指针数组」，各 UE4 版本不一致，
+    /// 所以两种布局各解一遍，用上面三个已知答案判定 —— 不照抄、不猜。
+    static func stepGNames(pid: Int32) -> String {
+        guard imageSlide != 0, imageBase != 0 else {
+            return "GNames: 还没有基址 —— 先点「找村口」"
+        }
+        let (kr, p) = port(for: pid)
+        guard kr == KERN_SUCCESS, p != 0 else { return "GNames: 取端口失败 \(describe(kr))" }
+
+        let s = imageSlide
+        let slotAddr = runtime(Offsets.load().gNames, slide: s)
+
+        // ① 槽 → 名字池
+        let (rkPool, pool) = readRaw(port: p, address: MachVmAddress(slotAddr))
+        guard rkPool == KERN_SUCCESS, pool != 0 else {
+            return "GNames: 槽 0x\(String(slotAddr, radix: 16)) 读失败 \(describe(rkPool))"
+        }
+
+        var lines: [String] = []
+        lines.append("GNames: 槽 0x\(String(slotAddr, radix: 16)) → pool=0x\(String(pool, radix: 16))")
+
+        // ② 池头 hex：先看清布局，再决定解哪一层
+        let (rkHead, head) = readBytes(port: p, address: MachVmAddress(pool), count: 0x40)
+        if rkHead == KERN_SUCCESS, !head.isEmpty {
+            lines.append("池头 0x40 字节（偏移相对 pool）:")
+            lines.append(contentsOf: hexLines(head, perLine: 16))
+            // 池头里若出现 0x4000（ElementsPerChunk），出现位置能反推布局
+            var hits: [String] = []
+            var k = 0
+            while k + 4 <= head.count {
+                let v = UInt32(head[k]) | (UInt32(head[k + 1]) << 8)
+                    | (UInt32(head[k + 2]) << 16) | (UInt32(head[k + 3]) << 24)
+                if v == 0x4000 { hits.append("+" + String(k, radix: 16)) }
+                k += 4
+            }
+            lines.append("池头里 0x4000 出现在: " + (hits.isEmpty ? "无" : hits.joined(separator: " ")))
+        } else {
+            lines.append("池头读失败 \(describe(rkHead))")
+        }
+
+        // ③ 两种布局各解一遍，用已知答案判定
+        let (rkA, lvlA) = readRaw(port: p, address: MachVmAddress(pool))
+        let (rkB, lvlB) = (rkA == KERN_SUCCESS)
+            ? readRaw(port: p, address: MachVmAddress(lvlA))
+            : (KERN_FAILURE, 0)
+        let expect = ["None", "ByteProperty", "IntProperty"]
+        let candidates: [(String, KernReturn, UInt64)] = [
+            ("A 池头直接是 chunk（一层）", rkA, lvlA),
+            ("B 池头指向 chunk 指针数组（二层）", rkB, lvlB)
+        ]
+        var passed = false
+        for (label, rk, chunk) in candidates {
+            guard rk == KERN_SUCCESS, chunk != 0 else {
+                lines.append("\(label): 指针无效 \(describe(rk))")
+                continue
+            }
+            var got: [String] = []
+            for i in 0..<3 {
+                let (rke, entry) = readRaw(port: p, address: MachVmAddress(chunk &+ UInt64(i) * 8))
+                if rke == KERN_SUCCESS, entry != 0 {
+                    got.append(readName(port: p, entry: entry))
+                } else {
+                    got.append("(取entry失败 \(describe(rke)))")
+                }
+            }
+            let ok = (got == expect)
+            passed = passed || ok
+            lines.append("\(label) chunk=0x\(String(chunk, radix: 16))")
+            for (i, name) in got.enumerated() {
+                lines.append("   [\(i)] \(name)")
+            }
+            if ok { lines.append("   → 验收通过：0/1/2 三个名字全对") }
+        }
+        if !passed {
+            lines.append("两个布局都没命中验收标准 —— 按池头 hex 决定下一步")
+        }
+        lines.append("（chunk 容量 \(namesPerChunk) 条/块，索引 0/1/2 都在第 0 块，暂不需要跨块）")
+        return lines.joined(separator: "\n")
+    }
+
     /// 单点区域归属：对 dump 基址问一次「这属于哪个文件」。
     ///
     /// 零风险探测：一次调用、不遍历、不写。
@@ -370,6 +532,9 @@ final class MemoryProbe {
     ///   2. protection 含 VM_PROT_EXECUTE(0x4)  → 可执行段
     ///   3. offset == 0                          → 从文件头映射 = Mach-O 头所在段
     /// 满足这三条的就是 __TEXT 段，它的起始地址 = image base。
+    /// 命中后还要读 4 字节校验 magic == 0xFEEDFACF、再读 +12 的 filetype == 2：
+    /// 三个 region 条件只说明"像 __TEXT"，最终裁决权在 Mach-O 头上，
+    /// 校验不过就继续枚举下一个候选，不把可疑值返回给上层。
     ///
     /// 为什么不用"二分 proc_regionfilename"：实测它的语义是
     /// "返回该地址所在或**之后第一个** region" —— 对未映射的低地址也会返回
