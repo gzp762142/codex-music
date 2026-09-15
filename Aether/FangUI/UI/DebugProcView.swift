@@ -446,6 +446,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         }
         // 顺序：上次走到哪 → 游戏最新崩溃详情 → 我们自己的 → 全部报告列表
         var rows = ["══ 上次走到 ══"]
+        rows.append("最新一步: " + MemoryProbe.latestStage())
         let stages = MemoryProbe.lastStages(8)
         rows.append(contentsOf: stages.isEmpty ? ["(无记录)"] : stages)
         rows.append("")

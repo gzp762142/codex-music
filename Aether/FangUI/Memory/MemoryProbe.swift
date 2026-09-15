@@ -276,10 +276,16 @@ final class MemoryProbe {
     // MARK: - 阶段标记（崩了之后还能知道停在哪）
 
     private static let stageFileName = "aether_stage.txt"
+    private static let stageLatestName = "aether_stage_latest.txt"
 
     private static func stageURL() -> URL? {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
             .appendingPathComponent(stageFileName)
+    }
+
+    private static func stageLatestURL() -> URL? {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
+            .appendingPathComponent(stageLatestName)
     }
 
     /// 当前阶段：后台线程写、UI 轮询读 —— 面板上能实时看到走到哪一步。
@@ -319,18 +325,29 @@ final class MemoryProbe {
         }
 
         // **同步**写盘。之前改成异步队列写过，结果进程被系统杀掉时，
-        // 队列里排队的那几行跟着一起丢了 —— 而那是我们唯一的现场
-        // （实测最后一次尝试连"检查基址"都没留下，看起来像没执行，其实执行了）。
-        // 每条只有几十字节，同步追加的代价可以接受。
-        guard let url = stageURL() else { return }
+        // 队列里排队的那几行跟着一起丢了。每条只有几十字节，同步的代价可以接受。
         let stamp = String(Int(Date().timeIntervalSince1970))
         let line = "\(stamp)  \(stage)\n"
-        if let handle = try? FileHandle(forWritingTo: url) {
-            handle.seekToEndOfFile()
-            handle.write(Data(line.utf8))
-            try? handle.close()
-        } else {
-            try? line.write(to: url, atomically: true, encoding: .utf8)
+
+        // ① 追加日志。
+        // **绝不能走 atomically:true 那条分支** —— 它是用一行覆盖整个文件，
+        // 把之前所有现场一起抹掉。实测就出现过"文件里只剩最后一行"，
+        // 让人误以为代码没往下走。这里先保证文件存在，再老老实实追加。
+        if let url = stageURL() {
+            if !FileManager.default.fileExists(atPath: url.path) {
+                FileManager.default.createFile(atPath: url.path, contents: nil)
+            }
+            if let handle = try? FileHandle(forWritingTo: url) {
+                defer { try? handle.close() }
+                handle.seekToEndOfFile()
+                handle.write(Data(line.utf8))
+            }
+        }
+
+        // ② 覆盖写的"最新状态"文件：里面永远只有最后一行。
+        // 追加那条路不管因为什么出问题，读这个文件都能知道停在哪一步。
+        if let latest = stageLatestURL() {
+            try? line.write(to: latest, atomically: false, encoding: .utf8)
         }
     }
 
@@ -340,6 +357,13 @@ final class MemoryProbe {
             return []
         }
         return text.split(separator: "\n").suffix(n).map(String.init)
+    }
+
+    /// 最新一步（覆盖写那个文件的全部内容）。
+    static func latestStage() -> String {
+        guard let url = stageLatestURL(),
+              let text = try? String(contentsOf: url, encoding: .utf8) else { return "(无)" }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// 从字节数组里读一个小端 UInt64（越界返回 0）。
