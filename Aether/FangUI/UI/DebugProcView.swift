@@ -41,6 +41,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     private let btnObjects = UIButton(type: .system)
     /// 世界：GWorld → PersistentLevel → Actors（三次小读，走热页）
     private let btnWorld = UIButton(type: .system)
+    /// 自己：LocalPlayer → PlayerController → Pawn → 坐标
+    private let btnSelf = UIButton(type: .system)
     /// 内存：读游戏的内存账本（footprint / compressed），不碰游戏内存
     private let btnMemory = UIButton(type: .system)
     /// 映射：把游戏内存 remap 进我们自己进程，之后本地读（样本的读取方式）
@@ -79,6 +81,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         // 其余按钮的声明和 action 都还留在文件里（只是不接线），要单独排查时接回来即可。
         let buttons: [(UIButton, String, Selector)] = [
             (btnWorld, "世界", #selector(onWorld)),
+            (btnSelf, "自己", #selector(onSelf)),
             (btnAuto, "跑一次", #selector(onAutoRun)),
             (btnMap, "映射", #selector(onMapProbe)),
             (btnEnum, "枚举", #selector(onEnumProbe)),
@@ -120,11 +123,12 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         crashLabel.frame = CGRect(x: w * 0.6, y: 15, width: w * 0.4, height: 14)
         probeLabel.frame = CGRect(x: 0, y: 30, width: w, height: 14)
 
-        // 8 个按钮排成 4 列 × 2 行
-        let all = [btnWorld, btnAuto, btnMap, btnEnum,
-                   btnRefresh, btnObjects, btnCrashFile, btnMemory]
+        // 9 个按钮排成 3 列 × 3 行
+        let all = [btnWorld, btnSelf, btnAuto,
+                   btnMap, btnEnum, btnRefresh,
+                   btnObjects, btnCrashFile, btnMemory]
         let gap: CGFloat = 4
-        let perRow = 4
+        let perRow = 3
         let bw = (w - gap * CGFloat(perRow - 1)) / CGFloat(perRow)
         let bh = btnRowH - 6
         for (i, b) in all.enumerated() {
@@ -134,8 +138,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
                              width: bw, height: bh)
         }
 
-        table.frame = CGRect(x: 0, y: headerH + btnRowH * 2, width: w,
-                             height: max(0, bounds.height - headerH - btnRowH * 2))
+        table.frame = CGRect(x: 0, y: headerH + btnRowH * 3, width: w,
+                             height: max(0, bounds.height - headerH - btnRowH * 3))
     }
 
     func reload() { onRefresh() }
@@ -400,6 +404,31 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     @objc private func onObjects() {
         guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
         runProbe("对象: 读取中…") { MemoryProbe.stepObjects(pid: $0) }
+    }
+
+    /// 自己：LocalPlayer → PlayerController → Pawn → 坐标。
+    /// 同样自包含 —— 缺基址自己找，缺映射按需建。
+    @objc private func onSelf() {
+        refreshProcess()
+        guard gpid != 0 else {
+            probeLabel.text = "自己: 没找到游戏进程"
+            probeLabel.textColor = warnText
+            return
+        }
+        runProbe("自己: 读取中…") { pid -> String in
+            var out: [String] = []
+            if !MemoryProbe.baseReady(for: pid) {
+                let base = MemoryProbe.stepFindBase(pid: pid)
+                out.append(base)
+                guard base.contains("✓ base=") else {
+                    out.append("→ 没拿到基址，定位不了自己")
+                    return out.joined(separator: "\n")
+                }
+                out.append("")
+            }
+            out.append(MemoryProbe.stepSelf(pid: pid))
+            return out.joined(separator: "\n")
+        }
     }
 
     /// 世界：GWorld → PersistentLevel → Actors → 认类名。

@@ -1234,8 +1234,131 @@ final class MemoryProbe {
         return lines.joined(separator: "\n")
     }
 
-    /// 单点区域归属：对 dump 基址问一次「这属于哪个文件」。
+    /// 定位自己：UWorld → GameInstance → LocalPlayers[0] → PlayerController
+    ///           → AcknowledgedPawn → RootComponent → ComponentToWorld → 坐标
     ///
+    /// 偏移全部来自同一份 dump：
+    ///   UWorld + 0xB20        → OwningGameInstance (UGameInstance*)
+    ///   UGameInstance + 0x48  → LocalPlayers (TArray<ULocalPlayer*>)
+    ///     ★ +0x80 是 bUseEncryptLocalPlayerPtr —— 这是和平精英加的反作弊：
+    ///       为 true 时 LocalPlayers 里的指针是加密的（明文那份在 +0x38
+    ///       EncryptedLocalPlayers）。所以这一环必须先读标志，再决定怎么解析。
+    ///   UPlayer + 0x30        → APlayerController*（ULocalPlayer 继承自 UPlayer）
+    ///   APlayerController + 0x660 → AcknowledgedPawn
+    ///   AActor + 0x260        → RootComponent (USceneComponent*)
+    ///   USceneComponent + 0x1F0   → ComponentToWorld (FTransform)
+    ///   FTransform + 0x10     → Translation (FVector: x, y, z 三个 float)
+    static func stepSelf(pid: Int32) -> String {
+        resetCounters()
+        stageMark("自己")
+        guard baseReady(for: pid) else {
+            return "自己: 没有当前进程的基址 —— 先点「世界」或「映射」"
+        }
+        let (kr, p) = port(for: pid)
+        guard kr == KERN_SUCCESS, p != 0 else { return "自己: 取端口失败 \(describe(kr))" }
+        defer { dropPort(p) }
+
+        let s = imageSlide
+        let off = Offsets.load()
+        var lines: [String] = []
+
+        func hex(_ v: UInt64) -> String { "0x" + String(v, radix: 16) }
+        func f32(_ b: [UInt8], _ o: Int) -> Float {
+            Float(bitPattern: UInt32(b[o]) | (UInt32(b[o + 1]) << 8)
+                | (UInt32(b[o + 2]) << 16) | (UInt32(b[o + 3]) << 24))
+        }
+
+        // ① UWorld
+        let (rkW, world) = readRaw(port: p, address: MachVmAddress(runtime(off.gWorld, slide: s)))
+        guard rkW == KERN_SUCCESS, world != 0 else {
+            return "自己: 读 GWorld 失败 \(describe(rkW))"
+        }
+        lines.append("UWorld=\(hex(world))")
+
+        // ② GameInstance
+        stageMark("自己 · GameInstance")
+        let (rkG, game) = readRaw(port: p, address: MachVmAddress(world &+ 0xB20))
+        guard rkG == KERN_SUCCESS, game != 0 else {
+            return lines.joined(separator: "\n")
+                + "\n读 OwningGameInstance 失败 \(describe(rkG)) @UWorld+0xB20"
+        }
+        lines.append("GameInstance=\(hex(game))")
+
+        // ③ 加密标志 + LocalPlayers
+        stageMark("自己 · LocalPlayers")
+        let (rkEnc, enc) = readAt(port: p, address: MachVmAddress(game &+ 0x80))
+        let encFlag = (rkEnc == KERN_SUCCESS) ? (enc & 0xFF) : 0xFF
+        lines.append("bUseEncryptLocalPlayerPtr=\(encFlag) "
+            + (encFlag == 0 ? "✓ 明文指针，可以直接用" : "⚠️ 指针被加密，这条路要另行处理"))
+
+        let (rkL, larr) = readBytes(port: p, address: MachVmAddress(game &+ 0x48), count: 16)
+        guard rkL == KERN_SUCCESS, larr.count >= 16 else {
+            return lines.joined(separator: "\n") + "\n读 LocalPlayers 失败 \(describe(rkL))"
+        }
+        let lData = u64le(larr, 0)
+        let lCount = UInt32(larr[8]) | (UInt32(larr[9]) << 8)
+            | (UInt32(larr[10]) << 16) | (UInt32(larr[11]) << 24)
+        lines.append("LocalPlayers: data=\(hex(lData)) count=\(lCount)")
+        guard lCount > 0, lData != 0 else {
+            lines.append("→ LocalPlayers 是空的：多半还在大厅，没进对局")
+            lines.append(costLine())
+            return lines.joined(separator: "\n")
+        }
+
+        // ④ ULocalPlayer
+        stageMark("自己 · ULocalPlayer")
+        let (rkLP, localPlayer) = readRaw(port: p, address: MachVmAddress(lData))
+        guard rkLP == KERN_SUCCESS, localPlayer != 0 else {
+            return lines.joined(separator: "\n") + "\n读 LocalPlayers[0] 失败 \(describe(rkLP))"
+        }
+        lines.append("LocalPlayer[0]=\(hex(localPlayer))")
+
+        // ⑤ PlayerController（UPlayer::PlayerController 在 0x30）
+        stageMark("自己 · PlayerController")
+        let (rkPC, pc) = readRaw(port: p, address: MachVmAddress(localPlayer &+ 0x30))
+        guard rkPC == KERN_SUCCESS, pc != 0 else {
+            lines.append("读 PlayerController 失败 \(describe(rkPC)) @LocalPlayer+0x30")
+            lines.append(costLine())
+            return lines.joined(separator: "\n")
+        }
+        lines.append("PlayerController=\(hex(pc))")
+
+        // ⑥ AcknowledgedPawn
+        stageMark("自己 · Pawn")
+        let (rkPawn, pawn) = readRaw(port: p, address: MachVmAddress(pc &+ 0x660))
+        guard rkPawn == KERN_SUCCESS, pawn != 0 else {
+            lines.append("读 AcknowledgedPawn 失败 \(describe(rkPawn)) @PC+0x660")
+            lines.append(costLine())
+            return lines.joined(separator: "\n")
+        }
+        lines.append("Pawn=\(hex(pawn))")
+
+        // ⑦ RootComponent
+        stageMark("自己 · 坐标")
+        let (rkRoot, root) = readRaw(port: p, address: MachVmAddress(pawn &+ 0x260))
+        guard rkRoot == KERN_SUCCESS, root != 0 else {
+            lines.append("读 RootComponent 失败 \(describe(rkRoot)) @Pawn+0x260")
+            lines.append(costLine())
+            return lines.joined(separator: "\n")
+        }
+        lines.append("RootComponent=\(hex(root))")
+
+        // ⑧ ComponentToWorld + 0x10 → FVector
+        let (rkT, tf) = readBytes(port: p, address: MachVmAddress(root &+ 0x1F0 + 0x10), count: 12)
+        guard rkT == KERN_SUCCESS, tf.count >= 12 else {
+            lines.append("读 ComponentToWorld 失败 \(describe(rkT))")
+            lines.append(costLine())
+            return lines.joined(separator: "\n")
+        }
+        let x = f32(tf, 0), y = f32(tf, 4), z = f32(tf, 8)
+        let sane = abs(x) < 1e7 && abs(y) < 1e7 && abs(z) < 1e7
+        lines.append("坐标: X=\(x)  Y=\(y)  Z=\(z) " + (sane ? "✓" : "✗ 数值异常"))
+
+        lines.append(costLine())
+        return lines.joined(separator: "\n")
+    }
+
+    /// 单点区域归属：对 dump 基址问一次「这属于哪个文件」。    ///
     /// 零风险探测：一次调用、不遍历、不写。
     /// 收益却很大 ——
     ///   返回 ShadowTrackerExtra 路径 → 该地址在游戏映像内，且符号可用
