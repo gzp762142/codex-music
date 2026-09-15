@@ -115,11 +115,43 @@ final class MemoryProbe {
 
     // MARK: - 读（全部 static：纯函数，不需要实例）
 
+    /// 本次动作触及的内存页（4KB 对齐去重）。
+    ///
+    /// 这是排查"读到游戏闪退"的唯一量化指标：
+    ///   名字池那步约 10 页 → 安全
+    ///   对象表 16 个全解（逐个读字段 + 两次名字解析）约 80 页 → 点完游戏闪退
+    /// 每次动作开头清空，报告里把页数打出来，阈值靠这个数收敛。
+    private static var touchedPages = Set<UInt64>()
+
+    /// 记一次「将要读这段地址」。按 4KB 页对齐去重。
+    private static func notePages(_ addr: UInt64, _ bytes: Int) {
+        let first = addr >> 12
+        let last = (addr &+ UInt64(bytes > 0 ? bytes - 1 : 0)) >> 12
+        var p = first
+        while p <= last {
+            touchedPages.insert(p)
+            if p == UInt64.max { return }
+            p += 1
+        }
+    }
+
+    /// 本次动作已触及的页数。
+    private static func pageCount() -> Int { touchedPages.count }
+
+    /// 从字节数组里读一个小端 UInt64（越界返回 0）。
+    private static func u64le(_ b: [UInt8], _ offset: Int) -> UInt64 {
+        guard offset >= 0, offset + 8 <= b.count else { return 0 }
+        var v: UInt64 = 0
+        for i in 0..<8 { v |= UInt64(b[offset + i]) << (8 * i) }
+        return v
+    }
+
     /// 按绝对地址读 4 字节。**只有 3 个参数**。
     /// mach_vm_region 那条路已被删除：它有两个出参，是之前连续出错的来源，
     /// 而读内存根本不需要枚举内存区。
     private static func readAt(port: MachPort, address: MachVmAddress) -> (KernReturn, UInt32) {
         guard let vmRead = vmReadFn else { return (KERN_FAILURE, 0) }
+        notePages(address, 4)
         var dataPtr: UInt = 0
         var dataLen: MachVmSize = 4
         let kr = vmRead(port, address, 4, &dataPtr, &dataLen)
@@ -135,6 +167,7 @@ final class MemoryProbe {
     /// 按绝对地址读 8 字节 —— 只给值，供程序判断用。
     private static func readRaw(port: MachPort, address: MachVmAddress) -> (KernReturn, UInt64) {
         guard let vmRead = vmReadFn else { return (KERN_FAILURE, 0) }
+        notePages(address, 8)
         var dataPtr: UInt = 0
         var dataLen: MachVmSize = 8
         let kr = vmRead(port, address, 8, &dataPtr, &dataLen)
@@ -155,6 +188,7 @@ final class MemoryProbe {
         -> (KernReturn, [UInt8]) {
         guard let vmRead = vmReadFn else { return (KERN_FAILURE, []) }
         guard count > 0, count <= 4096 else { return (KERN_FAILURE, []) }
+        notePages(address, count)
         var dataPtr: UInt = 0
         var dataLen: MachVmSize = MachVmSize(count)
         let kr = vmRead(port, address, MachVmSize(count), &dataPtr, &dataLen)
@@ -257,6 +291,7 @@ final class MemoryProbe {
     /// 验收：NumElements 是六位数（10 万 ~ 200 万）即表示 image base 与换算公式同时正确。
     /// 前提：先点过「找村口」—— base/slide 存在这份 static 状态里，不跨进程启动保留。
     static func stepFixedRead(pid: Int32) -> String {
+        touchedPages.removeAll()
         guard imageSlide != 0, imageBase != 0 else {
             return "定点读: 还没有基址 —— 先点「找村口」"
         }
@@ -312,6 +347,7 @@ final class MemoryProbe {
                 ? " 像堆指针（0x12xxxxxxx 段）"
                 : " 不像堆指针（不落在 0x120000000~0x140000000）"))
         }
+        lines.append("本次读取触及 \(pageCount()) 页（4KB 去重）")
         return lines.joined(separator: "\n")
     }
 
@@ -321,6 +357,9 @@ final class MemoryProbe {
     private static let nameEntryStringOffset: UInt64 = 0xE
     /// TNameArray 每个 chunk 的条目数（dump：ElementsPerChunk = 0x4000）。
     private static let namesPerChunk: UInt64 = 0x4000
+
+    /// 「对象」按钮的分批游标：每批详解 4 个，点一次往下走一批。
+    private static var objectCursor = 0
 
     /// 把一段字节按 hex 分行打印，偏移相对段首。
     private static func hexLines(_ bytes: [UInt8], perLine: Int = 16) -> [String] {
@@ -390,6 +429,7 @@ final class MemoryProbe {
     /// `Chunks` 是「内联指针数组」还是「指向指针数组」，各 UE4 版本不一致，
     /// 所以两种布局各解一遍，用上面三个已知答案判定 —— 不照抄、不猜。
     static func stepGNames(pid: Int32) -> String {
+        touchedPages.removeAll()
         guard imageSlide != 0, imageBase != 0 else {
             return "GNames: 还没有基址 —— 先点「找村口」"
         }
@@ -478,6 +518,7 @@ final class MemoryProbe {
             lines.append("两个布局都没命中验收标准 —— 按池头 hex 决定下一步")
         }
         lines.append("（chunk 容量 \(namesPerChunk) 条/块，索引 0/1/2 都在第 0 块，暂不需要跨块）")
+        lines.append("本次读取触及 \(pageCount()) 页（4KB 去重）")
         return lines.joined(separator: "\n")
     }
 
@@ -499,18 +540,22 @@ final class MemoryProbe {
         return readName(port: port, entry: entry)
     }
 
-    /// 对象表：从 chunk0 取前 16 个 FUObjectItem，逐个解出「类名 + 对象名」。
+    /// 对象表：批量读前 16 个 FUObjectItem，**每批只详解 4 个**。
     ///
     /// 链（偏移全部来自同一份 dump）：
     ///   item_i = items + i*0x18        FUObjectItem::Size = 0x18, Object = 0x0
     ///   class  = *(obj + 0x10)         UObject::Class
     ///   nameIX = *(obj + 0x18)         UObject::Name（FName::ComparisonIndex）
-    ///   number = *(obj + 0x1C)         FName::Number（>1 时名字显示成 Name_(Number-1)）
+    ///   number = *(obj + 0x1C)         FName::Number（>1 时显示成 Name_(Number-1)）
     ///   clsIX  = *(class + 0x18)       类的 FName
     ///
-    /// 读取量：每个对象 5 次小读 + 每次名字解析 1～2 次 —— 16 个对象约 100 次点读，
-    /// 不移动指针、不遍历全表（47 万个对象逐个读会把游戏读崩）。
+    /// 为什么收着读：上一版逐个对象读 5 处字段 + 两次名字解析，16 个全解时
+    /// 触及约 80 页 —— 点完游戏闪退了。现在改成
+    ///   ① items 数组一次读完（16×0x18 = 384 字节，1 页），拿到 16 个对象指针
+    ///   ② 每批只详解 4 个，点一次往下走一批（游标存在 static 里）
+    /// 每次点击的代价降到 1/4 以下，且报告里直接把触及页数打出来。
     static func stepObjects(pid: Int32) -> String {
+        touchedPages.removeAll()
         guard imageSlide != 0, imageBase != 0 else {
             return "对象: 还没有基址 —— 先点「找村口」"
         }
@@ -539,15 +584,35 @@ final class MemoryProbe {
             return "对象: items 指针读失败 \(describe(rkItems))"
         }
 
-        let n = min(Int(num), 16)
-        var lines: [String] = []
-        lines.append("对象: NumElements=\(num)  items=0x\(String(items, radix: 16))  取前 \(n) 个")
+        // ① items 数组一次读完：逐项读是 16 次 mach_vm_read，数据在同一页，
+        //    调用次数与内核里的 copy 分配却翻 16 倍，没有意义。
+        let listCount = min(Int(num), 16)
+        let (rkBuf, buf) = readBytes(port: p, address: MachVmAddress(items), count: listCount * 0x18)
+        guard rkBuf == KERN_SUCCESS else {
+            return "对象: items 数组读取失败 \(describe(rkBuf))"
+        }
+        var objs: [UInt64] = []
+        for i in 0..<listCount {
+            objs.append(u64le(buf, i * 0x18))     // FUObjectItem::Object = 0x0
+        }
 
-        for i in 0..<n {
-            let itemAddr = items &+ UInt64(i) * 0x18
-            let (rkObj, obj) = readRaw(port: p, address: MachVmAddress(itemAddr))
-            guard rkObj == KERN_SUCCESS, obj != 0 else {
-                lines.append("[\(i)] 空槽或读失败 \(describe(rkObj))")
+        // ② 分批详解：游标轮转，点一次走一批
+        let batch = 4
+        let start = objectCursor % max(1, listCount)
+        let stop = min(start + batch, listCount)
+        objectCursor = (stop >= listCount) ? 0 : stop
+
+        var lines: [String] = []
+        lines.append("对象: NumElements=\(num)  items=0x\(String(items, radix: 16))  "
+            + "本批 [\(start)..\(stop - 1)] / 列表 \(listCount)")
+        for i in 0..<listCount {
+            let obj = objs[i]
+            guard obj != 0 else {
+                lines.append("[\(i)] (空槽)")
+                continue
+            }
+            guard i >= start, i < stop else {
+                lines.append("[\(i)] 0x\(String(obj, radix: 16))   （只列指针）")
                 continue
             }
             let (rkCls, cls) = readRaw(port: p, address: MachVmAddress(obj &+ 0x10))
@@ -575,9 +640,9 @@ final class MemoryProbe {
             } else {
                 objName = "Name读失败 \(describe(rkName))"
             }
-
             lines.append("[\(i)] \(clsName)  \(objName)   @0x\(String(obj, radix: 16))")
         }
+        lines.append("本批触及 \(pageCount()) 页（4KB 去重）· 再点一次继续下一批")
         return lines.joined(separator: "\n")
     }
 
@@ -661,6 +726,7 @@ final class MemoryProbe {
     /// 游戏路径，二分因此完全失效（会出现负 slide 这种不可能的结果）。
     /// 所以必须有 region 边界信息，只能靠枚举。
     static func stepFindBase(pid: Int32) -> String {
+        touchedPages.removeAll()
         guard vmRegionRecurseFn != nil else { return "找基址: vm_region_recurse_64 符号缺失" }
         guard procRegionFileNameFn != nil else { return "找基址: proc_regionfilename 符号缺失" }
 
@@ -738,6 +804,7 @@ final class MemoryProbe {
             lines.append("\(name)\(pad)0x\(String(staticAddr, radix: 16)) → 0x\(String(r, radix: 16)) "
                 + (inside ? "✓" : "✗越界"))
         }
+        lines.append("（找基址本身不读游戏内存，这里只统计 Mach-O 头校验的 \(pageCount()) 页）")
         return lines.joined(separator: "\n")
     }
 }

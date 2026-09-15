@@ -267,10 +267,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
             probeLabel.textColor = idleText
             return
         }
-        // 顺序：先列全部 .ips → 再游戏最新崩溃详情（最关键）→ 最后我们自己的
-        var rows = CrashLogReader.listReports(limit: 16)
-        rows.append("")
-        rows.append("══ 游戏最新崩溃 ══")
+        // 顺序：游戏最新崩溃详情放最前（正在排查的就是它）→ 我们自己的 → 全部报告列表
+        var rows = ["══ 游戏最新崩溃 ══"]
         rows.append(contentsOf: CrashLogReader.crashDetail(for: "ShadowTrackerExtra"))
         rows.append("")
         rows.append("══ Music 最新崩溃 ══")
@@ -279,6 +277,9 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         } else {
             rows.append("(无)")
         }
+        rows.append("")
+        rows.append("══ 全部报告 ══")
+        rows.append(contentsOf: CrashLogReader.listReports(limit: 16))
         extraRows = rows
         table.reloadData()
         probeLabel.text = "崩溃报告 \(rows.count) 行已填入列表（可滚动）"
