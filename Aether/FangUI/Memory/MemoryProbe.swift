@@ -1103,34 +1103,45 @@ final class MemoryProbe {
 
     /// 只枚举 6 个 region，把原始字段全打出来 —— 专门验证这次调用本身对不对。
     ///
-    /// 它不找基址、不读内存、不做任何多余的事。判断规则：
-    ///   能返回 → vm_region_64 本身没问题，卡点在别处，继续往下切
-    ///   卡住   → 就是这次调用的问题（参数 / 符号 / 这个 API 在本机的行为）
-    ///
-    /// 先对自己进程来一次：参数写错的话会立刻暴露，而且完全不碰游戏。
+    /// **逐段自报**：每一步都写标记 + 一行结果。卡在哪一段，屏幕上就停在哪一段 ——
+    /// 前一版只有一个"枚举 · 开始"，卡住了也看不出是函数没进、还是某一行动不了。
     static func stepRegionProbe(pid: Int32) -> String {
-        resetCounters()
-        stageMark("枚举 · 开始")
-        guard vmRegion64Fn != nil else { return "枚举: vm_region_64 符号缺失" }
-
         var lines: [String] = []
-        lines.append("枚举自检: flavor=9(BASIC_INFO_64) infoCnt=8 object_name 走出参")
 
-        stageMark("枚举 · 对自己进程")
-        var selfAddr: UInt64 = 0x100000000
-        let selfR = nextRegion(task: mach_task_self_, addr: &selfAddr)
-        lines.append("对自己(0x100000000): ok=\(selfR.ok) size=0x\(String(selfR.size, radix: 16)) "
-            + "prot=\(selfR.prot) off=0x\(String(selfR.offset, radix: 16))")
+        stageMark("枚举 · A 函数已进入")
+        lines.append("A 函数已进入 ✓（参数 pid=\(pid)）")
 
-        stageMark("枚举 · 取端口")
+        resetCounters()
+        stageMark("枚举 · B 计数清零完成")
+        lines.append("B resetCounters 完成 ✓")
+
+        guard let fn = vmRegion64Fn else {
+            return lines.joined(separator: "\n") + "\nC ✗ vm_region_64 符号缺失"
+        }
+        _ = fn
+        stageMark("枚举 · C 符号已取到")
+        lines.append("C vm_region_64 符号 ✓")
+
+        stageMark("枚举 · D 取端口前")
         let (kr, p) = port(for: pid)
         guard kr == KERN_SUCCESS, p != 0 else {
-            return lines.joined(separator: "\n") + "\n取端口失败 \(describe(kr))"
+            return lines.joined(separator: "\n") + "\nD ✗ 取端口失败 \(describe(kr))"
         }
         defer { dropPort(p) }
+        stageMark("枚举 · D 端口已拿到")
+        lines.append("D 端口已拿到 ✓ port=0x\(String(p, radix: 16))")
 
+        // 第一次调用：只调一次，不做循环
+        stageMark("枚举 · E 第一次调用前")
         var addr: UInt64 = 0x100000000
-        for i in 0..<6 {
+        let first = nextRegion(task: p, addr: &addr)
+        stageMark("枚举 · E 第一次调用已返回")
+        lines.append("E 第一次调用返回 ✓ ok=\(first.ok) size=0x\(String(first.size, radix: 16)) "
+            + "prot=\(first.prot) off=0x\(String(first.offset, radix: 16))")
+
+        // 再走几个
+        var i = 1
+        while i < 6 {
             stageMark("枚举 · 第 \(i) 个")
             let r = nextRegion(task: p, addr: &addr)
             lines.append("[\(i)] addr=0x\(String(addr, radix: 16)) ok=\(r.ok) "
@@ -1138,6 +1149,7 @@ final class MemoryProbe {
             if !r.ok { break }
             addr += r.size
             if addr < r.size { break }
+            i += 1
         }
         lines.append(costLine())
         return lines.joined(separator: "\n")
@@ -1205,7 +1217,7 @@ final class MemoryProbe {
         var size: UInt64 = 0
         var objectName: UInt32 = 0
         var info = [Int32](repeating: 0, count: 16)
-        var count: UInt32 = 8               // VM_REGION_BASIC_INFO_COUNT_64
+        var count: UInt32 = 9               // 样本传的就是 9，不是 8
         let kr = info.withUnsafeMutableBytes { buf -> Int32 in
             guard let base = buf.baseAddress else { return KERN_FAILURE }
             return fn(task, &addr, &size, 9, base, &count, &objectName)
