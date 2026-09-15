@@ -646,6 +646,59 @@ final class MemoryProbe {
         return lines.joined(separator: "\n")
     }
 
+    /// 世界链：GWorld → PersistentLevel → Actors（三次小读，个位数页）。
+    ///
+    /// 这条链刻意**绕开对象表**。理由在崩溃报告里：
+    ///   对象表那步触及约 80 页（对象字段多是冷页）→ 点完游戏 SIGSEGV，
+    ///   而 GWorld / UWorld / ULevel 是游戏每一帧都在用的热页，读取不改变驻留图。
+    ///
+    ///   UWorld = *(GWorld槽)
+    ///   UWorld + 0xB8 → PersistentLevel (ULevel*)
+    ///   ULevel + 0xA0 → Actors TArray { data*(8) count(4) max(4) }
+    static func stepWorld(pid: Int32) -> String {
+        touchedPages.removeAll()
+        guard imageSlide != 0, imageBase != 0 else {
+            return "世界: 还没有基址 —— 先点「找村口」"
+        }
+        let (kr, p) = port(for: pid)
+        guard kr == KERN_SUCCESS, p != 0 else { return "世界: 取端口失败 \(describe(kr))" }
+
+        let s = imageSlide
+        let slot = runtime(Offsets.load().gWorld, slide: s)
+        var lines: [String] = []
+        lines.append("世界: GWorld槽 0x\(String(slot, radix: 16))")
+
+        // ① UWorld
+        let (rkWorld, world) = readRaw(port: p, address: MachVmAddress(slot))
+        guard rkWorld == KERN_SUCCESS, world != 0 else {
+            return "世界: 读 GWorld 失败 \(describe(rkWorld)) @0x\(String(slot, radix: 16))"
+        }
+        lines.append("  UWorld=0x\(String(world, radix: 16))"
+            + (world < 0x100000000 ? "  ✗ 不像指针" : "  ✓"))
+
+        // ② PersistentLevel
+        let (rkLevel, level) = readRaw(port: p, address: MachVmAddress(world &+ 0xB8))
+        guard rkLevel == KERN_SUCCESS, level != 0 else {
+            return "世界: 读 PersistentLevel 失败 \(describe(rkLevel)) @UWorld+0xB8"
+        }
+        lines.append("  PersistentLevel=0x\(String(level, radix: 16))"
+            + (level < 0x100000000 ? "  ✗ 不像指针" : "  ✓"))
+
+        // ③ Actors TArray：裸指针 + count + max，一次读 16 字节
+        let (rkArr, arr) = readBytes(port: p, address: MachVmAddress(level &+ 0xA0), count: 16)
+        guard rkArr == KERN_SUCCESS, arr.count >= 16 else {
+            return "世界: 读 Actors TArray 失败 \(describe(rkArr)) @ULevel+0xA0"
+        }
+        let dataPtr = u64le(arr, 0)
+        let count = UInt32(arr[8]) | (UInt32(arr[9]) << 8) | (UInt32(arr[10]) << 16) | (UInt32(arr[11]) << 24)
+        let cap = UInt32(arr[12]) | (UInt32(arr[13]) << 8) | (UInt32(arr[14]) << 16) | (UInt32(arr[15]) << 24)
+        let sane = (count > 0 && count <= 200_000 && count <= cap)
+        lines.append("  Actors: data=0x\(String(dataPtr, radix: 16))  count=\(count)  max=\(cap)  "
+            + (sane ? "✓ 数量合理" : "✗ 数量异常"))
+        lines.append("本次读取触及 \(pageCount()) 页（4KB 去重）· 对照：对象表那步约 80 页")
+        return lines.joined(separator: "\n")
+    }
+
     /// 单点区域归属：对 dump 基址问一次「这属于哪个文件」。
     ///
     /// 零风险探测：一次调用、不遍历、不写。

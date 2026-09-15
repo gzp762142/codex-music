@@ -37,6 +37,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     private let btnNames = UIButton(type: .system)
     /// 对象：从对象表取前 16 个，解出「类名 + 对象名」
     private let btnObjects = UIButton(type: .system)
+    /// 世界：GWorld → PersistentLevel → Actors（三次小读，走热页）
+    private let btnWorld = UIButton(type: .system)
     /// 读模块头：dump 基址处读 Mach-O，判断 ASLR 是否搬过基址
     /// 扫基址：128MB 内找 Mach-O magic（比上一版范围小）
     private let btnScan = UIButton(type: .system)
@@ -72,6 +74,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
             (btnFixed, "定点读", #selector(onFixedRead)),
             (btnNames, "名字", #selector(onNames)),
             (btnObjects, "对象", #selector(onObjects)),
+            (btnWorld, "世界", #selector(onWorld)),
             (btnRegion, "区域归属", #selector(onRegionName)),
             (btnScan, "找村口", #selector(onFindBase)),
             (btnRefresh, "刷新", #selector(onRefresh)),
@@ -112,11 +115,12 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         crashLabel.frame = CGRect(x: w * 0.6, y: 15, width: w * 0.4, height: 14)
         probeLabel.frame = CGRect(x: 0, y: 30, width: w, height: 14)
 
-        // 12 个按钮排成 6 列 × 2 行
-        let all = [btnSym, btnDlsym, btnProof, btnFixed, btnNames, btnObjects,
-                   btnScan, btnRefresh, btnCrashFile, btnSilent, btnJetsam, btnRegion]
+        // 13 个按钮排成 5 列 × 3 行（列变宽，长标题「崩溃文件」不再被压）
+        let all = [btnSym, btnDlsym, btnProof, btnFixed, btnNames,
+                   btnObjects, btnWorld, btnScan, btnRefresh, btnCrashFile,
+                   btnSilent, btnJetsam, btnRegion]
         let gap: CGFloat = 4
-        let perRow = 6
+        let perRow = 5
         let bw = (w - gap * CGFloat(perRow - 1)) / CGFloat(perRow)
         let bh = btnRowH - 6
         for (i, b) in all.enumerated() {
@@ -126,8 +130,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
                              width: bw, height: bh)
         }
 
-        table.frame = CGRect(x: 0, y: headerH + btnRowH * 2, width: w,
-                             height: max(0, bounds.height - headerH - btnRowH * 2))
+        table.frame = CGRect(x: 0, y: headerH + btnRowH * 3, width: w,
+                             height: max(0, bounds.height - headerH - btnRowH * 3))
     }
 
     func reload() { onRefresh() }
@@ -257,6 +261,12 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     @objc private func onObjects() {
         guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
         showReport(MemoryProbe.stepObjects(pid: gpid))
+    }
+
+    /// 世界：GWorld → PersistentLevel → Actors（三次小读，走热页）。
+    @objc private func onWorld() {
+        guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
+        showReport(MemoryProbe.stepWorld(pid: gpid))
     }
 
     @objc private func onCrashFile() {
