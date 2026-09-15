@@ -297,8 +297,8 @@ final class MemoryProbe {
     ///
     /// 三条自我约束：只映射 ≥ minSize 的块（避开碎片）、硬性时间预算、每若干轮确认目标还活着。
     @discardableResult
-    static func mapAllRegions(pid: Int32, minSize: UInt64 = 1 << 20,
-                              budget: TimeInterval = 2.5, maxBlocks: Int = 400) -> String {
+    static func mapAllRegions(pid: Int32, minSize: UInt64 = 256 << 10,
+                              budget: TimeInterval = 2.5, maxBlocks: Int = 600) -> String {
         guard let fn = machVmRemapFn else { return "预映射: mach_vm_remap 符号缺失" }
         let (kr, p) = port(for: pid)
         guard kr == KERN_SUCCESS, p != 0 else { return "预映射: 取端口失败 \(describe(kr))" }
@@ -385,7 +385,7 @@ final class MemoryProbe {
         }
 
         // 没命中：按需映射一次（块数设上限，避免地图无限膨胀）
-        if activePid != 0, mappedRanges.count < 512 {
+        if activePid != 0, mappedRanges.count < 2048 {
             let before = mappedRanges.count
             mapRegionContaining(pid: activePid, address: address)
             if mappedRanges.count > before { onDemandMaps += 1 }
@@ -1322,9 +1322,26 @@ final class MemoryProbe {
             lines.append("角色: \(charActors.count) 个 —— 每个都是客户端手上真实存在的身体")
             for (i, a) in charActors.prefix(24).enumerated() {
                 let home = charHomes[a] ?? "?"
+                var extra = ""
+                // 身份：APawn + 0x608 → AController，再读 APlayerController + 0xA8C
+                // 的 bIsLocalPlayerController。这条路不碰 LocalPlayers，不受加密影响。
+                let (rkC, ctrl) = readRaw(port: p, address: MachVmAddress(a &+ 0x608))
+                if rkC == KERN_SUCCESS, ctrl > 0x100000000 {
+                    let (rkL, lf) = readAt(port: p, address: MachVmAddress(ctrl &+ 0xA8C))
+                    if rkL == KERN_SUCCESS {
+                        extra += "  local=\(lf & 0xFF)"
+                        if (lf & 0xFF) == 1 { extra += " ★这是你" }
+                    }
+                }
+                // 名字：APawn + 0x5F0 → APlayerState，再从 PlayerState + 0x5D8 读 FString
+                let (rkPS, ps) = readRaw(port: p, address: MachVmAddress(a &+ 0x5F0))
+                if rkPS == KERN_SUCCESS, ps > 0x100000000 {
+                    let nm = readText(port: p, addr: ps &+ 0x5D8)
+                    if !nm.isEmpty { extra += "  \"\(nm)\"" }
+                }
                 let (rkR, root) = readRaw(port: p, address: MachVmAddress(a &+ 0x260))
                 guard rkR == KERN_SUCCESS, root > 0x100000000 else {
-                    lines.append("  [\(i)] @\(hexOf(a)) [\(home)]  RootComponent 无效")
+                    lines.append("  [\(i)] @\(hexOf(a)) [\(home)]  RootComponent 无效" + extra)
                     continue
                 }
                 let (rkT, tf) = readBytes(port: p, address: MachVmAddress(root &+ 0x1F0 + 0x10), count: 12)
@@ -1332,9 +1349,9 @@ final class MemoryProbe {
                     let x = floatAt(tf, 0), y = floatAt(tf, 4), z = floatAt(tf, 8)
                     let ok = (x != 0 || y != 0) && abs(x) < 5e6 && abs(y) < 5e6 && abs(z) < 1e5
                     lines.append("  [\(i)] @\(hexOf(a)) [\(home)]  Loc=(\(fmt1(x)), \(fmt1(y)), \(fmt1(z))) "
-                        + (ok ? "✓" : "✗ 量级不对"))
+                        + (ok ? "✓" : "✗ 量级不对") + extra)
                 } else {
-                    lines.append("  [\(i)] @\(hexOf(a)) [\(home)]  ComponentToWorld 读失败 \(describe(rkT))")
+                    lines.append("  [\(i)] @\(hexOf(a)) [\(home)]  ComponentToWorld 读失败 \(describe(rkT))" + extra)
                 }
             }
         }
