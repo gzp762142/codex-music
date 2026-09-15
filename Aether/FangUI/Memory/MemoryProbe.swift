@@ -953,6 +953,15 @@ final class MemoryProbe {
     ///   UWorld = *(GWorld槽)
     ///   UWorld + 0xB8 → PersistentLevel (ULevel*)
     ///   ULevel + 0xA0 → Actors TArray { data*(8) count(4) max(4) }
+    /// 世界链 + Actor 列表：GWorld → PersistentLevel → Actors，然后逐个认类名。
+    ///
+    /// 这是通往玩家的正路 —— 完全不碰那 46 万个对象的对象表。
+    /// 偏移来自同一份 dump：
+    ///   UWorld + 0xB8 → PersistentLevel (ULevel*)
+    ///   ULevel + 0xA0 → Actors (TArray<AActor*>: 指针8 + count4 + max4)
+    ///   每个 actor：Class(0x10) → 类的 FName(0x18) → 名字池
+    ///
+    /// 读取全部走映射（vm_remap 之后是本地内存读），所以这里可以放心多读几个。
     static func stepWorld(pid: Int32) -> String {
         resetCounters()
         stageMark("世界")
@@ -964,41 +973,77 @@ final class MemoryProbe {
         defer { dropPort(p) }
 
         let s = imageSlide
-        let slot = runtime(Offsets.load().gWorld, slide: s)
+        let off = Offsets.load()
         var lines: [String] = []
-        lines.append("世界: GWorld槽 0x\(String(slot, radix: 16))")
+
+        // 解类名要用名字池
+        let (rkPool, pool) = readRaw(port: p, address: MachVmAddress(runtime(off.gNames, slide: s)))
+        guard rkPool == KERN_SUCCESS, pool != 0 else {
+            return "世界: 名字池槽读取失败 \(describe(rkPool))"
+        }
+        let (rkChunk, nameChunk0) = readRaw(port: p, address: MachVmAddress(pool))
+        guard rkChunk == KERN_SUCCESS, nameChunk0 != 0 else {
+            return "世界: 名字池 chunk0 读取失败 \(describe(rkChunk))"
+        }
 
         // ① UWorld
-        stageMark("世界 · 读 UWorld")
-        let (rkWorld, world) = readRaw(port: p, address: MachVmAddress(slot))
-        guard rkWorld == KERN_SUCCESS, world != 0 else {
-            return "世界: 读 GWorld 失败 \(describe(rkWorld)) @0x\(String(slot, radix: 16))"
+        stageMark("世界 · UWorld")
+        let (rkW, world) = readRaw(port: p, address: MachVmAddress(runtime(off.gWorld, slide: s)))
+        guard rkW == KERN_SUCCESS, world != 0 else {
+            return "世界: 读 GWorld 失败 \(describe(rkW))"
         }
-        lines.append("  UWorld=0x\(String(world, radix: 16))"
-            + (world < 0x100000000 ? "  ✗ 不像指针" : "  ✓"))
+        lines.append("UWorld=0x\(String(world, radix: 16))")
 
         // ② PersistentLevel
-        stageMark("世界 · 读 PersistentLevel")
-        let (rkLevel, level) = readRaw(port: p, address: MachVmAddress(world &+ 0xB8))
-        guard rkLevel == KERN_SUCCESS, level != 0 else {
-            return "世界: 读 PersistentLevel 失败 \(describe(rkLevel)) @UWorld+0xB8"
+        stageMark("世界 · PersistentLevel")
+        let (rkL, level) = readRaw(port: p, address: MachVmAddress(world &+ 0xB8))
+        guard rkL == KERN_SUCCESS, level != 0 else {
+            return lines.joined(separator: "\n") + "\n读 PersistentLevel 失败 \(describe(rkL))"
         }
-        lines.append("  PersistentLevel=0x\(String(level, radix: 16))"
-            + (level < 0x100000000 ? "  ✗ 不像指针" : "  ✓"))
+        lines.append("PersistentLevel=0x\(String(level, radix: 16))")
 
-        // ③ Actors TArray：裸指针 + count + max，一次读 16 字节
-        stageMark("世界 · 读 Actors")
-        let (rkArr, arr) = readBytes(port: p, address: MachVmAddress(level &+ 0xA0), count: 16)
-        guard rkArr == KERN_SUCCESS, arr.count >= 16 else {
-            return "世界: 读 Actors TArray 失败 \(describe(rkArr)) @ULevel+0xA0"
+        // ③ Actors TArray
+        stageMark("世界 · Actors")
+        let (rkA, arr) = readBytes(port: p, address: MachVmAddress(level &+ 0xA0), count: 16)
+        guard rkA == KERN_SUCCESS, arr.count >= 16 else {
+            return lines.joined(separator: "\n") + "\n读 Actors TArray 失败 \(describe(rkA))"
         }
         let dataPtr = u64le(arr, 0)
-        let count = UInt32(arr[8]) | (UInt32(arr[9]) << 8) | (UInt32(arr[10]) << 16) | (UInt32(arr[11]) << 24)
-        let cap = UInt32(arr[12]) | (UInt32(arr[13]) << 8) | (UInt32(arr[14]) << 16) | (UInt32(arr[15]) << 24)
-        let sane = (count > 0 && count <= 200_000 && count <= cap)
-        lines.append("  Actors: data=0x\(String(dataPtr, radix: 16))  count=\(count)  max=\(cap)  "
+        let count = UInt32(arr[8]) | (UInt32(arr[9]) << 8)
+            | (UInt32(arr[10]) << 16) | (UInt32(arr[11]) << 24)
+        let cap = UInt32(arr[12]) | (UInt32(arr[13]) << 8)
+            | (UInt32(arr[14]) << 16) | (UInt32(arr[15]) << 24)
+        let sane = (count > 0 && count <= 200_000 && count <= cap && dataPtr != 0)
+        lines.append("Actors: data=0x\(String(dataPtr, radix: 16)) count=\(count) max=\(cap) "
             + (sane ? "✓ 数量合理" : "✗ 数量异常"))
-        lines.append(costLine() + " · 对照：对象表那步约 128 次调用")
+        guard sane else {
+            lines.append(costLine())
+            return lines.joined(separator: "\n")
+        }
+
+        // ④ 逐个认类名（最多 12 个）
+        stageMark("世界 · 遍历 Actor")
+        let n = min(Int(count), 12)
+        let (rkBuf, buf) = readBytes(port: p, address: MachVmAddress(dataPtr), count: n * 8)
+        guard rkBuf == KERN_SUCCESS, buf.count >= n * 8 else {
+            lines.append("读 actor 指针数组失败 \(describe(rkBuf))")
+            lines.append(costLine())
+            return lines.joined(separator: "\n")
+        }
+        for i in 0..<n {
+            let actor = u64le(buf, i * 8)
+            guard actor != 0 else { continue }
+            let (rkCls, cls) = readRaw(port: p, address: MachVmAddress(actor &+ 0x10))
+            var clsName = "(类指针无效)"
+            if rkCls == KERN_SUCCESS, cls != 0 {
+                let (rkIX, clsIX) = readAt(port: p, address: MachVmAddress(cls &+ 0x18))
+                if rkIX == KERN_SUCCESS {
+                    clsName = resolveName(port: p, pool: pool, chunk0: nameChunk0, index: clsIX)
+                }
+            }
+            lines.append("[\(i)] \(clsName)  @0x\(String(actor, radix: 16))")
+        }
+        lines.append(costLine())
         return lines.joined(separator: "\n")
     }
 
