@@ -26,6 +26,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     private let crashLabel = UILabel()
     private let table = UITableView(frame: .zero, style: .plain)
 
+    /// 跑一次：刷新 → 找村口 → 世界 → 名字池，一条链自动走完
+    private let btnAuto = UIButton(type: .system)
     private let btnRefresh = UIButton(type: .system)
     private let btnSym = UIButton(type: .system)
     private let btnDlsym = UIButton(type: .system)
@@ -69,21 +71,14 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         }
         hitLabel.font = .monospacedSystemFont(ofSize: 11, weight: .medium)
 
+        // 面板只留 5 个。主链已经验证过了，不需要再一步步点 ——
+        // 其余按钮的声明和 action 都还留在文件里（只是不接线），要单独排查时接回来即可。
         let buttons: [(UIButton, String, Selector)] = [
-            (btnSym, "符号", #selector(onSym)),
-            (btnDlsym, "dlsym", #selector(onDlsym)),
-            (btnProof, "读证", #selector(onProof)),
-            (btnFixed, "定点读", #selector(onFixedRead)),
-            (btnNames, "名字", #selector(onNames)),
-            (btnObjects, "对象", #selector(onObjects)),
-            (btnWorld, "世界", #selector(onWorld)),
-            (btnMemory, "内存", #selector(onMemory)),
-            (btnRegion, "区域归属", #selector(onRegionName)),
-            (btnScan, "找村口", #selector(onFindBase)),
+            (btnAuto, "跑一次", #selector(onAutoRun)),
             (btnRefresh, "刷新", #selector(onRefresh)),
+            (btnObjects, "对象", #selector(onObjects)),
             (btnCrashFile, "崩溃文件", #selector(onCrashFile)),
-            (btnSilent, "静默", #selector(onSilent)),
-            (btnJetsam, "Jetsam", #selector(onJetsam))
+            (btnMemory, "内存", #selector(onMemory))
         ]
         for (b, title, sel) in buttons {
             b.setTitle(title, for: .normal)
@@ -118,10 +113,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         crashLabel.frame = CGRect(x: w * 0.6, y: 15, width: w * 0.4, height: 14)
         probeLabel.frame = CGRect(x: 0, y: 30, width: w, height: 14)
 
-        // 14 个按钮排成 5 列 × 3 行
-        let all = [btnSym, btnDlsym, btnProof, btnFixed, btnNames,
-                   btnObjects, btnWorld, btnMemory, btnScan, btnRefresh,
-                   btnCrashFile, btnSilent, btnJetsam, btnRegion]
+        let all = [btnAuto, btnRefresh, btnObjects, btnCrashFile, btnMemory]
         let gap: CGFloat = 4
         let perRow = 5
         let bw = (w - gap * CGFloat(perRow - 1)) / CGFloat(perRow)
@@ -133,8 +125,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
                              width: bw, height: bh)
         }
 
-        table.frame = CGRect(x: 0, y: headerH + btnRowH * 3, width: w,
-                             height: max(0, bounds.height - headerH - btnRowH * 3))
+        table.frame = CGRect(x: 0, y: headerH + btnRowH, width: w,
+                             height: max(0, bounds.height - headerH - btnRowH))
     }
 
     func reload() { onRefresh() }
@@ -193,7 +185,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
 
     // MARK: - 单步动作
 
-    @objc private func onRefresh() {
+    /// 重扫进程、刷新顶部三行状态。返回后 gpid 就是最新的。
+    private func refreshProcess() {
         scanner.invalidate()
         entries = scanner.scan()
         gpid = scanner.findGamePID(forceRefresh: true) ?? 0
@@ -214,9 +207,44 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         } else {
             crashLabel.text = "自记:无"
         }
+    }
+
+    /// 一键跑完整条链：刷新 → 找村口 → 世界 → 名字池。
+    ///
+    /// 约 15 次 mach_vm_read，远低于会把游戏推崩的量级（实测 128 次才出事），
+    /// 所以串起来跑是安全的。哪一步断了就停在哪一步，报告里会写清楚。
+    /// 之所以能这么干，是因为这条链的每一段都已经单独验证过了 ——
+    /// 之前必须一步步点，是因为当时不知道哪一步会崩。
+    @objc private func onAutoRun() {
+        refreshProcess()
+        guard gpid != 0 else {
+            probeLabel.text = "自动: 没找到游戏进程"
+            probeLabel.textColor = warnText
+            return
+        }
+        runProbe("自动: 找村口 → 世界 → 名字池…") { pid -> String in
+            var out: [String] = []
+            let base = MemoryProbe.stepFindBase(pid: pid)
+            out.append(base)
+            guard base.contains("✓ base=") else {
+                out.append("→ 停在这里：基址没拿到，后面的步骤没有意义")
+                return out.joined(separator: "\n")
+            }
+            out.append("")
+            out.append(MemoryProbe.stepWorld(pid: pid))
+            out.append("")
+            out.append(MemoryProbe.stepGNames(pid: pid))
+            return out.joined(separator: "\n")
+        }
+    }
+
+    @objc private func onRefresh() {
+        refreshProcess()
         // 刷新 = 回进程列表（报告是上一次动作的产物，不该一直占着列表）
         extraRows = []
         table.reloadData()
+        probeLabel.text = gpid != 0 ? "已刷新 pid=\(gpid)" : "没找到游戏进程"
+        probeLabel.textColor = gpid != 0 ? accent : warnText
     }
 
     @objc private func onSym() {
