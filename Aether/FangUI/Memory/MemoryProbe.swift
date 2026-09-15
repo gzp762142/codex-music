@@ -155,6 +155,41 @@ final class MemoryProbe {
         "本次读取: \(probeCalls) 次 mach_vm_read · 触及 \(touchedPages.count) 页（4KB 去重）"
     }
 
+    // MARK: - 阶段标记（崩了之后还能知道停在哪）
+
+    private static let stageFileName = "aether_stage.txt"
+
+    private static func stageURL() -> URL? {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
+            .appendingPathComponent(stageFileName)
+    }
+
+    /// 把当前步骤落盘。
+    ///
+    /// 进程内的崩溃日志靠不住：被系统直接杀掉时（jetsam、watchdog、SIGKILL）
+    /// 信号处理器没有机会跑，什么都留不下。所以进度必须落盘 ——
+    /// 崩了之后重开 app，读这个文件就知道上一次停在哪一步。
+    static func stageMark(_ stage: String) {
+        guard let url = stageURL() else { return }
+        let stamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+        let line = "\(stamp)  \(stage)\n"
+        if let handle = try? FileHandle(forWritingTo: url) {
+            defer { try? handle.close() }
+            handle.seekToEndOfFile()
+            handle.write(Data(line.utf8))
+        } else {
+            try? line.write(to: url, atomically: true, encoding: .utf8)
+        }
+    }
+
+    /// 读回最后几行阶段记录。确认调用方也用它（stageMark 是 private 的配对）。
+    static func lastStages(_ n: Int = 6) -> [String] {
+        guard let url = stageURL(), let text = try? String(contentsOf: url, encoding: .utf8) else {
+            return []
+        }
+        return text.split(separator: "\n").suffix(n).map(String.init)
+    }
+
     /// 从字节数组里读一个小端 UInt64（越界返回 0）。
     private static func u64le(_ b: [UInt8], _ offset: Int) -> UInt64 {
         guard offset >= 0, offset + 8 <= b.count else { return 0 }
@@ -336,6 +371,7 @@ final class MemoryProbe {
     /// 前提：先点过「找村口」—— base/slide 存在这份 static 状态里，不跨进程启动保留。
     static func stepFixedRead(pid: Int32) -> String {
         resetCounters()
+        stageMark("定点读")
         guard baseReady(for: pid) else {
             return "定点读: 没有当前进程的基址 —— 先点「找村口」"
         }
@@ -475,6 +511,7 @@ final class MemoryProbe {
     /// 所以两种布局各解一遍，用上面三个已知答案判定 —— 不照抄、不猜。
     static func stepGNames(pid: Int32) -> String {
         resetCounters()
+        stageMark("名字")
         guard baseReady(for: pid) else {
             return "GNames: 没有当前进程的基址 —— 先点「找村口」"
         }
@@ -486,6 +523,7 @@ final class MemoryProbe {
         let slotAddr = runtime(Offsets.load().gNames, slide: s)
 
         // ① 槽 → 名字池
+        stageMark("名字 · 读池槽")
         let (rkPool, pool) = readRaw(port: p, address: MachVmAddress(slotAddr))
         guard rkPool == KERN_SUCCESS, pool != 0 else {
             return "GNames: 槽 0x\(String(slotAddr, radix: 16)) 读失败 \(describe(rkPool))"
@@ -495,6 +533,7 @@ final class MemoryProbe {
         lines.append("GNames: 槽 0x\(String(slotAddr, radix: 16)) → pool=0x\(String(pool, radix: 16))")
 
         // ② 池头 hex：先看清布局，再决定解哪一层
+        stageMark("名字 · 读池头")
         let (rkHead, head) = readBytes(port: p, address: MachVmAddress(pool), count: 0x40)
         if rkHead == KERN_SUCCESS, !head.isEmpty {
             lines.append("池头 0x40 字节（偏移相对 pool）:")
@@ -514,6 +553,7 @@ final class MemoryProbe {
         }
 
         // ③ 两种布局各解一遍，用已知答案判定
+        stageMark("名字 · 解候选")
         let (rkA, lvlA) = readRaw(port: p, address: MachVmAddress(pool))
         let (rkB, lvlB) = (rkA == KERN_SUCCESS)
             ? readRaw(port: p, address: MachVmAddress(lvlA))
@@ -602,6 +642,7 @@ final class MemoryProbe {
     /// 每次点击的代价降到 1/4 以下，且报告里直接把触及页数打出来。
     static func stepObjects(pid: Int32) -> String {
         resetCounters()
+        stageMark("对象")
         guard baseReady(for: pid) else {
             return "对象: 没有当前进程的基址 —— 先点「找村口」"
         }
@@ -704,6 +745,7 @@ final class MemoryProbe {
     ///   ULevel + 0xA0 → Actors TArray { data*(8) count(4) max(4) }
     static func stepWorld(pid: Int32) -> String {
         resetCounters()
+        stageMark("世界")
         guard baseReady(for: pid) else {
             return "世界: 没有当前进程的基址 —— 先点「找村口」"
         }
@@ -717,6 +759,7 @@ final class MemoryProbe {
         lines.append("世界: GWorld槽 0x\(String(slot, radix: 16))")
 
         // ① UWorld
+        stageMark("世界 · 读 UWorld")
         let (rkWorld, world) = readRaw(port: p, address: MachVmAddress(slot))
         guard rkWorld == KERN_SUCCESS, world != 0 else {
             return "世界: 读 GWorld 失败 \(describe(rkWorld)) @0x\(String(slot, radix: 16))"
@@ -725,6 +768,7 @@ final class MemoryProbe {
             + (world < 0x100000000 ? "  ✗ 不像指针" : "  ✓"))
 
         // ② PersistentLevel
+        stageMark("世界 · 读 PersistentLevel")
         let (rkLevel, level) = readRaw(port: p, address: MachVmAddress(world &+ 0xB8))
         guard rkLevel == KERN_SUCCESS, level != 0 else {
             return "世界: 读 PersistentLevel 失败 \(describe(rkLevel)) @UWorld+0xB8"
@@ -733,6 +777,7 @@ final class MemoryProbe {
             + (level < 0x100000000 ? "  ✗ 不像指针" : "  ✓"))
 
         // ③ Actors TArray：裸指针 + count + max，一次读 16 字节
+        stageMark("世界 · 读 Actors")
         let (rkArr, arr) = readBytes(port: p, address: MachVmAddress(level &+ 0xA0), count: 16)
         guard rkArr == KERN_SUCCESS, arr.count >= 16 else {
             return "世界: 读 Actors TArray 失败 \(describe(rkArr)) @ULevel+0xA0"
@@ -822,7 +867,7 @@ final class MemoryProbe {
         guard let fn = procRegionFileNameFn else {
             return "区域归属: proc_regionfilename 符号缺失"
         }
-        var buf = [CChar](repeating: 0, count: 1024)
+        var buf = [UInt8](repeating: 0, count: 1024)
         // buf.count 必须在闭包外取：withUnsafeMutableBytes 已对 buf 取独占访问，
         // 闭包内再读 buf.count 会触发 "overlapping accesses" 编译错误。
         let cap = UInt32(buf.count)
@@ -834,7 +879,7 @@ final class MemoryProbe {
         guard n > 0 else {
             return "区域归属: 0x\(String(addr, radix: 16)) → 返回 \(n)（该地址不在任何区域?)"
         }
-        let path = String(cString: buf)
+        let path = String(decoding: buf.prefix { $0 != 0 }, as: UTF8.self)
         let short = path.split(separator: "/").last.map(String.init) ?? path
         let isGame = path.lowercased().contains("shadowtracker")
         return "区域归属: 0x\(String(addr, radix: 16)) → \(short) \(isGame ? "是游戏映像" : "不是游戏")"
@@ -863,14 +908,16 @@ final class MemoryProbe {
     /// 问某地址属于哪个文件（proc_regionfilename 封装）
     private static func regionFile(pid: Int32, addr: UInt64) -> String? {
         guard let fn = procRegionFileNameFn else { return nil }
-        var buf = [CChar](repeating: 0, count: 1024)
+        var buf = [UInt8](repeating: 0, count: 1024)
         let cap = UInt32(buf.count)
         let n = buf.withUnsafeMutableBytes { raw -> Int32 in
             guard let base = raw.baseAddress else { return 0 }
             return fn(pid, addr, base, cap)
         }
         guard n > 0 else { return nil }
-        let s = String(cString: buf)
+        // 不假定内核一定写 NUL 终止符：按 0 截断再解码。
+        // 用 String(cString:) 的话，缓冲区被写满时它会一路读到越界。
+        let s = String(decoding: buf.prefix { $0 != 0 }, as: UTF8.self)
         return s.isEmpty ? nil : s
     }
 
@@ -891,6 +938,7 @@ final class MemoryProbe {
     /// 所以必须有 region 边界信息，只能靠枚举。
     static func stepFindBase(pid: Int32) -> String {
         resetCounters()
+        stageMark("找村口 开始")
         guard vmRegionRecurseFn != nil else { return "找基址: vm_region_recurse_64 符号缺失" }
         guard procRegionFileNameFn != nil else { return "找基址: proc_regionfilename 符号缺失" }
 

@@ -161,9 +161,11 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         probeLabel.textColor = idleText
         let pid = gpid
         DispatchQueue.global(qos: .userInitiated).async {
+            MemoryProbe.stageMark(pending)
             let t0 = Date()
             let result = work(pid)
             let ms = Int(Date().timeIntervalSince(t0) * 1000)
+            MemoryProbe.stageMark("完成 · \(ms) ms")
             DispatchQueue.main.async { [weak self] in
                 guard let s = self else { return }
                 s.probeBusy = false
@@ -352,8 +354,12 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
             probeLabel.textColor = idleText
             return
         }
-        // 顺序：游戏最新崩溃详情放最前（正在排查的就是它）→ 我们自己的 → 全部报告列表
-        var rows = ["══ 游戏最新崩溃 ══"]
+        // 顺序：上次走到哪 → 游戏最新崩溃详情 → 我们自己的 → 全部报告列表
+        var rows = ["══ 上次走到 ══"]
+        let stages = MemoryProbe.lastStages(8)
+        rows.append(contentsOf: stages.isEmpty ? ["(无记录)"] : stages)
+        rows.append("")
+        rows.append("══ 游戏最新崩溃 ══")
         rows.append(contentsOf: CrashLogReader.crashDetail(for: "ShadowTrackerExtra"))
         rows.append("")
         rows.append("══ Music 最新崩溃 ══")
