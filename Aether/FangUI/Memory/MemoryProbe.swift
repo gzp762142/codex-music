@@ -1163,6 +1163,7 @@ final class MemoryProbe {
         guard vmRegionRecurseFn != nil else { return "找基址: vm_region_recurse_64 符号缺失" }
 
         // ---- 参数自检：先对自己进程枚举一次，参数错就停在这里，绝不碰游戏 ----
+        stageMark("找村口 · 参数自检")
         var selfAddr: UInt64 = 0
         let selfCheck = nextRegion(task: mach_task_self_, addr: &selfAddr)
         guard selfCheck.ok else {
@@ -1170,6 +1171,7 @@ final class MemoryProbe {
         }
 
         // ---- 拿游戏的 task port ----
+        stageMark("找村口 · 取端口")
         let (kr, p) = port(for: pid)
         guard kr == KERN_SUCCESS, p != 0 else {
             return "找基址: 取端口失败 \(describe(kr))"
@@ -1181,6 +1183,7 @@ final class MemoryProbe {
         // 原来这里调 proc_regionfilename 走 vnode 查路径 —— 那是整条流程里最贵的一步，
         // 而且它会在游戏的 vm_map 上停很久，实测把后台线程直接卡死在那里。
         let hdrAddr: UInt64 = 0x100000000
+        stageMark("找村口 · 校验映像头")
         let (pidOK, pidWhy) = isExecutableMachO(port: p, hdrAddr)
         guard pidOK else {
             return "找基址: 0x\(String(hdrAddr, radix: 16)) 处不是游戏映像（\(pidWhy)）"
@@ -1211,6 +1214,7 @@ final class MemoryProbe {
         let scanLimit = 20
         let deadline = Date().addingTimeInterval(3.0)
 
+        stageMark("找村口 · 枚举 region")
         while scanned < scanLimit {
             if Date() > deadline { timedOut = true; break }
 
