@@ -246,8 +246,18 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
                 out.append("→ 停在这里：基址没拿到，后面的步骤没有意义")
                 return out.joined(separator: "\n")
             }
+            // 每步之间先确认目标还在。游戏要是先崩了，继续读它会跟它销毁 vm_map
+            // 的过程抢锁 —— 那是长时间内核自旋、CPU 被烧穿的典型场景。
+            guard MemoryProbe.targetAlive(pid) else {
+                out.append("→ 目标进程已经消失，后面的步骤全部停掉（继续读只会烧 CPU）")
+                return out.joined(separator: "\n")
+            }
             out.append("")
             out.append(MemoryProbe.stepWorld(pid: pid))
+            guard MemoryProbe.targetAlive(pid) else {
+                out.append("→ 目标进程已经消失，停掉")
+                return out.joined(separator: "\n")
+            }
             out.append("")
             out.append(MemoryProbe.stepGNames(pid: pid))
             return out.joined(separator: "\n")

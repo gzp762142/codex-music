@@ -62,6 +62,10 @@ final class MemoryProbe {
     /// iOS 无 <libproc.h>，符号同样只能 dlsym 取。
     private typealias ProcRegionFileNameFn = @convention(c) (Int32, UInt64, UnsafeMutableRawPointer?, UInt32) -> Int32
     private static let procRegionFileNameFn = symbol("proc_regionfilename", as: ProcRegionFileNameFn.self)
+
+    /// proc_pidpath：只用来问「这个 pid 还在不在」，不碰它的内存。
+    private typealias ProcPidPathFn = @convention(c) (Int32, UnsafeMutableRawPointer?, UInt32) -> Int32
+    private static let procPidPathFn = symbol("proc_pidpath", as: ProcPidPathFn.self)
     private static let vmReadFn = symbol("mach_vm_read", as: VmReadFn.self)
     private static let vmDeallocateFn = symbol("mach_vm_deallocate", as: VmDeallocateFn.self)
 
@@ -131,8 +135,14 @@ final class MemoryProbe {
     private static var touchedPages = Set<UInt64>()
     private static var probeCalls = 0
 
-    /// 记一次读取：调用次数 + 触及的页。
+    /// 记一次读取：先按节奏等一下，再计调用次数 + 触及的页。
+    ///
+    /// **节流是防 CPU 自旋的**：我们的每一次读都要抢游戏 vm_map 的锁，
+    /// 连续高频读最容易撞上争用 —— 而内核里争锁是**自旋**不是睡眠，
+    /// 撞上就是 CPU 时间白白烧掉（我们被 cpu_resource_fatal 杀过两次）。
+    /// 拉开节奏的代价是整条链慢几十毫秒，换来的是撞上的概率大幅下降。
     private static func noteRead(_ addr: UInt64, _ bytes: Int) {
+        paceRead()
         probeCalls += 1
         let first = addr >> 12
         let last = (addr &+ UInt64(bytes > 0 ? bytes - 1 : 0)) >> 12
@@ -142,6 +152,33 @@ final class MemoryProbe {
             if p == UInt64.max { return }
             p += 1
         }
+    }
+
+    /// 两次读取之间的最小间隔。
+    private static let minReadGap: TimeInterval = 0.02
+    private static var lastReadAt = Date.distantPast
+
+    private static func paceRead() {
+        let gap = Date().timeIntervalSince(lastReadAt)
+        if gap < minReadGap {
+            Thread.sleep(forTimeInterval: minReadGap - gap)
+        }
+        lastReadAt = Date()
+    }
+
+    /// 目标进程还在不在。只查进程表，一个字节的内存都不碰。
+    ///
+    /// **这条检查是必须的**：游戏如果先崩了，我们继续读它会跟它销毁 vm_map
+    /// 的过程抢同一把锁 —— 那正是长时间自旋、CPU 被烧穿的典型场景。
+    /// 两次 cpu_resource_fatal 都发生在"游戏先闪退、我们随后被杀"之后。
+    static func targetAlive(_ pid: Int32) -> Bool {
+        guard let fn = procPidPathFn else { return true }
+        var buf = [UInt8](repeating: 0, count: 4096)
+        let n = buf.withUnsafeMutableBytes { raw -> Int32 in
+            guard let base = raw.baseAddress else { return 0 }
+            return fn(pid, base, 4096)
+        }
+        return n > 0
     }
 
     /// 每次动作开头清零。
