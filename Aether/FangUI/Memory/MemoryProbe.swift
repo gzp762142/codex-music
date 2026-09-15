@@ -124,15 +124,6 @@ final class MemoryProbe {
 
     // MARK: - 读（全部 static：纯函数，不需要实例）
 
-    /// 本次动作触及的内存页（4KB 对齐去重）+ 发起的 mach_vm_read 次数。
-    ///
-    /// **真正的成本指标是调用次数，不是页数。**
-    /// 读 384 字节一次读完，和读 8 字节读 48 次，占的页数完全一样，
-    /// 但后者要抢 48 次目标进程 vm_map 的锁 —— 游戏主线程每帧都在做内存分配，
-    /// 我们每多抢一次读锁，就多打断它一次。
-    ///
-    /// 实测对照：找村口 2 次调用不崩；对象表 16 个全解约 128 次调用后游戏闪退。
-    private static var touchedPages = Set<UInt64>()
     private static var probeCalls = 0
 
     /// 记一次读取：先按节奏等一下，再计调用次数 + 触及的页。
@@ -141,30 +132,10 @@ final class MemoryProbe {
     /// 连续高频读最容易撞上争用 —— 而内核里争锁是**自旋**不是睡眠，
     /// 撞上就是 CPU 时间白白烧掉（我们被 cpu_resource_fatal 杀过两次）。
     /// 拉开节奏的代价是整条链慢几十毫秒，换来的是撞上的概率大幅下降。
-    private static func noteRead(_ addr: UInt64, _ bytes: Int) {
-        paceRead()
+    private static func noteRead() {
         probeCalls += 1
-        let first = addr >> 12
-        let last = (addr &+ UInt64(bytes > 0 ? bytes - 1 : 0)) >> 12
-        var p = first
-        while p <= last {
-            touchedPages.insert(p)
-            if p == UInt64.max { return }
-            p += 1
-        }
     }
 
-    /// 两次读取之间的最小间隔。
-    private static let minReadGap: TimeInterval = 0.02
-    private static var lastReadAt = Date.distantPast
-
-    private static func paceRead() {
-        let gap = Date().timeIntervalSince(lastReadAt)
-        if gap < minReadGap {
-            Thread.sleep(forTimeInterval: minReadGap - gap)
-        }
-        lastReadAt = Date()
-    }
 
     /// 目标进程还在不在。只查进程表，一个字节的内存都不碰。
     ///
@@ -265,12 +236,11 @@ final class MemoryProbe {
     /// 每次动作开头清零。
     private static func resetCounters() {
         probeCalls = 0
-        resetCounters()
     }
 
     /// 本次动作的成本：调用次数是主指标，页数作参考。
     private static func costLine() -> String {
-        "本次读取: \(probeCalls) 次 mach_vm_read · 触及 \(touchedPages.count) 页（4KB 去重）"
+        "本次读取: \(probeCalls) 次 mach_vm_read"
     }
 
     // MARK: - 阶段标记（崩了之后还能知道停在哪）
@@ -367,7 +337,7 @@ final class MemoryProbe {
     /// 而读内存根本不需要枚举内存区。
     private static func readAt(port: MachPort, address: MachVmAddress) -> (KernReturn, UInt32) {
         guard let vmRead = vmReadFn else { return (KERN_FAILURE, 0) }
-        noteRead(address, 4)
+        noteRead()
         var dataPtr: UInt = 0
         var dataLen: MachVmSize = 4
         let kr = vmRead(port, address, 4, &dataPtr, &dataLen)
@@ -383,7 +353,7 @@ final class MemoryProbe {
     /// 按绝对地址读 8 字节 —— 只给值，供程序判断用。
     private static func readRaw(port: MachPort, address: MachVmAddress) -> (KernReturn, UInt64) {
         guard let vmRead = vmReadFn else { return (KERN_FAILURE, 0) }
-        noteRead(address, 8)
+        noteRead()
         var dataPtr: UInt = 0
         var dataLen: MachVmSize = 8
         let kr = vmRead(port, address, 8, &dataPtr, &dataLen)
@@ -404,7 +374,7 @@ final class MemoryProbe {
         -> (KernReturn, [UInt8]) {
         guard let vmRead = vmReadFn else { return (KERN_FAILURE, []) }
         guard count > 0, count <= 4096 else { return (KERN_FAILURE, []) }
-        noteRead(address, count)
+        noteRead()
         var dataPtr: UInt = 0
         var dataLen: MachVmSize = MachVmSize(count)
         let kr = vmRead(port, address, MachVmSize(count), &dataPtr, &dataLen)
