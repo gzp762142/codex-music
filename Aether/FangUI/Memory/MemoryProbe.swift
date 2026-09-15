@@ -298,7 +298,7 @@ final class MemoryProbe {
     /// 落盘必须异步 —— 它是给"崩了之后回查"用的，绝不能反过来拖住调用它的读取线程。
     /// 一旦文件 I/O 卡住，整个读取链就停在原地，而面板上只会看到进度停在第一步
     /// （实测就是这样：状态停在 "映射: 建立中…"，后台却一步都没往下走）。
-    private static let stageQueue = DispatchQueue(label: "aether.stage", qos: .utility)
+    private static let stageQueue = DispatchQueue(label: "aether.stage", qos: .userInitiated)
 
     /// 进度回调：由调用方（UI）挂上来。
     ///
@@ -1204,8 +1204,12 @@ final class MemoryProbe {
     /// 200 轮是给"布局异常"留的余量。原来从 0 起、上限 6000 的版本实测
     /// 烧穿了 app 的 CPU 配额（被系统以 cpu_resource_fatal 杀掉，bug_type 206），
     /// 所以数量和时间两道限制同时上。
-        let scanLimit = 200
-        let deadline = Date().addingTimeInterval(5.0)
+        // 预算要按**最坏环境**定：我们是后台 app，线程优先级被系统压得很低，
+        // 同样一段代码在这里可能比前台慢几十倍。正常情况下起点 0x100000000
+        // 一两个 region 就命中，20 轮足够；真到 20 轮还没中，说明布局异常，
+        // 继续跑只会把后台那点执行窗口耗光。
+        let scanLimit = 20
+        let deadline = Date().addingTimeInterval(3.0)
 
         while scanned < scanLimit {
             if Date() > deadline { timedOut = true; break }
