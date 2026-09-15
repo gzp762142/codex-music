@@ -170,6 +170,9 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         probeLabel.textColor = idleText
         let pid = gpid
 
+        // 每个动作前统一绑定目标进程 —— 没有这一步，按需映射那条路根本不会启动
+        MemoryProbe.bind(pid: pid)
+
         // Music 是悬浮窗形态（窗口浮在游戏之上），它很可能**根本不在前台**。
         // 而后台 app 的线程会被 iOS 挂起 —— 挂起之后读取链就停在原地，
         // 面板表现正好是"卡在第一步不动"，几秒后整个进程被系统终止。

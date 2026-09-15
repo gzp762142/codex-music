@@ -136,6 +136,13 @@ final class MemoryProbe {
         probeCalls += 1
     }
 
+    /// 走已建立的映射、本地内存直接读的次数。
+    private static var mappedHits = 0
+    /// 真正落回 mach_vm_read 的次数 —— **这个才是成本**。
+    private static var vmReadCalls = 0
+    /// 按需建立的映射块数。
+    private static var onDemandMaps = 0
+
 
     /// 目标进程还在不在。只查进程表，一个字节的内存都不碰。
     ///
@@ -224,6 +231,19 @@ final class MemoryProbe {
     /// 当前会话的 pid —— 按需映射时要用它取端口。
     private(set) static var activePid: Int32 = 0
 
+    /// 绑定本次操作的目标进程。**每个动作开始前都要调** ——
+    /// 上一版只在「找村口」/「映射」里绑定，于是直接点「对象」时 activePid 还是 0，
+    /// 按需映射那段判断被跳过，读取全部退回 mach_vm_read（实测 38 次调用）。
+    /// pid 变了说明游戏重启过，旧的映射和基址一起作废。
+    static func bind(pid: Int32) {
+        guard activePid != pid else { return }
+        activePid = pid
+        mappedRanges.removeAll()
+        imageBase = 0
+        imageSlide = 0
+        basePid = 0
+    }
+
     /// 把**包含 address 的那个 region** 整个映射进来。
     ///
     /// vm_region_64 从 address 起枚举时会直接返回包含它的那个 region（地址会被写回
@@ -255,6 +275,7 @@ final class MemoryProbe {
 
         if let local = localAddress(for: address), local != 0 {
             noteRead()
+            mappedHits += 1
             if let base = UnsafeRawPointer(bitPattern: UInt(local)) {
                 return (KERN_SUCCESS, Array(UnsafeRawBufferPointer(start: base, count: n)))
             }
@@ -262,15 +283,20 @@ final class MemoryProbe {
 
         // 没命中：按需映射一次（块数设上限，避免地图无限膨胀）
         if activePid != 0, mappedRanges.count < 24 {
+            let before = mappedRanges.count
             mapRegionContaining(pid: activePid, address: address)
+            if mappedRanges.count > before { onDemandMaps += 1 }
             if let local = localAddress(for: address), local != 0 {
                 noteRead()
+                mappedHits += 1
                 if let base = UnsafeRawPointer(bitPattern: UInt(local)) {
                     return (KERN_SUCCESS, Array(UnsafeRawBufferPointer(start: base, count: n)))
                 }
             }
         }
 
+        noteRead()
+        vmReadCalls += 1
         return readBytesDirect(port: port, address: address, count: n)
     }
 
@@ -296,11 +322,17 @@ final class MemoryProbe {
     /// 每次动作开头清零。
     private static func resetCounters() {
         probeCalls = 0
+        mappedHits = 0
+        vmReadCalls = 0
+        onDemandMaps = 0
     }
 
-    /// 本次动作的成本：调用次数是主指标，页数作参考。
+    /// 本次动作的成本。**只看 mach_vm_read 那一项** —— 映射命中是本地内存读，
+    /// 不产生内核调用，也就没有成本。之前这里只报 probeCalls（读取总次数），
+    /// 文案却写成"次 mach_vm_read"，把完全不同的两件事混成了一个数。
     private static func costLine() -> String {
-        "本次读取: \(probeCalls) 次 mach_vm_read"
+        "读取 \(probeCalls) 次 · 映射命中 \(mappedHits) · 按需映射 \(onDemandMaps) 块 · "
+            + "mach_vm_read \(vmReadCalls) 次"
     }
 
     // MARK: - 阶段标记（崩了之后还能知道停在哪）
