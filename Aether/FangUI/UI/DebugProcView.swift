@@ -245,7 +245,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         case .background: stateText = "★后台"
         @unknown default: stateText = "?"
         }
-        countLabel.text = "共 \(entries.count) · 精确\(exact) · 疑似\(loose) · \(ProcessScanner.channelSummary) · app:\(stateText)"
+        countLabel.text = "共 \(entries.count) · 精确\(exact) · 疑似\(loose) · app:\(stateText) · 保活:\(BackgroundKeepAlive.shared.lastNote)"
         if gpid != 0 {
             hitLabel.text = "pid=\(gpid)"
             hitLabel.textColor = accent
