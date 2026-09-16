@@ -194,7 +194,8 @@ final class MemoryProbe {
     private static func releaseAllMappings() {
         if let fn = vmDeallocateFn {
             for m in mappedRanges {
-                _ = fn(mach_task_self_, m.localBase, m.size)
+                // 第二个形参是 UInt（mach_vm_address_t），我们的 localBase 是 UInt64 —— arm64 上同宽
+                _ = fn(mach_task_self_, UInt(m.localBase), m.size)
             }
         }
         mappedRanges.removeAll()
