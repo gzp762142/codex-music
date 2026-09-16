@@ -1256,7 +1256,6 @@ final class MemoryProbe {
         var classNames: [UInt64: String] = [:]
         var histogram: [String: Int] = [:]
         var charActors: [UInt64] = []
-        var charHomes: [UInt64: String] = [:]
         var ctrlActors: [UInt64] = []
         var psActors: [UInt64] = []
         var seen = 0
@@ -1304,7 +1303,6 @@ final class MemoryProbe {
                     // 于是报告里出现了一个 Loc=(0,0,0) 的"角色"。
                     if name.contains("Character") || (name.contains("Pawn") && !name.contains("Mode")) {
                         charActors.append(actor)
-                        charHomes[actor] = src.label
                     }
                     if name.contains("PlayerController") {
                         ctrlActors.append(actor)
@@ -1435,7 +1433,7 @@ final class MemoryProbe {
                 }
                 let (rkR, root) = readRaw(port: p, address: MachVmAddress(a &+ 0x260))
                 guard rkR == KERN_SUCCESS, root > 0x100000000 else {
-                    lines.append("  [\(i)] @\(hexOf(a)) [\(home)]  RootComponent 无效" + extra)
+                    lines.append("  [\(i)]        @\(hexOf(a))  RootComponent 无效" + extra)
                     continue
                 }
                 let (rkT, tf) = readBytes(port: p, address: MachVmAddress(root &+ 0x1F0 + 0x10), count: 12)
@@ -1458,7 +1456,7 @@ final class MemoryProbe {
                     lines.append("  [\(i)]\(tail)  (\(fmt1(x)), \(fmt1(y)), \(fmt1(z)))"
                         + (ok ? "" : "  ✗量级") + extra + "  @\(hexOf(a))")
                 } else {
-                    lines.append("  [\(i)] @\(hexOf(a)) [\(home)]  ComponentToWorld 读失败 \(describe(rkT))" + extra)
+                    lines.append("  [\(i)]        @\(hexOf(a))  ComponentToWorld 读失败 \(describe(rkT))" + extra)
                 }
             }
             if localCount == 0 {
