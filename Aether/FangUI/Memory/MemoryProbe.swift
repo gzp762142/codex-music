@@ -183,6 +183,24 @@ final class MemoryProbe {
     /// mappedRanges 是否已按 gameBase 排好序 —— localAddress 走二分，靠这个标志决定先不先排。
     private static var rangesSorted = true
 
+    /// 释放本进程地址空间里**所有**已建立的映射。
+    ///
+    /// 原来两处都是 `mappedRanges.removeAll()` —— 只把记录清掉，那些映射还牢牢占着
+    /// 本进程的地址空间，而且再也找不回来了。游戏每次重启（pid 变）就漏掉一轮
+    /// `mapAllRegions` 的量，几十到几百 MB，反复重启一路累积。
+    ///
+    /// 第一个参数必须是 `mach_task_self_`：要释放的是**本进程**的映射，不是目标的 ——
+    /// 传目标端口等于让内核去游戏的 vm_map 里找一个根本不存在的地址，然后静默失败。
+    private static func releaseAllMappings() {
+        if let fn = vmDeallocateFn {
+            for m in mappedRanges {
+                _ = fn(mach_task_self_, m.localBase, m.size)
+            }
+        }
+        mappedRanges.removeAll()
+        rangesSorted = true
+    }
+
     private static let vmFlagsAnywhere: Int32 = 0x0001
 
     /// 把游戏的一段内存**映射进我们自己的地址空间**。
@@ -223,9 +241,13 @@ final class MemoryProbe {
                 "映射 0x\(String(alignedStart, radix: 16)) +0x\(String(total, radix: 16)) → 本地 0x\(String(target, radix: 16))")
     }
 
-    /// 本地地址 → 游戏地址：查已建立的映射。
-    /// 命中就说明这块内存已经在我们自己地址空间里，读它不需要任何内核调用。
-    static func localAddress(for gameAddress: UInt64) -> UInt64? {
+    /// 查一块映射：命中时**同时**给出本地基址和这块还剩多少字节。
+    ///
+    /// 两者必须一起返回。只判断"起始地址在块内"是不够的 —— 读 n 个字节时还要求
+    /// `address + n` 仍落在同一块里，而块末尾就是 region 末尾：越过去读要么撞上
+    /// 未映射的地址（SIGSEGV，本进程闪退），要么落进别的映射（不崩，但数据是垃圾）。
+    /// 让调用方自己再查一次也不行 —— 两处判定迟早不同步。
+    static func mappedRecord(for gameAddress: UInt64) -> (localBase: UInt64, remain: UInt64)? {
         // 热路径：遍历一张 actor 表要查几千次，块数又可能上百 —— 线性扫是上百万次比较。
         // 这里按 gameBase 二分，排序由 rangesSorted 按需触发（append 时置脏）。
         if !rangesSorted {
@@ -242,10 +264,16 @@ final class MemoryProbe {
             } else if gameAddress >= m.gameBase &+ m.size {
                 lo = mid + 1
             } else {
-                return m.localBase &+ (gameAddress &- m.gameBase)
+                let offset = gameAddress &- m.gameBase
+                return (m.localBase &+ offset, m.size &- offset)
             }
         }
         return nil
+    }
+
+    /// 只要本地地址的薄封装 —— 判定逻辑只有上面那一处，避免两套二分各自演化。
+    static func localAddress(for gameAddress: UInt64) -> UInt64? {
+        mappedRecord(for: gameAddress)?.localBase
     }
 
     /// 当前会话的 pid —— 按需映射时要用它取端口。
@@ -262,8 +290,8 @@ final class MemoryProbe {
     static func bind(pid: Int32) {
         guard activePid != pid else { return }
         activePid = pid
-        mappedRanges.removeAll()
-        rangesSorted = true
+        // 旧映射要**释放**，不只是丢引用 —— 否则每次重启游戏都漏掉一整轮预映射的量
+        releaseAllMappings()
         imageBase = 0
         imageSlide = 0
         basePid = 0
@@ -381,10 +409,11 @@ final class MemoryProbe {
         let n = max(count, 1)
         guard n <= 0x10000 else { return (KERN_FAILURE, []) }
 
-        if let local = localAddress(for: address), local != 0 {
+        // 命中块**且**这块剩余长度够读完 n 字节，才走本地读 —— 否则可能是跨界读。
+        if let rec = mappedRecord(for: address), rec.localBase != 0, UInt64(n) <= rec.remain {
             noteRead()
             mappedHits += 1
-            if let base = UnsafeRawPointer(bitPattern: UInt(local)) {
+            if let base = UnsafeRawPointer(bitPattern: UInt(rec.localBase)) {
                 return (KERN_SUCCESS, Array(UnsafeRawBufferPointer(start: base, count: n)))
             }
         }
@@ -394,10 +423,11 @@ final class MemoryProbe {
             let before = mappedRanges.count
             mapRegionContaining(pid: activePid, address: address)
             if mappedRanges.count > before { onDemandMaps += 1 }
-            if let local = localAddress(for: address), local != 0 {
+            // 按需映射之后同样要查剩余长度 —— 新建的块边界一样可能不够读完 n 字节。
+            if let rec = mappedRecord(for: address), rec.localBase != 0, UInt64(n) <= rec.remain {
                 noteRead()
                 mappedHits += 1
-                if let base = UnsafeRawPointer(bitPattern: UInt(local)) {
+                if let base = UnsafeRawPointer(bitPattern: UInt(rec.localBase)) {
                     return (KERN_SUCCESS, Array(UnsafeRawBufferPointer(start: base, count: n)))
                 }
             }
@@ -638,7 +668,10 @@ final class MemoryProbe {
                 }
             }
         }
-        _ = vmDeallocateFn?(port, dataPtr, dataLen)
+        // 缓冲在**本进程**的地址空间里（mach_vm_read 是 vm_map_copyout 到 current_map），
+        // 所以释放也必须针对本进程 —— 传目标端口等于让内核去游戏的 vm_map 里找这个地址，
+        // 找不到就静默返回 KERN_INVALID_ADDRESS，于是每次都漏一个页。
+        _ = vmDeallocateFn?(mach_task_self_, dataPtr, dataLen)
         return (KERN_SUCCESS, out)
     }
 
@@ -757,7 +790,7 @@ final class MemoryProbe {
         resetCounters()
         stageMark("定点读")
         guard baseReady(for: pid) else {
-            return "定点读: 没有当前进程的基址 —— 先点「找村口」"
+            return "定点读: 没有当前进程的基址 —— 先点「跑一次」（它会自动完成找基址）"
         }
         let (kr, p) = port(for: pid)
         guard kr == KERN_SUCCESS, p != 0 else { return "定点读: 取端口失败 \(describe(kr))" }
@@ -897,7 +930,7 @@ final class MemoryProbe {
         resetCounters()
         stageMark("名字")
         guard baseReady(for: pid) else {
-            return "GNames: 没有当前进程的基址 —— 先点「找村口」"
+            return "GNames: 没有当前进程的基址 —— 先点「跑一次」（它会自动完成找基址）"
         }
         let (kr, p) = port(for: pid)
         guard kr == KERN_SUCCESS, p != 0 else { return "GNames: 取端口失败 \(describe(kr))" }
@@ -1028,7 +1061,7 @@ final class MemoryProbe {
         resetCounters()
         stageMark("对象")
         guard baseReady(for: pid) else {
-            return "对象: 没有当前进程的基址 —— 先点「找村口」"
+            return "对象: 没有当前进程的基址 —— 先点「跑一次」（它会自动完成找基址）"
         }
         let (kr, p) = port(for: pid)
         guard kr == KERN_SUCCESS, p != 0 else { return "对象: 取端口失败 \(describe(kr))" }
@@ -1140,7 +1173,7 @@ final class MemoryProbe {
         resetCounters()
         stageMark("世界")
         guard baseReady(for: pid) else {
-            return "世界: 没有当前进程的基址 —— 先点「找村口」"
+            return "世界: 没有当前进程的基址 —— 先点「跑一次」（它会自动完成找基址）"
         }
         let (kr, p) = port(for: pid)
         guard kr == KERN_SUCCESS, p != 0 else { return "世界: 取端口失败 \(describe(kr))" }
@@ -1624,10 +1657,9 @@ final class MemoryProbe {
         resetCounters()
         stageMark("映射 · 开始")
         guard baseReady(for: pid) else {
-            return "映射: 没有当前进程的基址 —— 先点「找村口」"
+            return "映射: 没有当前进程的基址 —— 先点「跑一次」（它会自动完成找基址）"
         }
-        mappedRanges.removeAll()
-        rangesSorted = true
+        releaseAllMappings()
         let s = imageSlide
         let base = imageBase
         var lines: [String] = []
