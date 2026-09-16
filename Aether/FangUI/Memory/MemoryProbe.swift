@@ -1257,6 +1257,7 @@ final class MemoryProbe {
         var histogram: [String: Int] = [:]
         var charActors: [UInt64] = []
         var charHomes: [UInt64: String] = [:]
+        var ctrlActors: [UInt64] = []
         var seen = 0
         var stopped = false
 
@@ -1304,6 +1305,9 @@ final class MemoryProbe {
                         charActors.append(actor)
                         charHomes[actor] = src.label
                     }
+                    if name.contains("PlayerController") {
+                        ctrlActors.append(actor)
+                    }
                 }
                 cursor += batch
                 seen += batch
@@ -1312,14 +1316,51 @@ final class MemoryProbe {
 
         lines.append("类名分布（\(sources.count) 个关卡 / 遍历 \(seen) 个 actor"
             + (stopped ? "（未跑完）" : "") + "，共 \(classNames.count) 种类）:")
-        for (name, c) in histogram.sorted(by: { $0.value > $1.value }).prefix(18) {
+        for (name, c) in histogram.sorted(by: { $0.value > $1.value }).prefix(40) {
             lines.append("  \(name) × \(c)")
+        }
+
+        // 只把「像角色」的类名单独再列一遍 —— 122 种类里前 40 名排不进玩家角色时，
+        // 上面那张总表会把它淹掉。这一节不管数量多少都要出现。
+        let pawnish = histogram.filter {
+            $0.key.contains("Character") || $0.key.contains("Pawn") || $0.key.contains("Controller")
+        }.sorted { $0.value > $1.value }
+        lines.append("含 Character/Pawn/Controller 的类名（\(pawnish.count) 种）:")
+        for (name, c) in pawnish.prefix(24) {
+            lines.append("  ◆ \(name) × \(c)")
+        }
+
+        // 直接问 PlayerController：谁是这个客户端自己的。这条路不依赖角色那边有没有 Controller。
+        if !ctrlActors.isEmpty {
+            lines.append("PlayerController（\(ctrlActors.count) 个）:")
+            for (i, c) in ctrlActors.prefix(8).enumerated() {
+                // AController::Pawn 0x5D8 · APlayerController::AcknowledgedPawn 0x660
+                // APlayerController::bIsLocalPlayerController 0xA8C · AController::PlayerState 0x5F0
+                let (r1, pawn) = readRaw(port: p, address: MachVmAddress(c &+ 0x5D8))
+                let (r2, ack) = readRaw(port: p, address: MachVmAddress(c &+ 0x660))
+                let (r3, lf) = readAt(port: p, address: MachVmAddress(c &+ 0xA8C))
+                let (r4, ps) = readRaw(port: p, address: MachVmAddress(c &+ 0x5F0))
+                var line = "  [\(i)] PC=\(hexOf(c))"
+                line += "  local=\(r3 == KERN_SUCCESS ? "\(lf & 0xFF)" : "读失败")"
+                line += "  Pawn=\(r1 == KERN_SUCCESS ? hexOf(pawn) : "失败")"
+                line += "  Ack=\(r2 == KERN_SUCCESS ? hexOf(ack) : "失败")"
+                line += "  PS=\(r4 == KERN_SUCCESS ? hexOf(ps) : "失败")"
+                lines.append(line)
+                if r4 == KERN_SUCCESS, ps > 0x100000000 {
+                    let nm = readText(port: p, addr: ps &+ 0x5D8)
+                    if !nm.isEmpty { lines.append("        名字: \"\(nm)\"") }
+                }
+            }
+        } else {
+            lines.append("PlayerController: 0 个（本次遍历里没抓到这类 actor）")
         }
 
         if charActors.isEmpty {
             lines.append("角色: 0 个 —— 这 \(sources.count) 个关卡的 \(seen) 个 actor 里没有 Character/Pawn")
         } else {
             lines.append("角色: \(charActors.count) 个 —— 每个都是客户端手上真实存在的身体")
+            var localCount = 0
+            var ctrlZero = 0
             for (i, a) in charActors.prefix(24).enumerated() {
                 let home = charHomes[a] ?? "?"
                 var extra = ""
@@ -1330,8 +1371,11 @@ final class MemoryProbe {
                     let (rkL, lf) = readAt(port: p, address: MachVmAddress(ctrl &+ 0xA8C))
                     if rkL == KERN_SUCCESS {
                         extra += "  local=\(lf & 0xFF)"
-                        if (lf & 0xFF) == 1 { extra += " ★这是你" }
+                        if (lf & 0xFF) == 1 { extra += " ★这是你"; localCount += 1 }
                     }
+                } else {
+                    ctrlZero += 1
+                    extra += "  ctrl=0"
                 }
                 // 名字：APawn + 0x5F0 → APlayerState，再从 PlayerState + 0x5D8 读 FString
                 let (rkPS, ps) = readRaw(port: p, address: MachVmAddress(a &+ 0x5F0))
@@ -1353,6 +1397,10 @@ final class MemoryProbe {
                 } else {
                     lines.append("  [\(i)] @\(hexOf(a)) [\(home)]  ComponentToWorld 读失败 \(describe(rkT))" + extra)
                 }
+            }
+            if localCount == 0 {
+                lines.append("  → 这 \(charActors.count) 个里没有一个 local=1；其中 Controller 为 0 的有 \(ctrlZero) 个"
+                    + "（无主 Pawn —— 多半是训练场展示假人，不是真人玩家控制的）")
             }
         }
         lines.append(costLine())
