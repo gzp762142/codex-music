@@ -47,6 +47,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     private let btnPlayers = UIButton(type: .system)
     /// 内存：读游戏的内存账本（footprint / compressed），不碰游戏内存
     private let btnMemory = UIButton(type: .system)
+    /// 自动总开关：启动/停止后台状态机。手动按钮**全部保留**，用来和自动模式对照排查。
+    private let btnTracker = UIButton(type: .system)
     /// 映射：把游戏内存 remap 进我们自己进程，之后本地读（样本的读取方式）
     private let btnMap = UIButton(type: .system)
     /// 枚举：只枚举几个 region 打原始字段，验证 vm_region_64 这个调用本身
@@ -91,7 +93,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
             (btnRefresh, "刷新", #selector(onRefresh)),
             (btnObjects, "对象", #selector(onObjects)),
             (btnCrashFile, "崩溃文件", #selector(onCrashFile)),
-            (btnMemory, "内存", #selector(onMemory))
+            (btnMemory, "内存", #selector(onMemory)),
+            (btnTracker, "自动", #selector(onTracker))
         ]
         for (b, title, sel) in buttons {
             b.setTitle(title, for: .normal)
@@ -126,11 +129,11 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         crashLabel.frame = CGRect(x: w * 0.6, y: 15, width: w * 0.4, height: 14)
         probeLabel.frame = CGRect(x: 0, y: 30, width: w, height: 14)
 
-        // 10 个按钮排成 5 列 × 2 行
+        // 11 个按钮排成 6 列 × 2 行
         let all = [btnWorld, btnSelf, btnPlayers, btnAuto, btnMap,
-                   btnEnum, btnRefresh, btnObjects, btnCrashFile, btnMemory]
+                   btnEnum, btnRefresh, btnObjects, btnCrashFile, btnMemory, btnTracker]
         let gap: CGFloat = 4
-        let perRow = 5
+        let perRow = 6
         let bw = (w - gap * CGFloat(perRow - 1)) / CGFloat(perRow)
         let bh = btnRowH - 6
         for (i, b) in all.enumerated() {
@@ -152,6 +155,10 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     private var probeStarted = Date.distantPast
     /// 轮询后台进度的定时器：面板上实时显示走到哪一步。
     private var stageTimer: Timer?
+    /// 状态机每拍都会回调，但列表没必要跟着 20Hz 重刷 —— 节流到 4Hz。
+    private var lastTrackerUI = Date.distantPast
+    /// 冷启动只自动开启一次。
+    private var autoStarted = false
 
     /// 所有内存操作都从这里走：**切到后台线程执行，回来后刷 UI**。
     ///
@@ -214,7 +221,10 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         DispatchQueue.global(qos: .userInitiated).async {
             MemoryProbe.stageMark(pending + " · 后台已启动[app \(appState)]")
             let t0 = Date()
-            let result = work(pid)
+            // 手动操作走状态机**同一条串行队列** —— 两边都会碰 MemoryProbe 的静态状态
+            // （mappedRanges / activePid / imageBase），并发跑会互相踩；尤其 bind()
+            // 会清空映射，正好撞上状态机在读的时候。
+            let result = AutoTracker.shared.syncExternal { work(pid) }
             let ms = Int(Date().timeIntervalSince(t0) * 1000)
             DispatchQueue.main.async { [weak self] in
                 guard let s = self else { return }
@@ -239,6 +249,70 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         probeLabel.text = lines.first ?? text
         probeLabel.textColor = text.contains("✓") ? accent : warnText
         extraRows = lines
+        table.reloadData()
+    }
+
+    // MARK: - 自动追踪总开关
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        guard window != nil, !autoStarted else { return }
+        autoStarted = true
+        onTracker()      // 默认开启：冷启动即自动挂载，不需要点任何按钮
+    }
+
+    /// 自动总开关。开启后不必再点任何按钮 —— 状态机自己 attach、找基址、持续出坐标；
+    /// 游戏退出会自动释放映射与端口，重开自动重挂。手动按钮**全部保留**，
+    /// 两者走同一条串行队列，可以随时对照排查。
+    @objc private func onTracker() {
+        let t = AutoTracker.shared
+        if t.isRunning {
+            t.onStatus = nil
+            t.onTargets = nil
+            t.stop()
+            btnTracker.setTitleColor(warnText, for: .normal)
+            probeLabel.text = "自动: 已停止"
+            return
+        }
+        MemoryProbe.screenSize = UIScreen.main.bounds.size
+        t.onStatus = { [weak self] text in
+            self?.probeLabel.text = text
+        }
+        t.onTargets = { [weak self] list, snap in
+            guard let s = self else { return }
+            let now = Date()
+            if now.timeIntervalSince(s.lastTrackerUI) < 0.25 { return }   // 列表 4Hz 就够
+            s.lastTrackerUI = now
+            s.renderTracker(list, snap)
+        }
+        t.start()
+        btnTracker.setTitleColor(accent, for: .normal)
+        probeLabel.text = "自动: 启动中…"
+    }
+
+    /// 把状态机每拍的目标摊到可滚动区。这一步只做**显示**，不做绘制 ——
+    /// 屏幕坐标已经算好了（`RenderTarget.screen`），画框接上去就能用。
+    private func renderTracker(_ list: [AutoTracker.RenderTarget],
+                               _ snap: MemoryProbe.SelfSnapshot) {
+        var rows: [String] = []
+        let me = snap.loc
+        rows.append(String(format: "自身 (%.1f, %.1f, %.1f)  相机%@ FOV %.0f  映射 %d 块",
+                           me.0, me.1, me.2,
+                           snap.camera.valid ? "✓" : "✗",
+                           snap.camera.fov,
+                           MemoryProbe.mappedBlockCount))
+        rows.append("目标 \(list.count) 个 · \(AutoTracker.shared.lastScanNote)")
+        for t in list.sorted(by: { $0.dist < $1.dist }).prefix(30) {
+            let tag = t.isSelf ? "★你 " : "    "
+            let scr: String
+            if let s = t.screen {
+                scr = String(format: "屏幕(%4.0f,%4.0f)%@", s.0, s.1, t.onScreen ? " " : "屏外")
+            } else {
+                scr = "屏幕(身后)  "
+            }
+            rows.append(String(format: "  %@%5.0fm  %@  %@", tag, t.dist, scr, t.cls))
+        }
+        extraRows = rows
         table.reloadData()
     }
 

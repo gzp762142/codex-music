@@ -191,7 +191,10 @@ final class MemoryProbe {
     ///
     /// 第一个参数必须是 `mach_task_self_`：要释放的是**本进程**的映射，不是目标的 ——
     /// 传目标端口等于让内核去游戏的 vm_map 里找一个根本不存在的地址，然后静默失败。
-    private static func releaseAllMappings() {
+    ///
+    /// 访问级别是 internal（不是 private）：`AutoTracker` 在 attach/detach 生命周期
+    /// 里必须能调到它，那是"游戏退出就释放"这条验收要求的落点。
+    static func releaseAllMappings() {
         if let fn = vmDeallocateFn {
             for m in mappedRanges {
                 // 第二个形参是 UInt（mach_vm_address_t），我们的 localBase 是 UInt64 —— arm64 上同宽
@@ -627,6 +630,361 @@ final class MemoryProbe {
             if sc > bestScore { bestScore = sc; best = text }
         }
         return best
+    }
+
+    // MARK: - 相机与投影（手动按钮与自动追踪共用同一份，不各自实现）
+
+    /// 一次相机快照：位置、朝向、水平 FOV。
+    struct CameraPose {
+        var loc: (Float, Float, Float) = (0, 0, 0)
+        var rot: (Float, Float, Float) = (0, 0, 0)
+        var fov: Float = 0
+        var valid = false
+    }
+
+    /// 世界坐标 → 屏幕逻辑坐标（左上原点）。返回 nil 表示在相机身后或参数不可用。
+    ///
+    /// UE4 约定：X 前 / Y 右 / Z 上，Yaw 绕 Z、Pitch 绕 Y、Roll 绕 X，
+    /// `FMinimalViewInfo.FOV` 是**水平**视角 —— 垂直方向按屏幕宽高比折算，
+    /// 否则宽屏上画出来的框会被拉歪。
+    static func projectPoint(_ wx: Float, _ wy: Float, _ wz: Float,
+                             camera cam: CameraPose,
+                             screenW: Double, screenH: Double) -> (Double, Double)? {
+        guard cam.valid, screenW > 1, screenH > 1 else { return nil }
+        let d2r = Double.pi / 180
+        let cp = cos(Double(cam.rot.0) * d2r), sp = sin(Double(cam.rot.0) * d2r)
+        let cy = cos(Double(cam.rot.1) * d2r), sy = sin(Double(cam.rot.1) * d2r)
+        let cr = cos(Double(cam.rot.2) * d2r), sr = sin(Double(cam.rot.2) * d2r)
+        // 相机三轴（UE4 FRotationMatrix）
+        let fx = cp * cy
+        let fy = cp * sy
+        let fz = sp
+        let rx = sr * sp * cy - cr * sy
+        let ry = sr * sp * sy + cr * cy
+        let rz = -sr * cp
+        let ux = -(cr * sp * cy + sr * sy)
+        let uy = cy * sr - cr * sp * sy
+        let uz = cr * cp
+
+        let dx = Double(wx) - Double(cam.loc.0)
+        let dy = Double(wy) - Double(cam.loc.1)
+        let dz = Double(wz) - Double(cam.loc.2)
+
+        let zc = dx * fx + dy * fy + dz * fz
+        guard zc > 1.0 else { return nil }              // 在相机身后
+        let xc = dx * rx + dy * ry + dz * rz
+        let yc = dx * ux + dy * uy + dz * uz
+
+        let tanX = tan(Double(cam.fov) * d2r / 2)
+        guard tanX > 0.0001 else { return nil }
+        let tanY = tanX * screenH / screenW
+        let ndcX = (xc / zc) / tanX
+        let ndcY = (yc / zc) / tanY
+        return ((1 + ndcX) * screenW / 2, (1 - ndcY) * screenH / 2)
+    }
+
+    // MARK: - 自动追踪用的读取层
+    //
+    // 手动按钮那条路是"每次操作都 task_for_pid → 读完就释放"。这条在 20–30Hz 上
+    // 不成立：光端口管理就是每秒几十次内核往返。所以这里做三件事：
+    //   ① 长连接端口：attach 一次持有，detach 时释放
+    //   ② 偏移表缓存：`Offsets.load()` 每次都会去 Documents 试读 offsets.txt，
+    //      那是文件系统调用，绝不能出现在高频路径上
+    //   ③ 两段式读取：短链（自己+相机）走高频，长链（actor 遍历）走低频
+
+    /// 持有中的 task port。0 = 未 attach。
+    private static var longPort: MachPort = 0
+    private static var longPid: Int32 = 0
+
+    static var isAttached: Bool { longPort != 0 }
+    static var attachedPid: Int32 { longPid }
+
+    /// 建立长连接端口。**同一个 pid 重复调用直接复用，不重复 attach。**
+    static func attachPort(_ pid: Int32) -> (ok: Bool, note: String) {
+        if longPort != 0, longPid == pid { return (true, "复用现有端口") }
+        if longPort != 0 { detachPort() }
+        let (kr, p) = port(for: pid)
+        guard kr == KERN_SUCCESS, p != 0 else {
+            return (false, "task_for_pid 失败 \(describe(kr))")
+        }
+        longPort = p
+        longPid = pid
+        cachedOffsets = nil
+        return (true, "新建端口 pid=\(pid)")
+    }
+
+    /// 释放长连接端口。**必须与 attachPort 配对。**
+    static func detachPort() {
+        if longPort != 0 { dropPort(longPort) }
+        longPort = 0
+        longPid = 0
+    }
+
+    /// 偏移表缓存（见上方说明）。
+    private static var cachedOffsets: Offsets?
+
+    static var offsets: Offsets {
+        if let c = cachedOffsets { return c }
+        let o = Offsets.load()
+        cachedOffsets = o
+        return o
+    }
+
+    /// 自身 + 相机的一次快照（高频层产出）。
+    struct SelfSnapshot {
+        var pc: UInt64 = 0
+        var pawn: UInt64 = 0
+        var loc: (Float, Float, Float) = (0, 0, 0)
+        var camera = CameraPose()
+        var valid = false
+    }
+
+    /// 一个真实存在于客户端的目标（低频层产出）。
+    struct TargetSnapshot {
+        var actor: UInt64 = 0
+        var cls = ""
+        var loc: (Float, Float, Float) = (0, 0, 0)
+        var isSelf = false
+    }
+
+    /// 一次全量扫描的结果。
+    struct TargetScan {
+        var targets: [TargetSnapshot] = []
+        var classes: [String: Int] = [:]
+        /// 本轮读到的世界对象 —— 高频层要用它走 GWorld → LocalPlayers
+        var world: UInt64 = 0
+        /// 本机 PlayerController 与它的 Pawn。**高频层靠这个锚点活下去**：
+        /// `LocalPlayers` 那条路在本机被 bUseEncryptLocalPlayerPtr 挡着，拿不到 PC 就
+        /// 连自己是谁都定位不了。扫描时顺手记下来，20Hz 那层就不用再遍历一遍。
+        var localPC: UInt64 = 0
+        var localPawn: UInt64 = 0
+        var scanned = 0
+        var usedMappings: Int = 0
+        var vmReads: Int = 0
+        var note = ""
+    }
+
+    private static func readWorldPointer(_ p: MachPort) -> UInt64? {
+        guard imageSlide != 0 else { return nil }
+        let (rk, w) = readRaw(port: p, address: MachVmAddress(runtime(offsets.gWorld, slide: imageSlide)))
+        return (rk == KERN_SUCCESS && w > 0x100000000) ? w : nil
+    }
+
+    /// 高频层：只走「自己 + 相机」这条短链，全程约 15–20 次小读。
+    ///
+    /// GWorld → OwningGameInstance(0xB20) → LocalPlayers(0x48) → UPlayer+0x30 → PlayerController
+    ///   → Pawn{ AcknowledgedPawn(0x660) / Pawn(0x5D8) }
+    ///   → RootComponent(0x260) → ComponentToWorld(0x1F0)+0x10 → FVector
+    ///   → CameraManager(0x680) → CameraCache(0x640)+0x10 → POV{Loc 0x00, Rot 0x18, FOV 0x30}
+    ///
+    /// `hintPC` 来自低频层：LocalPlayers 那条路可能被 `bUseEncryptLocalPlayerPtr` 挡住，
+    /// 那时用它兜底（本机实测就是这种情况）。
+    static func readSelfAndCamera(hintPC: UInt64, world: UInt64) -> SelfSnapshot {
+        var snap = SelfSnapshot()
+        guard longPort != 0 else { return snap }
+        let p = longPort
+
+        // ① 自己的 PlayerController
+        var pc: UInt64 = 0
+        if world > 0x100000000 {
+            let (rkG, gi) = readRaw(port: p, address: MachVmAddress(world &+ 0xB20))
+            if rkG == KERN_SUCCESS, gi > 0x100000000 {
+                let (rkL, lp) = readBytes(port: p, address: MachVmAddress(gi &+ 0x48), count: 16)
+                if rkL == KERN_SUCCESS, lp.count >= 16 {
+                    let data = u64le(lp, 0)
+                    let cnt = u32le(lp, 8)
+                    if data > 0x100000000, cnt > 0, cnt <= 8 {
+                        let (rkP0, lplayer) = readRaw(port: p, address: MachVmAddress(data))
+                        if rkP0 == KERN_SUCCESS, lplayer > 0x100000000 {
+                            let (rkPC, got) = readRaw(port: p, address: MachVmAddress(lplayer &+ 0x30))
+                            if rkPC == KERN_SUCCESS, got > 0x100000000 { pc = got }
+                        }
+                    }
+                }
+            }
+        }
+        if pc == 0 { pc = hintPC }
+        guard pc > 0x100000000 else { return snap }
+        snap.pc = pc
+
+        // ② Pawn 与世界坐标
+        var pawn: UInt64 = 0
+        let (rkA, ack) = readRaw(port: p, address: MachVmAddress(pc &+ 0x660))
+        if rkA == KERN_SUCCESS, ack > 0x100000000 {
+            pawn = ack
+        } else {
+            let (rkP, pw) = readRaw(port: p, address: MachVmAddress(pc &+ 0x5D8))
+            if rkP == KERN_SUCCESS, pw > 0x100000000 { pawn = pw }
+        }
+        guard pawn > 0x100000000 else { return snap }
+        snap.pawn = pawn
+
+        let (rkR, root) = readRaw(port: p, address: MachVmAddress(pawn &+ 0x260))
+        guard rkR == KERN_SUCCESS, root > 0x100000000 else { return snap }
+        let (rkT, tf) = readBytes(port: p, address: MachVmAddress(root &+ 0x1F0 &+ 0x10), count: 12)
+        guard rkT == KERN_SUCCESS, tf.count >= 12 else { return snap }
+        snap.loc = (floatAt(tf, 0), floatAt(tf, 4), floatAt(tf, 8))
+
+        // ③ 相机
+        let (rkC, cm) = readRaw(port: p, address: MachVmAddress(pc &+ 0x680))
+        if rkC == KERN_SUCCESS, cm > 0x100000000 {
+            let (rkPov, pov) = readBytes(port: p,
+                                         address: MachVmAddress(cm &+ 0x640 &+ 0x10),
+                                         count: 0x60)
+            if rkPov == KERN_SUCCESS, pov.count >= 0x34 {
+                let fov = floatAt(pov, 0x30)
+                snap.camera = CameraPose(
+                    loc: (floatAt(pov, 0x00), floatAt(pov, 0x04), floatAt(pov, 0x08)),
+                    rot: (floatAt(pov, 0x18), floatAt(pov, 0x1C), floatAt(pov, 0x20)),
+                    fov: fov,
+                    valid: fov > 1 && fov < 179)
+            }
+        }
+        snap.valid = true
+        return snap
+    }
+
+    /// 低频层：遍历所有关卡的 actor，筛出「客户端手上真实存在的身体」。
+    ///
+    /// 这条链长（本机实测 13 个关卡合计约 650 个 actor），所以只在 1–2Hz 上跑。
+    /// 两条硬要求：
+    ///   · **每一个关卡都要遍历** —— 之前只挑"最大的那个关卡"，结果玩家所在的
+    ///     PersistentLevel 被跳过，角色数直接是 0
+    ///   · 类名解析按 Class 指针**去重** —— 同类对象共享 Class，解析次数只跟
+    ///     "有多少种类"有关，不跟 actor 数量有关
+    static func scanTargets() -> TargetScan {
+        var out = TargetScan()
+        guard longPort != 0 else { out.note = "未 attach"; return out }
+        let p = longPort
+        let off = offsets
+        let vmBefore = vmReadCalls
+
+        guard let world = readWorldPointer(p) else {
+            out.note = "读 GWorld 失败"
+            return out
+        }
+        out.world = world
+        let (rkPool, pool) = readRaw(port: p, address: MachVmAddress(runtime(off.gNames, slide: imageSlide)))
+        guard rkPool == KERN_SUCCESS, pool > 0x100000000 else {
+            out.note = "读 GNames 槽失败"
+            return out
+        }
+        let (rkChunk, chunk0) = readRaw(port: p, address: MachVmAddress(pool))
+        guard rkChunk == KERN_SUCCESS, chunk0 > 0x100000000 else {
+            out.note = "读名字池 chunk0 失败"
+            return out
+        }
+
+        // 收集 actor 源：PersistentLevel + UWorld::Levels 里的每一个
+        var sources: [(label: String, data: UInt64, count: Int)] = []
+        let (rkL, level) = readRaw(port: p, address: MachVmAddress(world &+ 0xB8))
+        if rkL == KERN_SUCCESS, level > 0x100000000 {
+            let (rkA, arr) = readBytes(port: p, address: MachVmAddress(level &+ 0xA0), count: 16)
+            if rkA == KERN_SUCCESS, arr.count >= 16 {
+                let d = u64le(arr, 0)
+                let c = Int(u32le(arr, 8))
+                if d > 0x100000000, c > 0, c <= 200_000 {
+                    sources.append(("Persistent", d, c))
+                }
+            }
+        }
+        let (rkLv, lvHdr) = readBytes(port: p, address: MachVmAddress(world &+ 0x0AF0), count: 16)
+        if rkLv == KERN_SUCCESS, lvHdr.count >= 16 {
+            let d = u64le(lvHdr, 0)
+            let c = Int(u32le(lvHdr, 8))
+            if d > 0x100000000, c > 0, c <= 4096 {
+                let probe = min(c, 64)
+                let (rkP, ptrs) = readBytes(port: p, address: MachVmAddress(d), count: probe * 8)
+                if rkP == KERN_SUCCESS, ptrs.count >= probe * 8 {
+                    for k in 0..<probe {
+                        let lv = u64le(ptrs, k * 8)
+                        guard lv > 0x100000000, lv != level else { continue }
+                        let (rkA2, a2) = readBytes(port: p, address: MachVmAddress(lv &+ 0xA0), count: 16)
+                        guard rkA2 == KERN_SUCCESS, a2.count >= 16 else { continue }
+                        let d2 = u64le(a2, 0)
+                        let c2 = Int(u32le(a2, 8))
+                        guard d2 > 0x100000000, c2 > 0, c2 <= 100_000 else { continue }
+                        sources.append(("Level[\(k)]", d2, c2))
+                    }
+                }
+            }
+        }
+        guard !sources.isEmpty else {
+            out.note = "没有拿到任何关卡的 actor 源"
+            return out
+        }
+
+        var classNames: [UInt64: String] = [:]
+        var seen = 0
+        var stopped: String?
+        sourceLoop: for src in sources {
+            var cursor = 0
+            while cursor < src.count {
+                if vmReadCalls - vmBefore > 200 {
+                    stopped = "mach_vm_read 超预算，提前收手"
+                    break sourceLoop
+                }
+                if seen >= 3000 {
+                    stopped = "达到 3000 上限"
+                    break sourceLoop
+                }
+                let batch = min(500, src.count - cursor)
+                let (rkBuf, buf) = readBytes(port: p,
+                                             address: MachVmAddress(src.data &+ UInt64(cursor * 8)),
+                                             count: batch * 8)
+                guard rkBuf == KERN_SUCCESS, buf.count >= batch * 8 else { break }
+                for i in 0..<batch {
+                    let actor = u64le(buf, i * 8)
+                    guard actor > 0x100000000 else { continue }
+                    let (rkCls, cls) = readRaw(port: p, address: MachVmAddress(actor &+ 0x10))
+                    guard rkCls == KERN_SUCCESS, cls > 0x100000000 else { continue }
+                    var nm = classNames[cls]
+                    if nm == nil {
+                        let (rkIX, clsIX) = readAt(port: p, address: MachVmAddress(cls &+ 0x18))
+                        nm = (rkIX == KERN_SUCCESS)
+                            ? resolveName(port: p, pool: pool, chunk0: chunk0, index: clsIX)
+                            : "?"
+                        classNames[cls] = nm
+                    }
+                    let name = nm ?? "?"
+                    out.classes[name, default: 0] += 1
+
+                    // 顺手认出本机 PlayerController —— 高频层的锚点，见 TargetScan 注释
+                    if name.contains("PlayerController"), out.localPC == 0 {
+                        let (rkLf, lf) = readAt(port: p, address: MachVmAddress(actor &+ 0xA8C))
+                        if rkLf == KERN_SUCCESS, (lf & 0xFF) == 1 {
+                            out.localPC = actor
+                            let (rkPw, pw) = readRaw(port: p, address: MachVmAddress(actor &+ 0x5D8))
+                            if rkPw == KERN_SUCCESS, pw > 0x100000000 { out.localPawn = pw }
+                        }
+                    }
+
+                    guard name.contains("Character")
+                        || (name.contains("Pawn") && !name.contains("Mode")) else { continue }
+                    var t = TargetSnapshot()
+                    t.actor = actor
+                    t.cls = name
+                    let (rkR, root) = readRaw(port: p, address: MachVmAddress(actor &+ 0x260))
+                    if rkR == KERN_SUCCESS, root > 0x100000000 {
+                        let (rkT, tf) = readBytes(port: p,
+                                                  address: MachVmAddress(root &+ 0x1F0 &+ 0x10),
+                                                  count: 12)
+                        if rkT == KERN_SUCCESS, tf.count >= 12 {
+                            t.loc = (floatAt(tf, 0), floatAt(tf, 4), floatAt(tf, 8))
+                        }
+                    }
+                    out.targets.append(t)
+                }
+                cursor += batch
+                seen += batch
+            }
+        }
+        out.scanned = seen
+        out.usedMappings = mappedRanges.count
+        out.vmReads = vmReadCalls - vmBefore
+        out.note = "\(sources.count) 个关卡 / 遍历 \(seen) 个 actor"
+            + (stopped.map { "（\($0)）" } ?? "")
+        return out
     }
 
     /// 按绝对地址读 4 字节。**只有 3 个参数**。
@@ -1461,40 +1819,11 @@ final class MemoryProbe {
         lines.append("屏幕: \(Int(scrW)) × \(Int(scrH))"
             + (scrW > 1 && scrH > 1 ? "" : "（UI 层还没写入尺寸，投影会跳过）"))
 
-        /// UE4 约定：X 前 / Y 右 / Z 上，Yaw 绕 Z、Pitch 绕 Y、Roll 绕 X，
-        /// `FMinimalViewInfo.FOV` 是**水平**视角。返回屏幕逻辑坐标（左上原点）。
+        // 投影统一走 MemoryProbe.projectPoint —— 手动按钮和自动追踪共用同一份，
+        // 免得两处公式各自演化（上一轮审查刚吃过"两套逻辑不同步"的亏）。
+        let camPose = CameraPose(loc: camLoc, rot: camRot, fov: camFov, valid: camReady)
         func project(_ wx: Float, _ wy: Float, _ wz: Float) -> (Double, Double)? {
-            guard camReady, scrW > 1, scrH > 1 else { return nil }
-            let d2r = Double.pi / 180
-            let cp = cos(Double(camRot.0) * d2r), sp = sin(Double(camRot.0) * d2r)
-            let cy = cos(Double(camRot.1) * d2r), sy = sin(Double(camRot.1) * d2r)
-            let cr = cos(Double(camRot.2) * d2r), sr = sin(Double(camRot.2) * d2r)
-            // 相机三轴（UE4 FRotationMatrix）
-            let fx = cp * cy
-            let fy = cp * sy
-            let fz = sp
-            let rx = sr * sp * cy - cr * sy
-            let ry = sr * sp * sy + cr * cy
-            let rz = -sr * cp
-            let ux = -(cr * sp * cy + sr * sy)
-            let uy = cy * sr - cr * sp * sy
-            let uz = cr * cp
-
-            let dx = Double(wx) - Double(camLoc.0)
-            let dy = Double(wy) - Double(camLoc.1)
-            let dz = Double(wz) - Double(camLoc.2)
-
-            let zc = dx * fx + dy * fy + dz * fz
-            guard zc > 1.0 else { return nil }              // 在相机身后
-            let xc = dx * rx + dy * ry + dz * rz
-            let yc = dx * ux + dy * uy + dz * uz
-
-            let tanX = tan(Double(camFov) * d2r / 2)
-            guard tanX > 0.0001 else { return nil }
-            let tanY = tanX * scrH / scrW                   // 水平 FOV 折算垂直
-            let ndcX = (xc / zc) / tanX
-            let ndcY = (yc / zc) / tanY
-            return ((1 + ndcX) * scrW / 2, (1 - ndcY) * scrH / 2)
+            MemoryProbe.projectPoint(wx, wy, wz, camera: camPose, screenW: scrW, screenH: scrH)
         }
 
         // PlayerState 段：**这里才是把「档案」和「身体」对上号的地方**。
