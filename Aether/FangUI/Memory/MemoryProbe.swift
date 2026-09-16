@@ -1355,6 +1355,35 @@ final class MemoryProbe {
             lines.append("PlayerController: 0 个（本次遍历里没抓到这类 actor）")
         }
 
+        // 先把自己钉死：PlayerController 里 bIsLocalPlayerController==1 的那个，
+        // 它的 Pawn 就是你的身体。**这是整条链的锚点** —— 有了自己才能算相对位置。
+        var myPawn: UInt64 = 0
+        var myName = ""
+        for c in ctrlActors {
+            let (r3, lf) = readAt(port: p, address: MachVmAddress(c &+ 0xA8C))
+            guard r3 == KERN_SUCCESS, (lf & 0xFF) == 1 else { continue }
+            let (r1, pawn) = readRaw(port: p, address: MachVmAddress(c &+ 0x5D8))
+            if r1 == KERN_SUCCESS, pawn > 0x100000000 { myPawn = pawn }
+            let (r4, ps) = readRaw(port: p, address: MachVmAddress(c &+ 0x5F0))
+            if r4 == KERN_SUCCESS, ps > 0x100000000 { myName = readText(port: p, addr: ps &+ 0x5D8) }
+            break
+        }
+        var myLoc: (Float, Float, Float)?
+        if myPawn > 0x100000000 {
+            let (rkMr, root) = readRaw(port: p, address: MachVmAddress(myPawn &+ 0x260))
+            if rkMr == KERN_SUCCESS, root > 0x100000000 {
+                let (rkMt, tf) = readBytes(port: p, address: MachVmAddress(root &+ 0x1F0 + 0x10), count: 12)
+                if rkMt == KERN_SUCCESS, tf.count >= 12 {
+                    myLoc = (floatAt(tf, 0), floatAt(tf, 4), floatAt(tf, 8))
+                }
+            }
+            lines.append("自己: Pawn=\(hexOf(myPawn))"
+                + (myName.isEmpty ? "" : "  名字=\"\(myName)\"")
+                + (myLoc.map { "  位置=(\(fmt1($0.0)), \(fmt1($0.1)), \(fmt1($0.2)))" } ?? "  位置读失败"))
+        } else {
+            lines.append("自己: 没找到带 local=1 的 PlayerController（没进对局或该类没被抓到）")
+        }
+
         if charActors.isEmpty {
             lines.append("角色: 0 个 —— 这 \(sources.count) 个关卡的 \(seen) 个 actor 里没有 Character/Pawn")
         } else {
@@ -1370,8 +1399,7 @@ final class MemoryProbe {
                 if rkC == KERN_SUCCESS, ctrl > 0x100000000 {
                     let (rkL, lf) = readAt(port: p, address: MachVmAddress(ctrl &+ 0xA8C))
                     if rkL == KERN_SUCCESS {
-                        extra += "  local=\(lf & 0xFF)"
-                        if (lf & 0xFF) == 1 { extra += " ★这是你"; localCount += 1 }
+                        extra += "  ctrlLocal=\(lf & 0xFF)"
                     }
                 } else {
                     ctrlZero += 1
@@ -1392,8 +1420,20 @@ final class MemoryProbe {
                 if rkT == KERN_SUCCESS, tf.count >= 12 {
                     let x = floatAt(tf, 0), y = floatAt(tf, 4), z = floatAt(tf, 8)
                     let ok = (x != 0 || y != 0) && abs(x) < 5e6 && abs(y) < 5e6 && abs(z) < 1e5
+                    var tail = ""
+                    if myPawn > 0x100000000 && a == myPawn {
+                        tail += "  ★这是你"
+                        localCount += 1
+                    } else if let my = myLoc {
+                        // 坐标单位是厘米，这里换算成米 —— 这就是 ESP 真正要用的那个数
+                        let dx = Double(x) - Double(my.0)
+                        let dy = Double(y) - Double(my.1)
+                        let dz = Double(z) - Double(my.2)
+                        let dist = (dx * dx + dy * dy + dz * dz).squareRoot() / 100.0
+                        tail += "  距离你 \(String(format: "%.0f", dist)) 米"
+                    }
                     lines.append("  [\(i)] @\(hexOf(a)) [\(home)]  Loc=(\(fmt1(x)), \(fmt1(y)), \(fmt1(z))) "
-                        + (ok ? "✓" : "✗ 量级不对") + extra)
+                        + (ok ? "✓" : "✗ 量级不对") + tail + extra)
                 } else {
                     lines.append("  [\(i)] @\(hexOf(a)) [\(home)]  ComponentToWorld 读失败 \(describe(rkT))" + extra)
                 }
