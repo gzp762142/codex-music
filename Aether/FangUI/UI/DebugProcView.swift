@@ -176,6 +176,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         probeStarted = Date()
         probeLabel.text = pending
         probeLabel.textColor = idleText
+        // 屏幕尺寸在主线程取一次交给探测层 —— 投影跑在后台线程，不该去碰 UIScreen。
+        MemoryProbe.screenSize = UIScreen.main.bounds.size
         let pid = gpid
 
         // 每个动作前统一绑定目标进程 —— 没有这一步，按需映射那条路根本不会启动

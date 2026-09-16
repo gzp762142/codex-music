@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import CoreGraphics
 
 /// 读内存探针：**只读**，不写、不 hook、不注入。**只有一条路**。
 ///
@@ -249,6 +250,10 @@ final class MemoryProbe {
 
     /// 当前会话的 pid —— 按需映射时要用它取端口。
     private(set) static var activePid: Int32 = 0
+
+    /// 屏幕逻辑尺寸。**由 UI 层在主线程写进来** —— 投影跑在后台线程，
+    /// 不该在后台去碰 `UIScreen`。没设置过（0×0）时投影会直接放弃，不会算出垃圾坐标。
+    static var screenSize: CGSize = .zero
 
     /// 绑定本次操作的目标进程。**每个动作开始前都要调** ——
     /// 上一版只在「找村口」/「映射」里绑定，于是直接点「对象」时 activePid 还是 0，
@@ -1360,10 +1365,12 @@ final class MemoryProbe {
         // 先把自己钉死：PlayerController 里 bIsLocalPlayerController==1 的那个，
         // 它的 Pawn 就是你的身体。**这是整条链的锚点** —— 有了自己才能算相对位置。
         var myPawn: UInt64 = 0
+        var myPC: UInt64 = 0
         var myName = ""
         for c in ctrlActors {
             let (r3, lf) = readAt(port: p, address: MachVmAddress(c &+ 0xA8C))
             guard r3 == KERN_SUCCESS, (lf & 0xFF) == 1 else { continue }
+            myPC = c
             let (r1, pawn) = readRaw(port: p, address: MachVmAddress(c &+ 0x5D8))
             if r1 == KERN_SUCCESS, pawn > 0x100000000 { myPawn = pawn }
             let (r4, ps) = readRaw(port: p, address: MachVmAddress(c &+ 0x5F0))
@@ -1384,6 +1391,76 @@ final class MemoryProbe {
                 + (myLoc.map { "  位置=(\(fmt1($0.0)), \(fmt1($0.1)), \(fmt1($0.2)))" } ?? "  位置读失败"))
         } else {
             lines.append("自己: 没找到带 local=1 的 PlayerController（没进对局或该类没被抓到）")
+        }
+
+        // ── 相机：世界坐标 → 屏幕坐标的最后一步 ───────────────────────────
+        //   APlayerController     + 0x0680 → APlayerCameraManager*
+        //   APlayerCameraManager  + 0x0640 → FCameraCacheEntry（POV 在 +0x10）
+        //   FMinimalViewInfo      +0x00 Location · +0x18 Rotation · +0x30 FOV
+        // 三次读拿全（PC → CameraManager → POV 那 0x60 字节）。
+        var camLoc: (Float, Float, Float) = (0, 0, 0)
+        var camRot: (Float, Float, Float) = (0, 0, 0)
+        var camFov: Float = 0
+        var camReady = false
+        if myPC > 0x100000000 {
+            let (rkCm, cm) = readRaw(port: p, address: MachVmAddress(myPC &+ 0x680))
+            if rkCm == KERN_SUCCESS, cm > 0x100000000 {
+                let (rkPov, pov) = readBytes(port: p,
+                                             address: MachVmAddress(cm &+ 0x640 &+ 0x10),
+                                             count: 0x60)
+                if rkPov == KERN_SUCCESS, pov.count >= 0x34 {
+                    camLoc = (floatAt(pov, 0x00), floatAt(pov, 0x04), floatAt(pov, 0x08))
+                    camRot = (floatAt(pov, 0x18), floatAt(pov, 0x1C), floatAt(pov, 0x20))
+                    camFov = floatAt(pov, 0x30)
+                    camReady = camFov > 1 && camFov < 179
+                }
+            }
+        }
+        lines.append("相机: " + (camReady
+            ? "位置=(\(fmt1(camLoc.0)), \(fmt1(camLoc.1)), \(fmt1(camLoc.2)))"
+                + "  朝向=(P\(fmt1(camRot.0)) Y\(fmt1(camRot.1)) R\(fmt1(camRot.2)))"
+                + "  FOV=\(fmt1(camFov))"
+            : "读失败（没进对局，或 PC 没抓到）"))
+
+        let scrW = Double(screenSize.width)
+        let scrH = Double(screenSize.height)
+        lines.append("屏幕: \(Int(scrW)) × \(Int(scrH))"
+            + (scrW > 1 && scrH > 1 ? "" : "（UI 层还没写入尺寸，投影会跳过）"))
+
+        /// UE4 约定：X 前 / Y 右 / Z 上，Yaw 绕 Z、Pitch 绕 Y、Roll 绕 X，
+        /// `FMinimalViewInfo.FOV` 是**水平**视角。返回屏幕逻辑坐标（左上原点）。
+        func project(_ wx: Float, _ wy: Float, _ wz: Float) -> (Double, Double)? {
+            guard camReady, scrW > 1, scrH > 1 else { return nil }
+            let d2r = Double.pi / 180
+            let cp = cos(Double(camRot.0) * d2r), sp = sin(Double(camRot.0) * d2r)
+            let cy = cos(Double(camRot.1) * d2r), sy = sin(Double(camRot.1) * d2r)
+            let cr = cos(Double(camRot.2) * d2r), sr = sin(Double(camRot.2) * d2r)
+            // 相机三轴（UE4 FRotationMatrix）
+            let fx = cp * cy
+            let fy = cp * sy
+            let fz = sp
+            let rx = sr * sp * cy - cr * sy
+            let ry = sr * sp * sy + cr * cy
+            let rz = -sr * cp
+            let ux = -(cr * sp * cy + sr * sy)
+            let uy = cy * sr - cr * sp * sy
+            let uz = cr * cp
+
+            let dx = Double(wx) - Double(camLoc.0)
+            let dy = Double(wy) - Double(camLoc.1)
+            let dz = Double(wz) - Double(camLoc.2)
+
+            let zc = dx * fx + dy * fy + dz * fz
+            guard zc > 1.0 else { return nil }              // 在相机身后
+            let xc = dx * rx + dy * ry + dz * rz
+            let yc = dx * ux + dy * uy + dz * uz
+
+            let tanX = tan(Double(camFov) * d2r / 2)
+            guard tanX > 0.0001 else { return nil }
+            let tanY = tanX * scrH / scrW                   // 水平 FOV 折算垂直
+            let ndcX = (xc / zc) / tanX
+            let ndcY = (yc / zc) / tanY
+            return ((1 + ndcX) * scrW / 2, (1 - ndcY) * scrH / 2)
         }
 
         // PlayerState 段：**这里才是把「档案」和「身体」对上号的地方**。
@@ -1452,8 +1529,16 @@ final class MemoryProbe {
                         let dist = (dx * dx + dy * dy + dz * dz).squareRoot() / 100.0
                         tail = "  \(String(format: "%5.0f", dist))m"
                     }
-                    // 距离放在最前面：行太长时面板会截断尾部，之前就是这样把距离吃掉过。
-                    lines.append("  [\(i)]\(tail)  (\(fmt1(x)), \(fmt1(y)), \(fmt1(z)))"
+                    // 屏幕坐标：**这是 ESP 真正要画的那个点**。
+                    var scrTxt = ""
+                    if let pt = project(x, y, z) {
+                        let inView = pt.0 >= 0 && pt.0 <= scrW && pt.1 >= 0 && pt.1 <= scrH
+                        scrTxt = "  屏幕(\(Int(pt.0)), \(Int(pt.1)))" + (inView ? "" : " 屏外")
+                    } else {
+                        scrTxt = "  屏幕(身后)"
+                    }
+                    // 距离和屏幕坐标都排在最前面：面板会截断长行，之前就是这样把距离吃掉过。
+                    lines.append("  [\(i)]\(tail)\(scrTxt)  (\(fmt1(x)), \(fmt1(y)), \(fmt1(z)))"
                         + (ok ? "" : "  ✗量级") + extra + "  @\(hexOf(a))")
                 } else {
                     lines.append("  [\(i)]        @\(hexOf(a))  ComponentToWorld 读失败 \(describe(rkT))" + extra)
