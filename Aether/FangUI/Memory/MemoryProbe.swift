@@ -1258,6 +1258,7 @@ final class MemoryProbe {
         var charActors: [UInt64] = []
         var charHomes: [UInt64: String] = [:]
         var ctrlActors: [UInt64] = []
+        var psActors: [UInt64] = []
         var seen = 0
         var stopped = false
 
@@ -1307,6 +1308,9 @@ final class MemoryProbe {
                     }
                     if name.contains("PlayerController") {
                         ctrlActors.append(actor)
+                    }
+                    if name.contains("PlayerState") {
+                        psActors.append(actor)
                     }
                 }
                 cursor += batch
@@ -1384,26 +1388,44 @@ final class MemoryProbe {
             lines.append("自己: 没找到带 local=1 的 PlayerController（没进对局或该类没被抓到）")
         }
 
+        // PlayerState 段：**这里才是把「档案」和「身体」对上号的地方**。
+        // 从 Pawn 正着读 PlayerState(0x5F0) 在客户端是空的，但反方向是通的：
+        //   ASTExtraPlayerState + 0x16C0 CharacterOwner  → 那个人的身体
+        //   ASTExtraPlayerState + 0x16D0 PlayerHealth    → 血量 / 上限
+        //   APlayerState        + 0x05D8 PlayerName      → 名字
+        // 有名字 + 有血量 + 有身体的，才是真人玩家。
+        if !psActors.isEmpty {
+            lines.append("PlayerState（\(psActors.count) 个）:")
+            for (i, s) in psActors.prefix(16).enumerated() {
+                let nm = readText(port: p, addr: s &+ 0x5D8)
+                let (rkCh, ch) = readRaw(port: p, address: MachVmAddress(s &+ 0x16C0))
+                let (rkHp, hpSeg) = readBytes(port: p, address: MachVmAddress(s &+ 0x16D0), count: 8)
+                var l = "  [\(i)]"
+                if !nm.isEmpty { l += " \"\(nm)\"" }
+                if rkHp == KERN_SUCCESS, hpSeg.count >= 8 {
+                    l += "  HP=\(fmt1(floatAt(hpSeg, 0)))/\(fmt1(floatAt(hpSeg, 4)))"
+                }
+                l += "  Char=\(rkCh == KERN_SUCCESS && ch > 0x100000000 ? hexOf(ch) : "空")"
+                if myPawn > 0x100000000, ch == myPawn { l += "  ★这是你" }
+                lines.append(l)
+            }
+        } else {
+            lines.append("PlayerState: 0 个（这类 actor 没抓到）")
+        }
+
         if charActors.isEmpty {
             lines.append("角色: 0 个 —— 这 \(sources.count) 个关卡的 \(seen) 个 actor 里没有 Character/Pawn")
         } else {
             lines.append("角色: \(charActors.count) 个 —— 每个都是客户端手上真实存在的身体")
             var localCount = 0
-            var ctrlZero = 0
             for (i, a) in charActors.prefix(24).enumerated() {
-                let home = charHomes[a] ?? "?"
                 var extra = ""
                 // 身份：APawn + 0x608 → AController，再读 APlayerController + 0xA8C
                 // 的 bIsLocalPlayerController。这条路不碰 LocalPlayers，不受加密影响。
                 let (rkC, ctrl) = readRaw(port: p, address: MachVmAddress(a &+ 0x608))
                 if rkC == KERN_SUCCESS, ctrl > 0x100000000 {
                     let (rkL, lf) = readAt(port: p, address: MachVmAddress(ctrl &+ 0xA8C))
-                    if rkL == KERN_SUCCESS {
-                        extra += "  ctrlLocal=\(lf & 0xFF)"
-                    }
-                } else {
-                    ctrlZero += 1
-                    extra += "  ctrl=0"
+                    if rkL == KERN_SUCCESS, (lf & 0xFF) == 1 { extra += "  [本机控制器]" }
                 }
                 // 名字：APawn + 0x5F0 → APlayerState，再从 PlayerState + 0x5D8 读 FString
                 let (rkPS, ps) = readRaw(port: p, address: MachVmAddress(a &+ 0x5F0))
@@ -1420,9 +1442,9 @@ final class MemoryProbe {
                 if rkT == KERN_SUCCESS, tf.count >= 12 {
                     let x = floatAt(tf, 0), y = floatAt(tf, 4), z = floatAt(tf, 8)
                     let ok = (x != 0 || y != 0) && abs(x) < 5e6 && abs(y) < 5e6 && abs(z) < 1e5
-                    var tail = ""
+                    var tail = "     "
                     if myPawn > 0x100000000 && a == myPawn {
-                        tail += "  ★这是你"
+                        tail = "  ★你  "
                         localCount += 1
                     } else if let my = myLoc {
                         // 坐标单位是厘米，这里换算成米 —— 这就是 ESP 真正要用的那个数
@@ -1430,17 +1452,17 @@ final class MemoryProbe {
                         let dy = Double(y) - Double(my.1)
                         let dz = Double(z) - Double(my.2)
                         let dist = (dx * dx + dy * dy + dz * dz).squareRoot() / 100.0
-                        tail += "  距离你 \(String(format: "%.0f", dist)) 米"
+                        tail = "  \(String(format: "%5.0f", dist))m"
                     }
-                    lines.append("  [\(i)] @\(hexOf(a)) [\(home)]  Loc=(\(fmt1(x)), \(fmt1(y)), \(fmt1(z))) "
-                        + (ok ? "✓" : "✗ 量级不对") + tail + extra)
+                    // 距离放在最前面：行太长时面板会截断尾部，之前就是这样把距离吃掉过。
+                    lines.append("  [\(i)]\(tail)  (\(fmt1(x)), \(fmt1(y)), \(fmt1(z)))"
+                        + (ok ? "" : "  ✗量级") + extra + "  @\(hexOf(a))")
                 } else {
                     lines.append("  [\(i)] @\(hexOf(a)) [\(home)]  ComponentToWorld 读失败 \(describe(rkT))" + extra)
                 }
             }
             if localCount == 0 {
-                lines.append("  → 这 \(charActors.count) 个里没有一个 local=1；其中 Controller 为 0 的有 \(ctrlZero) 个"
-                    + "（无主 Pawn —— 多半是训练场展示假人，不是真人玩家控制的）")
+                lines.append("  → 这 \(charActors.count) 个里没有一个是本机 Pawn（你的 Pawn 可能没被遍历到）")
             }
         }
         lines.append(costLine())
