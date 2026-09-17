@@ -355,8 +355,11 @@ final class AutoTracker {
             let counters = "映射命中 \(MemoryProbe.mappedHitCalls)(+\(lastScanMappedHits))"
                 + " 按需映射 \(MemoryProbe.onDemandMapBlocks)(+\(lastScanOnDemand))"
                 + " 内核读 \(MemoryProbe.hardReadCalls)(+\(lastScanVMReads))"
-            // 抽查放后台队列算，结果留给列表单独一行 —— 状态行已经塞不下它了
+            // 抽查放后台队列算，结果留给列表单独一行 —— 状态行已经塞不下它了。
+            // 降权失败数挂在这行上：它必须是 0，而且要在状态机跑着的时候也看得见 ——
+            // 手动按钮的报告会被状态行/列表覆写，靠点按钮读不到它。
             protectionNote = MemoryProbe.spotCheckProtection()
+                + " · 降权失败 \(MemoryProbe.protectFailures)"
             setState(state == .degraded ? .degraded : .running,
                      "pid=\(targetPid) \(Int(fastHz))Hz tick=\(tickCount) 目标\(targets.count) 映射\(MemoryProbe.mappedBlockCount)块 \(cam) vm=\(fastTickVMReads)"
                      + " | \(counters)")
