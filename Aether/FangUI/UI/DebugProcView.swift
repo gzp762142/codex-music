@@ -269,10 +269,44 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     }
 
     /// 冷启动自动开启，只跑一次。`init` 与 `didMoveToWindow` 都会调它。
+    ///
+    /// **要的是「确保在跑」，不是「切换」。** `setTracker` 是个 toggle，
+    /// 而 `autoStarted` 只是**本实例**的守卫 —— 面板每次收放都会重建：
+    /// 音量- 走 `FangUIBridge.hide()`，那里把 `panel = nil`；下次弹出来时
+    /// `attachPanel` 会新建整个 `RootViewController`（连带本视图）。新实例的守卫是
+    /// false，于是又调一次 `setTracker`；而 `AutoTracker.shared` 是单例、`isRunning`
+    /// 早已是 true —— toggle 直接把跑着的状态机关掉。表现就是「开一下、关一下」，
+    /// 收放两次菜单等于白开。而 `RootView` 里音量- 的注释写的是「服务可继续跑」。
     private func autoStartOnce(from source: String) {
         guard !autoStarted else { return }
         autoStarted = true
+        let t = AutoTracker.shared
+        if t.isRunning {
+            // 服务本来就该继续跑。这里只把回调重新接到**当前**这个实例上 ——
+            // 旧视图已经释放，它那些闭包是弱引用，等于空转，新面板会一片空白。
+            claimTrackerCallbacks()
+            btnTracker.setTitleColor(accent, for: .normal)
+            probeLabel.text = "自动[\(t.state.rawValue)] \(t.detail)"
+            return
+        }
         setTracker(source)
+    }
+
+    /// 把状态机的两个回调接到**当前**这个面板实例上。
+    /// 面板重建后旧实例已经释放（闭包都是弱引用），必须重新认领，否则新面板收不到任何东西。
+    private func claimTrackerCallbacks() {
+        let t = AutoTracker.shared
+        MemoryProbe.screenSize = UIScreen.main.bounds.size
+        t.onStatus = { [weak self] text in
+            self?.probeLabel.text = text
+        }
+        t.onTargets = { [weak self] list, snap in
+            guard let s = self else { return }
+            let now = Date()
+            if now.timeIntervalSince(s.lastTrackerUI) < 0.25 { return }   // 列表 4Hz 就够
+            s.lastTrackerUI = now
+            s.renderTracker(list, snap)
+        }
     }
 
     /// 自动总开关。开启后不必再点任何按钮 —— 状态机自己 attach、找基址、持续出坐标；
@@ -293,17 +327,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
             probeLabel.text = "自动: 已停止（\(source)）"
             return
         }
-        MemoryProbe.screenSize = UIScreen.main.bounds.size
-        t.onStatus = { [weak self] text in
-            self?.probeLabel.text = text
-        }
-        t.onTargets = { [weak self] list, snap in
-            guard let s = self else { return }
-            let now = Date()
-            if now.timeIntervalSince(s.lastTrackerUI) < 0.25 { return }   // 列表 4Hz 就够
-            s.lastTrackerUI = now
-            s.renderTracker(list, snap)
-        }
+        claimTrackerCallbacks()
         t.start()
         btnTracker.setTitleColor(accent, for: .normal)
         probeLabel.text = "自动: 启动中…（\(source)）"
