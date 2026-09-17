@@ -272,15 +272,18 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     private func autoStartOnce(from source: String) {
         guard !autoStarted else { return }
         autoStarted = true
-        onTracker(source)
+        setTracker(source)
     }
 
     /// 自动总开关。开启后不必再点任何按钮 —— 状态机自己 attach、找基址、持续出坐标；
     /// 游戏退出会自动释放映射与端口，重开自动重挂。手动按钮**全部保留**，
     /// 两者走同一条串行队列，可以随时对照排查。
-    @objc private func onTracker() { onTracker("手动") }
+    ///
+    /// **带参数的那个不能也叫 onTracker**：重载会让 `#selector(onTracker)` 变成
+    /// 含糊引用（编译器直接报 "onTracker 用法含糊"），所以它另起名 setTracker。
+    @objc private func onTracker() { setTracker("手动") }
 
-    private func onTracker(_ source: String) {
+    private func setTracker(_ source: String) {
         let t = AutoTracker.shared
         if t.isRunning {
             t.onStatus = nil
