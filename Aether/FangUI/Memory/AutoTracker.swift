@@ -53,6 +53,10 @@ final class AutoTracker {
     private(set) var tickCount = 0
     private(set) var lastScanNote = ""
     private(set) var lastScanVMReads = 0
+    /// 本轮扫描走映射本地读的次数（累计值在 MemoryProbe 里）
+    private(set) var lastScanMappedHits = 0
+    /// 本轮扫描现场补建的映射块数
+    private(set) var lastScanOnDemand = 0
     private(set) var fastTickVMReads = 0
     private(set) var mappingBlocks = 0
 
@@ -264,9 +268,14 @@ final class AutoTracker {
 
     private func slowTick() {
         guard running, MemoryProbe.isAttached, baseReady else { return }
+        // 计数器一律取「本轮差值」：累计值看不出当下走的是映射还是内核
+        let mappedBefore = MemoryProbe.mappedHitCalls
+        let onDemandBefore = MemoryProbe.onDemandMapBlocks
         let scan = MemoryProbe.scanTargets()
         lastScanNote = scan.note
         lastScanVMReads = scan.vmReads
+        lastScanMappedHits = MemoryProbe.mappedHitCalls - mappedBefore
+        lastScanOnDemand = MemoryProbe.onDemandMapBlocks - onDemandBefore
         mappingBlocks = scan.usedMappings
 
         // 世界指针和本机 PlayerController **每拍更新** —— 换图/重生都会换对象，
@@ -338,8 +347,14 @@ final class AutoTracker {
             let cam = snap.camera.valid
                 ? "cam(\(Int(snap.camera.fov))°)"
                 : "cam无"
+            // 双口径：括号里是本轮增量（看当下走哪条路），前面是累计（看趋势 ——
+            // 内核读的累计值涨得太快，说明映射覆盖率不够，那是个独立信号）
+            let counters = "映射命中 \(MemoryProbe.mappedHitCalls)(+\(lastScanMappedHits))"
+                + " 按需映射 \(MemoryProbe.onDemandMapBlocks)(+\(lastScanOnDemand))"
+                + " 内核读 \(MemoryProbe.hardReadCalls)(+\(lastScanVMReads))"
             setState(state == .degraded ? .degraded : .running,
-                     "pid=\(targetPid) \(Int(fastHz))Hz tick=\(tickCount) 目标\(targets.count) 映射\(MemoryProbe.mappedBlockCount)块 \(cam) vm=\(fastTickVMReads)")
+                     "pid=\(targetPid) \(Int(fastHz))Hz tick=\(tickCount) 目标\(targets.count) 映射\(MemoryProbe.mappedBlockCount)块 \(cam) vm=\(fastTickVMReads)"
+                     + " | \(counters) | \(MemoryProbe.spotCheckProtection())")
         }
     }
 

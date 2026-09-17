@@ -178,6 +178,40 @@ final class MemoryProbe {
 
     private static let machVmRemapFn = symbol("mach_vm_remap", as: MachVmRemapFn.self)
 
+    /// `mach_vm_protect` —— 映射建立之后把权限压到只读。
+    ///
+    /// 为什么必须补这一步：`vm_remap` 的 cur/max protection 是**出参**，调用时指定不了；
+    /// 而 `copy = FALSE` 的共享映射默认就带**写**权限
+    /// （man page：the region is mapped read-write）。我们只读，握着一块能改游戏内存的
+    /// 窗口没有任何功能收益，只有风险。
+    private typealias MachVmProtectFn = @convention(c) (
+        UInt32,                              // target_task
+        UInt64,                              // address
+        UInt64,                              // size
+        Int32,                               // set_maximum
+        Int32                                // new_protection
+    ) -> KernReturn
+
+    private static let machVmProtectFn = symbol("mach_vm_protect", as: MachVmProtectFn.self)
+
+    private static let vmProtRead: Int32 = 0x1
+
+    /// 降权失败的累计次数。**验收要求它是 0**：每失败一次就意味着有一块映射被主动丢弃
+    /// （那是正确行为），但它同时说明 `mach_vm_protect` 在这个环境上不工作，要查。
+    private(set) static var downgradeFailureCount = 0
+
+    /// 把刚建立的映射压成只读。返回 false 表示**调用方必须丢弃这块映射**。
+    ///
+    /// `set_maximum = 1` 是刻意的：只降 current 的话「上限」还留着写权限，
+    /// 之后一句 `mach_vm_protect` 就能把 W 提回来。把上限本身压掉，写权限才真拿不回来。
+    ///
+    /// 抽成一个函数而不是两处各写一遍：降权是「protect + 失败清理 + 返回状态」三步，
+    /// 复制两份迟早漂移，读路径上不允许存在两种降权语义。
+    private static func downgradeToReadOnly(_ target: UInt64, total: UInt64) -> Bool {
+        guard let fn = machVmProtectFn else { return false }
+        return fn(mach_task_self_, target, total, 1, vmProtRead) == KERN_SUCCESS
+    }
+
     /// 已经建立起来的映射：游戏地址 → 我们的本地地址。
     private static var mappedRanges: [(gameBase: UInt64, size: UInt64, localBase: UInt64)] = []
     /// mappedRanges 是否已按 gameBase 排好序 —— localAddress 走二分，靠这个标志决定先不先排。
@@ -218,7 +252,12 @@ final class MemoryProbe {
     /// 游戏的 vm_map 锁是读写互斥的：它主线程每帧写坐标拿写锁，我们每读一次拿一次读锁，
     /// 两者不能同时进行。映射建立之后我们不再碰它的 map，读的是自己的页表。
     ///
-    /// `copy = TRUE` 是写时复制 —— 我们只读，永远不会改到游戏的页。
+    /// `copy = FALSE` 是**共享**映射：架子上放的是原书，游戏之后写的每个字都看得见。
+    /// 反过来 `copy = TRUE` 拿到的只是映射那一瞬间的**复印件** —— 冷启动时游戏还没建好
+    /// UWorld，槽里是 0，复印件上就永远是 0，之后不会跟着更新。那正是「连续 18 次读到
+    /// 0x0」的完整成因：不是有 18 次错误，是**只有一次**错误，被读成了 18 遍。
+    ///
+    /// 代价是共享映射默认带写权限，所以建立之后立刻要走 `downgradeToReadOnly`。
     static func mapRange(pid: Int32, srcAddress: UInt64, size: UInt64) -> (local: UInt64, note: String) {
         guard let fn = machVmRemapFn else { return (0, "mach_vm_remap 符号缺失") }
         let (kr, p) = port(for: pid)
@@ -235,9 +274,16 @@ final class MemoryProbe {
         var curProt: Int32 = 0
         var maxProt: Int32 = 0
         let rk = fn(mach_task_self_, &target, total, 0, vmFlagsAnywhere,
-                    p, alignedStart, 1, &curProt, &maxProt, 0)
+                    p, alignedStart, 0, &curProt, &maxProt, 0)
         guard rk == KERN_SUCCESS, target != 0 else {
             return (0, "mach_vm_remap 失败 \(describe(rk))")
+        }
+        // 共享映射建立时带写权限，立刻压成只读。压不下去就整块丢掉 ——
+        // 宁可少一块映射，也不留一个能改游戏内存的窗口。
+        guard downgradeToReadOnly(target, total: total) else {
+            _ = vmDeallocateFn?(mach_task_self_, UInt(target), total)
+            downgradeFailureCount += 1
+            return (0, "降权失败，已丢弃该映射（拒绝以可写状态持有游戏内存）")
         }
         mappedRanges.append((alignedStart, total, target))
         rangesSorted = false
@@ -374,13 +420,22 @@ final class MemoryProbe {
             var curProt: Int32 = 0
             var maxProt: Int32 = 0
             let rk = fn(mach_task_self_, &target, total, 0, vmFlagsAnywhere,
-                        p, aligned, 1, &curProt, &maxProt, 0)
-            if rk == KERN_SUCCESS, target != 0 {
+                        p, aligned, 0, &curProt, &maxProt, 0)
+            // 降权必须成功才算映射建立完成 —— 失败的块后面会被收掉
+            let downgraded = (rk == KERN_SUCCESS && target != 0)
+                ? downgradeToReadOnly(target, total: total)
+                : false
+            if rk == KERN_SUCCESS, target != 0, downgraded {
                 mappedRanges.append((aligned, total, target))
                 rangesSorted = false
                 mapped += 1
                 bytes += total
             } else {
+                // 降权失败的块必须自己收掉，不能把它挂在地址空间里当可写窗口
+                if rk == KERN_SUCCESS, target != 0 {
+                    _ = vmDeallocateFn?(mach_task_self_, UInt(target), total)
+                    downgradeFailureCount += 1
+                }
                 failed += 1
             }
         }
@@ -390,7 +445,11 @@ final class MemoryProbe {
         }
 
         let mb = String(format: "%.0f", Double(bytes) / 1048576.0)
-        return "预映射: \(mapped) 块 / \(mb) MB（扫 \(rounds) 个 region，跳过小块 \(skipped)，失败 \(failed)）"
+        // 降权失败是本批唯一「不能妥协」的那一项，报告里必须看得见
+        let protNote = downgradeFailureCount == 0
+            ? ""
+            : "，降权失败累计 \(downgradeFailureCount) 块已丢弃"
+        return "预映射: \(mapped) 块 / \(mb) MB（扫 \(rounds) 个 region，跳过小块 \(skipped)，失败 \(failed)\(protNote)）"
     }
 
     /// 已建立的映射块数 —— 调用方用它判断"要不要先预映射一轮"。
@@ -398,6 +457,36 @@ final class MemoryProbe {
 
     /// 真正落回 mach_vm_read 的次数。遍历类操作要盯着这个数，超预算就该收手。
     static var hardReadCalls: Int { vmReadCalls }
+
+    /// 走已建立映射、本地直读的次数。和 `hardReadCalls` 放一起看，一眼能分清
+    /// 这一轮走的是映射还是内核 —— `hardReadCalls` 必须长期保持在低位，
+    /// 它每涨一次游戏就多一次抢锁，那正是当初把游戏读崩的那条路。
+    static var mappedHitCalls: Int { mappedHits }
+
+    /// 按需建立的映射块数 —— 它一直涨说明预映射没铺到，正在现场补。
+    static var onDemandMapBlocks: Int { onDemandMaps }
+
+    /// 保护位抽查的游标：每轮只看一块，轮换着覆盖。
+    private static var protectionCursor = 0
+
+    /// 抽查一块常驻映射当前的实际保护位 —— 验收要确认映射确实是只读的。
+    ///
+    /// **每轮只查一块**：`vm_region_64` 本身也是一次内核调用，几百块一次全查会变成
+    /// 新的开销源。轮询的代价恒定（每轮一次），几百块映射几百轮就能全覆盖。
+    static func spotCheckProtection() -> String {
+        guard !mappedRanges.isEmpty else { return "保护位: 无映射" }
+        if protectionCursor >= mappedRanges.count { protectionCursor = 0 }
+        let idx = protectionCursor
+        protectionCursor = (idx + 1) % mappedRanges.count
+
+        var addr = mappedRanges[idx].localBase
+        let (ok, _, prot, _) = nextRegion(task: mach_task_self_, addr: &addr)
+        guard ok else { return "保护位 块\(idx): 查询失败" }
+
+        // VM_PROT_WRITE = 0x2 —— 只读就是这一位必须为 0
+        let writable = (prot & 0x2) != 0
+        return "保护位 块\(idx)/\(mappedRanges.count)=\(writable ? "有写✗" : "只读✓")"
+    }
 
 
     /// **映射优先的读**：命中已建立的映射就本地读（零内核调用）；
