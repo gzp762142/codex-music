@@ -117,6 +117,14 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         table.separatorStyle = .none
         table.register(UITableViewCell.self, forCellReuseIdentifier: "proc")
         addSubview(table)
+
+        // 冷启动自动开启。**不能只靠 didMoveToWindow** —— 面板窗口是 FangUIBridge
+        // 用私有 entitlement 挂上去的，走的不是标准 addSubview 路径，那个回调
+        // 不保证触发（实测就没触发，状态机一直没起来）。
+        // 这里排进主队列：等 self 完全初始化、当前 runloop 结束后直接启动。
+        DispatchQueue.main.async { [weak self] in
+            self?.autoStartOnce(from: "冷启动")
+        }
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -256,22 +264,30 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
-        guard window != nil, !autoStarted else { return }
+        guard window != nil else { return }
+        autoStartOnce(from: "窗口挂载")     // 兜底：init 那条路已经先跑过了
+    }
+
+    /// 冷启动自动开启，只跑一次。`init` 与 `didMoveToWindow` 都会调它。
+    private func autoStartOnce(from source: String) {
+        guard !autoStarted else { return }
         autoStarted = true
-        onTracker()      // 默认开启：冷启动即自动挂载，不需要点任何按钮
+        onTracker(source)
     }
 
     /// 自动总开关。开启后不必再点任何按钮 —— 状态机自己 attach、找基址、持续出坐标；
     /// 游戏退出会自动释放映射与端口，重开自动重挂。手动按钮**全部保留**，
     /// 两者走同一条串行队列，可以随时对照排查。
-    @objc private func onTracker() {
+    @objc private func onTracker() { onTracker("手动") }
+
+    private func onTracker(_ source: String) {
         let t = AutoTracker.shared
         if t.isRunning {
             t.onStatus = nil
             t.onTargets = nil
             t.stop()
             btnTracker.setTitleColor(warnText, for: .normal)
-            probeLabel.text = "自动: 已停止"
+            probeLabel.text = "自动: 已停止（\(source)）"
             return
         }
         MemoryProbe.screenSize = UIScreen.main.bounds.size
@@ -287,7 +303,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         }
         t.start()
         btnTracker.setTitleColor(accent, for: .normal)
-        probeLabel.text = "自动: 启动中…"
+        probeLabel.text = "自动: 启动中…（\(source)）"
     }
 
     /// 把状态机每拍的目标摊到可滚动区。这一步只做**显示**，不做绘制 ——
