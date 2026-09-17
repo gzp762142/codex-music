@@ -200,6 +200,13 @@ final class MemoryProbe {
     /// （那是正确行为），但它同时说明 `mach_vm_protect` 在这个环境上不工作，要查。
     private(set) static var protectFailures = 0
 
+    /// 最近一次降权失败的详情（地址 + 大小 + 返回码）。
+    ///
+    /// 光有次数定不了位。返回码能直接分开「参数/地址」和「权限」两类原因：
+    /// `KERN_INVALID_ADDRESS` 指向「范围超出实际映射」—— `vm_remap` 会按源 region 的
+    /// 边界把映射截短，而这里仍按原始 `total` 去 protect，多出来的那截没有映射。
+    private(set) static var lastProtectFailure = ""
+
     /// 把一块刚建立的共享映射压到只读，**失败清理收在函数内部**。
     ///
     /// `copy = FALSE` 的共享映射默认带写权限，不降权就等于握着一个能改游戏内存的窗口。
@@ -211,8 +218,13 @@ final class MemoryProbe {
     ///
     /// 符号缺失时可选链给出 nil，`nil == KERN_SUCCESS` 为 false，走同一条失败路径。
     private static func downgradeToReadOnly(_ target: UInt64, total: UInt64) -> Bool {
-        let ok = machVmProtectFn?(mach_task_self_, target, total, 1, vmProtRead) == KERN_SUCCESS
+        let kr = machVmProtectFn?(mach_task_self_, target, total, 1, vmProtRead)
+        let ok = kr == KERN_SUCCESS
         if !ok {
+            // 失败原因只能从返回码看出来，记下来 —— 它决定往哪查
+            let why = kr.map { describe($0) } ?? "mach_vm_protect 符号缺失"
+            lastProtectFailure = "0x\(String(target, radix: 16))"
+                + " +0x\(String(total, radix: 16)) \(why)"
             // 降权失败 = 手上握着一块能改游戏内存的映射。宁可不要。
             _ = vmDeallocateFn?(mach_task_self_, UInt(target), total)
             protectFailures += 1
