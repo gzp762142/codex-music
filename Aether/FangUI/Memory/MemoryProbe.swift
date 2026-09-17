@@ -228,10 +228,10 @@ final class MemoryProbe {
     private static func downgradeToReadOnly(_ target: UInt64, total: UInt64,
                                             src: UInt64, maxProt: Int32,
                                             gamePort: MachPort) -> Bool {
-        // `vm_remap` 的出参已经把上限说清楚了：**没有 W 位**就代表内核不允许这块映射
-        // 变成可写，它本来就是安全的，不必再画蛇添足设一次 max_protection。
-        // 对只读源（__TEXT / __DATA_CONST 那一类）这多出来的一步恰恰会被 XNU 拒掉 ——
-        // 于是一块完全无害的映射被误判成「降权失败」丢掉了。
+        // `maxProt` 是 `vm_remap` 给的**上限出参**。实测它通常是 `VM_PROT_ALL (0x7)`，
+        // **并不反映源 region 的实际权限** —— 同一块 region 实测 `源prot=0x3`、`max=0x7`，
+        // 源连 X 都没有，出参却给了 RWX。所以别拿它推断源是只读还是可写，
+        // 这个分支只在真正没有 W 位时兜一层底，正常路径不会触发。
         if (maxProt & vmProtWrite) == 0 { return true }
 
         let kr = machVmProtectFn?(mach_task_self_, target, total, 1, vmProtRead)
