@@ -320,6 +320,9 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
                            snap.camera.valid ? "✓" : "✗",
                            snap.camera.fov,
                            MemoryProbe.mappedBlockCount))
+        // 保护位单独一行、放在「目标」之上：并进「自身」那行会溢出（那行已贴到右缘），
+        // 挂在状态行尾部同样放不下，截断之后就等于没显示
+        rows.append(AutoTracker.shared.protectionNote)
         rows.append("目标 \(list.count) 个 · \(AutoTracker.shared.lastScanNote)")
         for t in list.sorted(by: { $0.dist < $1.dist }).prefix(30) {
             let tag = t.isSelf ? "★你 " : "    "

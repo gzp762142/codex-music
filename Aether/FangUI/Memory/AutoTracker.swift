@@ -59,6 +59,9 @@ final class AutoTracker {
     private(set) var lastScanOnDemand = 0
     private(set) var fastTickVMReads = 0
     private(set) var mappingBlocks = 0
+    /// 保护位抽查结果（每轮一块，轮换覆盖）。在后台队列里算好，UI 只负责读 ——
+    /// `vm_region_64` 是内核调用，不该落在主线程上。
+    private(set) var protectionNote = "保护位: 等待首次抽查"
 
     /// 状态行（主线程回调）
     var onStatus: ((String) -> Void)?
@@ -352,9 +355,11 @@ final class AutoTracker {
             let counters = "映射命中 \(MemoryProbe.mappedHitCalls)(+\(lastScanMappedHits))"
                 + " 按需映射 \(MemoryProbe.onDemandMapBlocks)(+\(lastScanOnDemand))"
                 + " 内核读 \(MemoryProbe.hardReadCalls)(+\(lastScanVMReads))"
+            // 抽查放后台队列算，结果留给列表单独一行 —— 状态行已经塞不下它了
+            protectionNote = MemoryProbe.spotCheckProtection()
             setState(state == .degraded ? .degraded : .running,
                      "pid=\(targetPid) \(Int(fastHz))Hz tick=\(tickCount) 目标\(targets.count) 映射\(MemoryProbe.mappedBlockCount)块 \(cam) vm=\(fastTickVMReads)"
-                     + " | \(counters) | \(MemoryProbe.spotCheckProtection())")
+                     + " | \(counters)")
         }
     }
 
