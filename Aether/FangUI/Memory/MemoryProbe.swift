@@ -198,18 +198,26 @@ final class MemoryProbe {
 
     /// 降权失败的累计次数。**验收要求它是 0**：每失败一次就意味着有一块映射被主动丢弃
     /// （那是正确行为），但它同时说明 `mach_vm_protect` 在这个环境上不工作，要查。
-    private(set) static var downgradeFailureCount = 0
+    private(set) static var protectFailures = 0
 
-    /// 把刚建立的映射压成只读。返回 false 表示**调用方必须丢弃这块映射**。
+    /// 把一块刚建立的共享映射压到只读，**失败清理收在函数内部**。
+    ///
+    /// `copy = FALSE` 的共享映射默认带写权限，不降权就等于握着一个能改游戏内存的窗口。
+    /// 清理必须和 protect 写在同一处 —— 分成两份迟早漂移，而那条约束
+    /// （失败即丢弃、绝不放行）只允许有一个实现。
     ///
     /// `set_maximum = 1` 是刻意的：只降 current 的话「上限」还留着写权限，
     /// 之后一句 `mach_vm_protect` 就能把 W 提回来。把上限本身压掉，写权限才真拿不回来。
     ///
-    /// 抽成一个函数而不是两处各写一遍：降权是「protect + 失败清理 + 返回状态」三步，
-    /// 复制两份迟早漂移，读路径上不允许存在两种降权语义。
+    /// 符号缺失时可选链给出 nil，`nil == KERN_SUCCESS` 为 false，走同一条失败路径。
     private static func downgradeToReadOnly(_ target: UInt64, total: UInt64) -> Bool {
-        guard let fn = machVmProtectFn else { return false }
-        return fn(mach_task_self_, target, total, 1, vmProtRead) == KERN_SUCCESS
+        let ok = machVmProtectFn?(mach_task_self_, target, total, 1, vmProtRead) == KERN_SUCCESS
+        if !ok {
+            // 降权失败 = 手上握着一块能改游戏内存的映射。宁可不要。
+            _ = vmDeallocateFn?(mach_task_self_, UInt(target), total)
+            protectFailures += 1
+        }
+        return ok
     }
 
     /// 已经建立起来的映射：游戏地址 → 我们的本地地址。
@@ -278,11 +286,8 @@ final class MemoryProbe {
         guard rk == KERN_SUCCESS, target != 0 else {
             return (0, "mach_vm_remap 失败 \(describe(rk))")
         }
-        // 共享映射建立时带写权限，立刻压成只读。压不下去就整块丢掉 ——
-        // 宁可少一块映射，也不留一个能改游戏内存的窗口。
+        // 降权与失败清理都在函数里，这里只判结果
         guard downgradeToReadOnly(target, total: total) else {
-            _ = vmDeallocateFn?(mach_task_self_, UInt(target), total)
-            downgradeFailureCount += 1
             return (0, "降权失败，已丢弃该映射（拒绝以可写状态持有游戏内存）")
         }
         mappedRanges.append((alignedStart, total, target))
@@ -421,7 +426,7 @@ final class MemoryProbe {
             var maxProt: Int32 = 0
             let rk = fn(mach_task_self_, &target, total, 0, vmFlagsAnywhere,
                         p, aligned, 0, &curProt, &maxProt, 0)
-            // 降权必须成功才算映射建立完成 —— 失败的块后面会被收掉
+            // 降权（含失败清理）已收在 downgradeToReadOnly 里
             let downgraded = (rk == KERN_SUCCESS && target != 0)
                 ? downgradeToReadOnly(target, total: total)
                 : false
@@ -431,11 +436,6 @@ final class MemoryProbe {
                 mapped += 1
                 bytes += total
             } else {
-                // 降权失败的块必须自己收掉，不能把它挂在地址空间里当可写窗口
-                if rk == KERN_SUCCESS, target != 0 {
-                    _ = vmDeallocateFn?(mach_task_self_, UInt(target), total)
-                    downgradeFailureCount += 1
-                }
                 failed += 1
             }
         }
@@ -446,9 +446,9 @@ final class MemoryProbe {
 
         let mb = String(format: "%.0f", Double(bytes) / 1048576.0)
         // 降权失败是本批唯一「不能妥协」的那一项，报告里必须看得见
-        let protNote = downgradeFailureCount == 0
+        let protNote = protectFailures == 0
             ? ""
-            : "，降权失败累计 \(downgradeFailureCount) 块已丢弃"
+            : "，降权失败累计 \(protectFailures) 块已丢弃"
         return "预映射: \(mapped) 块 / \(mb) MB（扫 \(rounds) 个 region，跳过小块 \(skipped)，失败 \(failed)\(protNote)）"
     }
 
