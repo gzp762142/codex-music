@@ -349,7 +349,12 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         rows.append(AutoTracker.shared.protectionNote)
         // 有失败才多占一行：把地址和返回码摆出来 —— 光有次数定不了位
         if !MemoryProbe.lastProtectFailure.isEmpty {
-            rows.append("降权失败详情: \(MemoryProbe.lastProtectFailure)")
+            // 拆行渲染：面板一行装不下七十多个字符，后半段（源 prot）会被截掉 ——
+            // 而它正是诊断的判据，截掉就等于白跑一轮
+            let parts = MemoryProbe.lastProtectFailure.split(separator: "\n")
+            for (i, part) in parts.enumerated() {
+                rows.append(i == 0 ? "降权失败详情: \(part)" : "　\(part)")
+            }
         }
         rows.append("目标 \(list.count) 个 · \(AutoTracker.shared.lastScanNote)")
         for t in list.sorted(by: { $0.dist < $1.dist }).prefix(30) {

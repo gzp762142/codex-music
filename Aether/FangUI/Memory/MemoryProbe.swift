@@ -240,16 +240,21 @@ final class MemoryProbe {
             // 失败原因只能从返回码看出来，记下来 —— 它决定往哪查。
             // 游戏地址必须一起记：本地地址每次运行都不一样，只报它定位不到是哪个 region。
             let why = kr.map { describe($0) } ?? "mach_vm_protect 符号缺失"
-            // 源 region 的属性是判据：只读源正好解释「为什么这一步多余又被拒」
+            // 源 region 的属性是判据：它决定这块为什么降不下去。
+            // **拆成两行**：面板宽度只放得下七十来个字符，一行装不下最后那几项，
+            // 而尾巴上的 `源prot` 恰恰是唯一能定性的字段（截断过一次，白跑一轮）。
             var probe = src
             let (okSrc, srcSize, srcProt, _) = nextRegion(task: gamePort, addr: &probe)
-            let srcNote = okSrc
-                ? " 源prot=0x\(String(srcProt, radix: 16)) 源size=0x\(String(srcSize, radix: 16))"
-                : " 源region查询失败"
-            lastProtectFailure = "游戏 0x\(String(src, radix: 16))"
+            let head = "游戏 0x\(String(src, radix: 16))"
                 + " / 本地 0x\(String(target, radix: 16))"
                 + " +0x\(String(total, radix: 16))"
-                + " max=0x\(String(maxProt, radix: 16)) \(why)" + srcNote
+            let tail = okSrc
+                ? "源prot=0x\(String(srcProt, radix: 16))"
+                    + " 源size=0x\(String(srcSize, radix: 16))"
+                    + " max=0x\(String(maxProt, radix: 16)) \(why)"
+                : "源region查询失败"
+                    + " max=0x\(String(maxProt, radix: 16)) \(why)"
+            lastProtectFailure = head + "\n" + tail
             // 降权失败 = 手上握着一块能改游戏内存的映射。宁可不要。
             _ = vmDeallocateFn?(mach_task_self_, UInt(target), total)
             protectFailures += 1
