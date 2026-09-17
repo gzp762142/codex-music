@@ -79,13 +79,20 @@ final class MemoryProbe {
     }
 
     /// 把 kern_return_t 翻成人和自己能读懂的话。
+    ///
+    /// **数值按 XNU 的 mach/kern_return.h 来，别照印象写**：
+    /// 1 = INVALID_ADDRESS、2 = PROTECTION_FAILURE、3 = NO_SPACE、16 = INVALID_TASK。
+    /// 原来这里把 2 标成 INVALID_TASK、3 标成 INVALID_ADDRESS —— 正好串了一格，
+    /// 于是「权限被拒」被报成「task 无效」，诊断方向整个带偏。
     private static func describe(_ kr: KernReturn) -> String {
         switch kr {
         case KERN_SUCCESS: return "成功"
-        case KERN_FAILURE: return "权限被挡 (KERN_FAILURE)"
-        case 4: return "参数错 (KERN_INVALID_ARGUMENT)"
-        case 2: return "KERN_INVALID_TASK"
-        case 3: return "KERN_INVALID_ADDRESS"
+        case 1: return "KERN_INVALID_ADDRESS"
+        case 2: return "KERN_PROTECTION_FAILURE"
+        case 3: return "KERN_NO_SPACE"
+        case 4: return "KERN_INVALID_ARGUMENT"
+        case KERN_FAILURE: return "KERN_FAILURE"
+        case 16: return "KERN_INVALID_TASK"
         default: return "ret=\(kr)"
         }
     }
@@ -217,13 +224,16 @@ final class MemoryProbe {
     /// 之后一句 `mach_vm_protect` 就能把 W 提回来。把上限本身压掉，写权限才真拿不回来。
     ///
     /// 符号缺失时可选链给出 nil，`nil == KERN_SUCCESS` 为 false，走同一条失败路径。
-    private static func downgradeToReadOnly(_ target: UInt64, total: UInt64) -> Bool {
+    private static func downgradeToReadOnly(_ target: UInt64, total: UInt64,
+                                            src: UInt64) -> Bool {
         let kr = machVmProtectFn?(mach_task_self_, target, total, 1, vmProtRead)
         let ok = kr == KERN_SUCCESS
         if !ok {
-            // 失败原因只能从返回码看出来，记下来 —— 它决定往哪查
+            // 失败原因只能从返回码看出来，记下来 —— 它决定往哪查。
+            // 游戏地址必须一起记：本地地址每次运行都不一样，只报它定位不到是哪个 region。
             let why = kr.map { describe($0) } ?? "mach_vm_protect 符号缺失"
-            lastProtectFailure = "0x\(String(target, radix: 16))"
+            lastProtectFailure = "游戏 0x\(String(src, radix: 16))"
+                + " / 本地 0x\(String(target, radix: 16))"
                 + " +0x\(String(total, radix: 16)) \(why)"
             // 降权失败 = 手上握着一块能改游戏内存的映射。宁可不要。
             _ = vmDeallocateFn?(mach_task_self_, UInt(target), total)
@@ -299,7 +309,7 @@ final class MemoryProbe {
             return (0, "mach_vm_remap 失败 \(describe(rk))")
         }
         // 降权与失败清理都在函数里，这里只判结果
-        guard downgradeToReadOnly(target, total: total) else {
+        guard downgradeToReadOnly(target, total: total, src: alignedStart) else {
             return (0, "降权失败，已丢弃该映射（拒绝以可写状态持有游戏内存）")
         }
         mappedRanges.append((alignedStart, total, target))
@@ -440,7 +450,7 @@ final class MemoryProbe {
                         p, aligned, 0, &curProt, &maxProt, 0)
             // 降权（含失败清理）已收在 downgradeToReadOnly 里
             let downgraded = (rk == KERN_SUCCESS && target != 0)
-                ? downgradeToReadOnly(target, total: total)
+                ? downgradeToReadOnly(target, total: total, src: aligned)
                 : false
             if rk == KERN_SUCCESS, target != 0, downgraded {
                 mappedRanges.append((aligned, total, target))

@@ -306,6 +306,10 @@ final class AutoTracker {
             tmp.append(rt)
         }
         targets = tmp
+        // 先算好距离与屏幕坐标再推。否则这一拍交给 UI 的是 dist=0、screen=nil 的原始
+        // 对象，列表会显示成一片「0m / 屏幕(身后)」，要等下一次 fastTick 才被填上 ——
+        // 慢分频 1Hz 而快照 2Hz，肉眼就是距离在 0 和真实值之间来回跳。
+        projectAll()
         pushTargets()
     }
 
