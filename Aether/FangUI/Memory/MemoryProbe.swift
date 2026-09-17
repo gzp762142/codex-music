@@ -860,7 +860,17 @@ final class MemoryProbe {
         let vmBefore = vmReadCalls
 
         guard let world = readWorldPointer(p) else {
-            out.note = "读 GWorld 失败"
+            // 失败要带数值：地址、返回码、读到的原始值 —— 光说"失败"没法定位
+            let gwAddr = imageSlide != 0
+                ? runtime(offsets.gWorld, slide: imageSlide)
+                : 0
+            let (rkW, w) = imageSlide != 0
+                ? readRaw(port: p, address: MachVmAddress(gwAddr))
+                : (KERN_FAILURE, 0)
+            out.note = "读 GWorld 失败 rk=\(describe(rkW))"
+                + " slide=\(hexOf(imageSlide))"
+                + " 槽=\(hexOf(gwAddr))  值=\(hexOf(w))"
+                + " 映射\(mappedRanges.count)块"
             return out
         }
         out.world = world

@@ -212,14 +212,15 @@ final class AutoTracker {
     private func heartbeat() {
         guard running else { return }
         scanner.invalidate()
-        let pid = scanner.findGamePID(forceRefresh: true) ?? 0
-
-        // 游戏不在 → 全部释放，回到等待
-        guard pid != 0 else {
+        let list = scanner.scan()
+        // 把 comm 一起带出来：`exact` 只说明 comm/路径匹配了白名单，
+        // 显示出来才能确认挂的到底是哪个进程。
+        guard let hit = list.first(where: { $0.exact }) else {
             if MemoryProbe.isAttached { teardownLocked(reason: "游戏已退出") }
-            else { setState(.waiting, "等待游戏进程") }
+            else { setState(.waiting, "等待游戏进程（扫到 \(list.count) 个）") }
             return
         }
+        let pid = hit.pid
 
         // 已挂载但 pid 变了（游戏重启）→ 先释放再重挂
         if MemoryProbe.isAttached, targetPid != pid {
@@ -250,12 +251,12 @@ final class AutoTracker {
             // 首次挂载主动铺一次映射，之后靠按需兜底
             let mapNote = MemoryProbe.mapAllRegions(pid: pid)
             mappingBlocks = MemoryProbe.mappedBlockCount
-            setState(.running, "已挂载 pid=\(pid) · \(mapNote)")
+            setState(.running, "已挂载 \(hit.comm) pid=\(pid) · \(mapNote)")
             return
         }
 
         if state != .running {
-            setState(.running, "已挂载 pid=\(pid)")
+            setState(.running, "已挂载 \(hit.comm) pid=\(pid)")
         }
     }
 
