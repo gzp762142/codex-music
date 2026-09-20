@@ -125,6 +125,10 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         DispatchQueue.main.async { [weak self] in
             self?.autoStartOnce(from: "冷启动")
         }
+
+        // 内核自检是异步的（PUAFF 几十秒），面板可能先于它建好 —— 起个轻量定时器
+        // 等它就绪后自动刷一次。跟状态机开不开无关：这是现在唯一要盯的东西。
+        startKernelStatusWatch()
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -258,6 +262,49 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         probeLabel.textColor = text.contains("✓") ? accent : warnText
         extraRows = lines
         table.reloadData()
+    }
+
+    // MARK: - 内核层状态（面板常驻显示）
+
+    /*
+     * 内核自检的结果必须常驻可见。
+     *
+     * 为什么不能塞进 extraRows：那个数组在每次手动操作、Jetsam 报告、状态机回调时
+     * 都会被整个覆盖 —— 塞进去的那一次会在下一次点击时消失，而内核结果恰恰是
+     * 最该一直挂着看的。
+     *
+     * 所以放在数据源里动态拼：每次都算一遍，永远在列表最前。
+     */
+    private func kernelStatusRows() -> [String] {
+        guard AppDelegate.kernelReady else {
+            return ["［内核层］ 初始化中…（PUAFF 需要几十秒）"]
+        }
+        var out = AppDelegate.kernelNote
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+        // 空的话给个占位，否则表格里那一段会整块消失
+        if out.allSatisfy({ $0.isEmpty }) { out = ["［内核层］ （无报告）"] }
+        return out.map { "［内核］ " + $0 }
+    }
+
+    /// 内核就绪后自动刷一次面板 —— 自检是异步的，面板可能先于它建好。
+    private var kernelWasReady = false
+    private var kernelUITimer: Timer?
+
+    private func startKernelStatusWatch() {
+        guard kernelUITimer == nil else { return }
+        kernelUITimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] t in
+            guard let s = self else { t.invalidate(); return }
+            let ready = AppDelegate.kernelReady
+            guard ready != s.kernelWasReady else { return }
+            s.kernelWasReady = ready
+            // 内核刚就绪：清掉手动操作留下的旧结果，让内核报告独占列表开头
+            s.extraRows = []
+            s.table.reloadData()
+            s.probeLabel.text = ready
+                ? "[内核] 就绪 —— 报告见列表首行，或看设备日志 [KernelMemory]"
+                : "[内核] 初始化中…"
+        }
     }
 
     // MARK: - 自动追踪总开关
@@ -693,7 +740,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     // MARK: - Table
 
     func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-        extraRows.isEmpty ? entries.count : extraRows.count
+        kernelStatusRows().count + (extraRows.isEmpty ? entries.count : extraRows.count)
     }
 
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
@@ -701,10 +748,28 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         cell.backgroundColor = .clear
         cell.selectionStyle = .none
 
+        // 内核层状态常驻在最前，不被任何操作覆盖
+        let krows = kernelStatusRows()
+        if indexPath.row < krows.count {
+            let line = krows[indexPath.row]
+            cell.textLabel?.text = line
+            cell.textLabel?.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+            cell.textLabel?.lineBreakMode = .byTruncatingTail
+            if line.contains("不可用") {
+                cell.textLabel?.textColor = warnText
+            } else if line.contains("就绪") || line.contains("OK") || line.contains("MATCH") {
+                cell.textLabel?.textColor = accent
+            } else {
+                cell.textLabel?.textColor = idleText
+            }
+            return cell
+        }
+        let row = indexPath.row - krows.count
+
         // 文本行模式（Jetsam 报告等）：逐行显示，可滚动
         if !extraRows.isEmpty {
-            guard indexPath.row < extraRows.count else { return cell }
-            let line = extraRows[indexPath.row]
+            guard row < extraRows.count else { return cell }
+            let line = extraRows[row]
             cell.textLabel?.text = line
             cell.textLabel?.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
             cell.textLabel?.lineBreakMode = .byTruncatingTail
@@ -718,9 +783,9 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
             return cell
         }
 
-        if indexPath.row >= entries.count { return cell }
+        if row >= entries.count { return cell }
 
-        let e = entries[indexPath.row]
+        let e = entries[row]
         let comm = e.comm.isEmpty ? "(no comm)" : e.comm
         var mark = ""
         if e.exact { mark = "  ●" } else if e.matched { mark = "  ○" }

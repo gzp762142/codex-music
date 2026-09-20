@@ -145,7 +145,7 @@ final class AutoTracker {
 
     func start() {
         guard Self.stateMachineEnabled else {
-            setState(.idle, "自动状态机已暂时关闭 —— 优先验证内核层，见启动日志 [KernelMemory]")
+            setState(.idle, "自动状态机已暂时关闭 —— 优先验证内核层，见面板首行")
             return
         }
         queue.async { [weak self] in
