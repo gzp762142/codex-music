@@ -22,16 +22,25 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
         // 内核内存层自检。kopen 是重操作（PUAFF 要跑几十秒），
         // 放后台队列，绝不出现在启动路径上。
+        //
+        // 输出必须走 NSLog 而不是 print：我们跑在游戏之上、自己不是前台 app，
+        // Swift 的 print 只写 stdout，不进 unified log —— Console.app 和设备
+        // 日志都看不到，等于自检结果没有出口。NSLog 会进 unified log，
+        // 按子系统/进程过滤就能读到。
         DispatchQueue.global(qos: .userInitiated).async {
             var error: UnsafePointer<CChar>?
             let ok = km_init(&error)
             if ok {
                 var buffer = [CChar](repeating: 0, count: 512)
                 km_self_test(&buffer, buffer.count)
-                print("[KernelMemory] ready\n" + String(cString: buffer))
+                // 逐行打，日志面板按行显示更清楚
+                let report = String(cString: buffer)
+                for line in report.split(separator: "\n", omittingEmptySubsequences: false) {
+                    NSLog("[KernelMemory] %@", String(line))
+                }
             } else {
                 let reason = error.map { String(cString: $0) } ?? "unknown"
-                print("[KernelMemory] not available: " + reason)
+                NSLog("[KernelMemory] not available: %@", reason)
             }
         }
         return true
