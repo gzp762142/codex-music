@@ -46,7 +46,8 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
                 AppDelegate.kernelNote = "[内核] 不可用：" + reason
             }
             // 置位放最后：状态机和调试页都靠它区分「内核没好」和「真的失败了」
-            kernelReady = true
+            // 静态属性在实例方法里必须带类型前缀，不能裸写 kernelReady
+            Self.kernelReady = true
         }
         return true
     }
