@@ -133,7 +133,21 @@ final class AutoTracker {
 
     // MARK: - 生命周期
 
+    /// 状态机总开关。**当前关闭**，先用内核自检把内核层单独验通。
+    ///
+    /// 关掉的理由：现在有两个未知（内核层能不能用、状态机读得对不对），
+    /// 同时查会互相干扰。而且状态机依赖的映射快路径是自映射，不产游戏数据 ——
+    /// 它报出来的「找基址未命中」「目标 0 个」都不能反映内核层真实状态。
+    ///
+    /// 保留开关而不是砍代码：等 `km_self_test` 四级判据全 OK、映射快路径有
+    /// 真实语义之后，把这里改回 true 即可。
+    private static let stateMachineEnabled = false
+
     func start() {
+        guard Self.stateMachineEnabled else {
+            setState(.idle, "自动状态机已暂时关闭 —— 优先验证内核层，见启动日志 [KernelMemory]")
+            return
+        }
         queue.async { [weak self] in
             guard let self = self, !self._running else { return }
             self._running = true
@@ -275,7 +289,18 @@ final class AutoTracker {
             MemoryProbe.bind(pid: pid)
             let (ok, note) = MemoryProbe.attachPort(pid)
             guard ok else {
-                setState(.failed, note)
+                /*
+                 * 区分「内核还没准备好」和「真的挂不上」。
+                 *
+                 * km_init 是异步的、PUAFF 要几十秒；在那之前 km_proc_for_pid 一律
+                 * 返回 0，attachPort 会把失败原因写成「内核里找不到 pid 的 proc」——
+                 * 那是假错误，会把人往"游戏进程有问题"的方向带。
+                 */
+                if !AppDelegate.kernelReady {
+                    setState(.attaching, "等待内核初始化（PUAFF 要几十秒）")
+                } else {
+                    setState(.failed, note)
+                }
                 return
             }
             targetPid = pid

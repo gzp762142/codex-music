@@ -583,26 +583,44 @@ final class MemoryProbe {
         let n = max(count, 1)
         guard n <= 0x10000 else { return (KERN_FAILURE, []) }
 
-        // 命中块**且**这块剩余长度够读完 n 字节，才走本地读 —— 否则可能是跨界读。
-        if let rec = mappedRecord(for: address), rec.localBase != 0, UInt64(n) <= rec.remain {
-            noteRead()
-            mappedHits += 1
-            if let base = UnsafeRawPointer(bitPattern: UInt(rec.localBase)) {
-                return (KERN_SUCCESS, Array(UnsafeRawBufferPointer(start: base, count: n)))
-            }
-        }
-
-        // 没命中：按需映射一次（块数设上限，避免地图无限膨胀）
-        if activePid != 0, mappedRanges.count < 2048 {
-            let before = mappedRanges.count
-            mapRegionContaining(pid: activePid, address: address)
-            if mappedRanges.count > before { onDemandMaps += 1 }
-            // 按需映射之后同样要查剩余长度 —— 新建的块边界一样可能不够读完 n 字节。
+        /*
+         * ── 映射快路径：暂时关闭 ──
+         *
+         * 为什么关：这条路的映射是**自映射**（mapRange 里 src_task 和 target_task
+         * 都是 mach_task_self_，而 srcAddress 传的却是游戏地址）。游戏那块内存在
+         * 自己的 vm_map 里并不存在，所以它既不产出游戏数据，又白占 mappedRanges
+         * 的额度（上限 2048 块）。样本的自映射之所以成立，是因为它前面有
+         * physrw / PTE 改写，已经先把游戏的物理页挂进了自己的地址空间 —— 那一步
+         * 我们只做完了「定位 PTE」（km_pte_for + 自检），真实改写和 TLB 刷新还没做。
+         *
+         * 用 `kernelReady` 当开关而不是写死 false：内核层验通之后直接放开这里
+         * 就能恢复映射优先，不需要改回来。
+         *
+         * 关闭期间读取全部走 km_read_process —— 那条路是实的：走目标页表拿 PA，
+         * 经线性映射用 kread 读。慢，但结论可信。
+         */
+        if AppDelegate.kernelReady {
+            // 命中块**且**这块剩余长度够读完 n 字节，才走本地读 —— 否则可能是跨界读。
             if let rec = mappedRecord(for: address), rec.localBase != 0, UInt64(n) <= rec.remain {
                 noteRead()
                 mappedHits += 1
                 if let base = UnsafeRawPointer(bitPattern: UInt(rec.localBase)) {
                     return (KERN_SUCCESS, Array(UnsafeRawBufferPointer(start: base, count: n)))
+                }
+            }
+
+            // 没命中：按需映射一次（块数设上限，避免地图无限膨胀）
+            if activePid != 0, mappedRanges.count < 2048 {
+                let before = mappedRanges.count
+                mapRegionContaining(pid: activePid, address: address)
+                if mappedRanges.count > before { onDemandMaps += 1 }
+                // 按需映射之后同样要查剩余长度 —— 新建的块边界一样可能不够读完 n 字节。
+                if let rec = mappedRecord(for: address), rec.localBase != 0, UInt64(n) <= rec.remain {
+                    noteRead()
+                    mappedHits += 1
+                    if let base = UnsafeRawPointer(bitPattern: UInt(rec.localBase)) {
+                        return (KERN_SUCCESS, Array(UnsafeRawBufferPointer(start: base, count: n)))
+                    }
                 }
             }
         }
@@ -873,32 +891,48 @@ final class MemoryProbe {
     //      那是文件系统调用，绝不能出现在高频路径上
     //   ③ 两段式读取：短链（自己+相机）走高频，长链（actor 遍历）走低频
 
-    /// 当前挂载的目标 pid。0 = 未挂载。
-    private static var longPid: Int32 = 0
-
-    static var isAttached: Bool { longPid != 0 }
-    static var attachedPid: Int32 { longPid }
+    /// 是否已绑定目标进程。
+    ///
+    /// 直接复用 `activePid` —— 以前这里另有一个 `longPid`，两个 pid 各记各的，
+    /// 一旦只走完 bind 或只走完 attachPort 就会不一致：`isAttached` 说挂上了，
+    /// 而 `readSmart` 的快路径用的是 `activePid`，读的其实是另一个进程。
+    /// 现在只有一个真相来源。
+    static var isAttached: Bool { activePid != 0 }
+    static var attachedPid: Int32 { activePid }
 
     /// 挂载目标进程。**同一个 pid 重复调用直接复用。**
     ///
     /// 内核路径下「挂载」不再意味着持有 task port，而是确认这个 pid
     /// 能在内核里定位到 proc —— 那正是后续所有读取的前提。
     static func attachPort(_ pid: Int32) -> (ok: Bool, note: String) {
-        if longPid == pid, pid != 0 { return (true, "复用现有挂载") }
-        if longPid != 0 { detachPort() }
+        /*
+         * 先看内核层到底就绪没有。
+         *
+         * 不查这一步的话，`km_proc_for_pid` 在 g_handle==0 时返回 0，
+         * 这里会把「内核还没跑完 PUAFF」误报成「找不到该 pid 的 proc」。
+         */
+        guard AppDelegate.kernelReady else {
+            return (false, "内核尚未就绪（km_init 仍在跑，PUAFF 需要几十秒）")
+        }
+        guard km_ready() else {
+            return (false, "内核层不可用（km_init 失败，见启动日志）")
+        }
+
+        if activePid == pid, pid != 0 { return (true, "复用现有挂载") }
+        if activePid != 0 { detachPort() }
 
         let proc = km_proc_for_pid(pid)
         guard proc != 0 else {
             return (false, "内核里找不到 pid=\(pid) 的 proc")
         }
-        longPid = pid
+        activePid = pid
         cachedOffsets = nil
         return (true, "已挂载 pid=\(pid) proc=0x\(String(proc, radix: 16))")
     }
 
     /// 卸载目标进程。
     static func detachPort() {
-        longPid = 0
+        activePid = 0
     }
 
     /// 偏移表缓存（见上方说明）。

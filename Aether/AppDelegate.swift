@@ -38,13 +38,33 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
                 for line in report.split(separator: "\n", omittingEmptySubsequences: false) {
                     NSLog("[KernelMemory] %@", String(line))
                 }
+                AppDelegate.kernelNote = "[内核] 就绪 · kbase=0x"
+                    + String(km_kernel_base(), radix: 16) + "\n" + report
             } else {
                 let reason = error.map { String(cString: $0) } ?? "unknown"
                 NSLog("[KernelMemory] not available: %@", reason)
+                AppDelegate.kernelNote = "[内核] 不可用：" + reason
             }
+            // 置位放最后：状态机和调试页都靠它区分「内核没好」和「真的失败了」
+            kernelReady = true
         }
         return true
     }
+
+    // MARK: - 内核层状态（跨线程只读）
+
+    /// `km_init` 是否已经跑完（无论成功还是失败）。
+    ///
+    /// 为什么需要它：`km_init` 异步、且 PUAFF 要几十秒。在那之前
+    /// `km_proc_for_pid` 一律返回 0，而调用方会把它误报成「找不到该进程的 proc」——
+    /// 一个假错误。有了这个标志，上层才能说「内核还在初始化」而不是「进程有问题」。
+    ///
+    /// 写只在 AppDelegate 那个后台闭包里发生一次，读是跨线程的（状态机队列、
+    /// 主线程 UI）。是个 bool，用不着加锁。
+    static var kernelReady = false
+
+    /// 最近一次内核自检的文本（成功是整份报告，失败是一行原因）。
+    static var kernelNote = "[内核] 初始化中…"
 
     // MARK: UISceneSession
 
