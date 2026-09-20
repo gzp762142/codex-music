@@ -2,19 +2,21 @@ import Foundation
 import Darwin
 import CoreGraphics
 
-/// 读内存探针：**只读**，不写、不 hook、不注入。
-///
-/// 读取路径：**内核读写原语**（见 libmemrw/KernelMemory.c）。
+/// 读内存探针：**只读**，不写、不 hook、不注入。**只有一条路**。
 ///
 /// ```
-/// pid → proc → task → vm_map → pmap → 页表 → 物理页 → 内核虚拟地址 → kread
+/// let fn  = dlsym(RTLD_DEFAULT, "task_for_pid")
+/// let tfp = unsafeBitCast(fn, to: TaskForPidFn.self)
+/// let kr  = tfp(mach_task_self_, pid, &port)
 /// ```
 ///
-/// 原语由 PUAFF 建立（kopen → puaf_run → krkw_run），**不经过 task_for_pid，
-/// 也不使用 mach_vm_read** —— 目标进程的定位与地址翻译全部在内核里完成。
+/// **绝不使用 syscall()。** `syscall()` 只走 BSD syscall 表，而 task_for_pid 是
+/// Mach trap，两套编号互不相通。把 mach trap 号（45）交给 syscall() 会让它按
+/// BSD 表跳到第 45 号那个完全不同的调用上 —— 实测直接闪退。
+/// 26 同理（BSD 表第 26 号是 ptrace，还有副作用）。
 ///
-/// 唯一保留的快路径是**共享映射**（`vm_remap` 到本进程，本地直读零内核调用），
-/// 未命中时才退回内核读。两条路都可用时优先映射，因为本地读没有读锁竞争。
+/// 这条路如果返回 KERN_FAILURE(5)，那是**权限**问题不是号错：
+/// `Music.entitlements` 需要 `task_for_pid-allow`，重签重装后再试。
 final class MemoryProbe {
 
     private typealias MachPort = UInt32
@@ -22,12 +24,19 @@ final class MemoryProbe {
     private typealias MachVmAddress = UInt64
     private typealias MachVmSize = UInt64
 
+    private typealias TaskForPidFn = @convention(c) (MachPort, Int32,
+                                                     UnsafeMutablePointer<MachPort>) -> KernReturn
+    private typealias VmReadFn = @convention(c) (MachPort, MachVmAddress, MachVmSize,
+                                                 UnsafeMutablePointer<UInt>,
+                                                 UnsafeMutablePointer<MachVmSize>) -> KernReturn
     private typealias VmDeallocateFn = @convention(c) (MachPort, UInt, MachVmSize) -> KernReturn
 
     private static func symbol<T>(_ name: String, as: T.Type) -> T? {
         guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), name) else { return nil }
         return unsafeBitCast(sym, to: T.self)
     }
+
+    private static let taskForPidFn = symbol("task_for_pid", as: TaskForPidFn.self)
 
     /// mach_port_deallocate：释放我们自己持有的 port right。
     private typealias PortDeallocateFn = @convention(c) (MachPort, MachPort) -> KernReturn
@@ -58,13 +67,13 @@ final class MemoryProbe {
     /// proc_pidpath：只用来问「这个 pid 还在不在」，不碰它的内存。
     private typealias ProcPidPathFn = @convention(c) (Int32, UnsafeMutableRawPointer?, UInt32) -> Int32
     private static let procPidPathFn = symbol("proc_pidpath", as: ProcPidPathFn.self)
+    private static let vmReadFn = symbol("mach_vm_read", as: VmReadFn.self)
     private static let vmDeallocateFn = symbol("mach_vm_deallocate", as: VmDeallocateFn.self)
 
 
-    /// 符号自检。读取路径已切到内核，这里只关心仍在用的 Mach 符号。
     static var symbolSummary: String {
-        let a = vmRegionRecurseFn != nil ? "vm_region=OK" : "vm_region=nil"
-        let b = procRegionFileNameFn != nil ? "regionfile=OK" : "regionfile=nil"
+        let a = taskForPidFn != nil ? "tfp=OK" : "tfp=nil"
+        let b = vmReadFn != nil ? "vm_read=OK" : "vm_read=nil"
         let c = vmDeallocateFn != nil ? "vm_dealloc=OK" : "vm_dealloc=nil"
         return "\(a) \(b) \(c)"
     }
@@ -97,16 +106,28 @@ final class MemoryProbe {
     /// 注意返回值写 UInt32 而不是私有别名 MachPort：
     /// internal 函数的签名不能暴露 private typealias，否则编译报
     /// "method must be declared private because its parameter uses a private type"。
-    // acquirePort 已移除：内核路径不产生 port，目标进程由 km_proc_for_pid 定位。
+    static func acquirePort(pid: Int32) -> (port: UInt32, note: String)? {
+        guard let fn = taskForPidFn else { return nil }
+        var port: MachPort = 0
+        let kr = fn(mach_task_self_, pid, &port)
+        guard kr == KERN_SUCCESS, port != 0 else { return nil }
+        return (port, "port=0x\(String(port, radix: 16))")
+    }
 
     /// 第 1 步：只报告符号解析情况，不调用任何东西。
     static func stepSymbols() -> String { symbolSummary }
 
-    /// 第 2 步：确认内核读路径对目标 pid 可用（等价于原先的「取到端口」）。
+    /// 第 2 步：只调 libSystem 的 task_for_pid —— 唯一被允许的取端口方式。
+    /// 不用 syscall：syscall() 只走 BSD 表，Mach trap 号交给它会跳到别的调用上。
     static func stepDlsym(pid: Int32) -> String {
-        let proc = km_proc_for_pid(pid)
-        guard proc != 0 else { return "内核: 找不到 pid=\(pid) 的 proc" }
-        return "内核: proc=0x\(String(proc, radix: 16))"
+        guard let fn = taskForPidFn else { return "dlsym: 符号缺失" }
+        var port: MachPort = 0
+        let kr = fn(mach_task_self_, pid, &port)
+        defer { dropPort(port) }
+        if kr == KERN_SUCCESS, port != 0 {
+            return "dlsym: 成功 port=0x\(String(port, radix: 16))"
+        }
+        return "dlsym: \(describe(kr))"
     }
 
     // MARK: - 读（全部 static：纯函数，不需要实例）
@@ -125,8 +146,8 @@ final class MemoryProbe {
 
     /// 走已建立的映射、本地内存直接读的次数。
     private static var mappedHits = 0
-    /// 真正落回内核读的次数 —— **这个才是成本**（映射命中是本地读，不计入）。
-    private static var kernelReadCalls = 0
+    /// 真正落回 mach_vm_read 的次数 —— **这个才是成本**。
+    private static var vmReadCalls = 0
     /// 按需建立的映射块数。
     private static var onDemandMaps = 0
 
@@ -148,16 +169,7 @@ final class MemoryProbe {
 
     // MARK: - 跨进程映射（这是样本用的读取方式）
 
-    /// `vm_remap` —— 32 位地址空间版本，样本用的就是这一个。
-    ///
-    /// 样本实测（见 _kfd_port/样本通道权威实测结论.md）：
-    ///     0x0100f75a34  bl  #0x1010b1704   ; __stubs -> _vm_remap（不是 mach_vm_remap）
-    /// 配套的区域查询也是 32 位版：`_vm_region_64` / `_vm_region_recurse_64`，
-    /// 不是 `mach_vm_region`。所以这里跟着样本对齐到 `vm_remap`。
-    ///
-    /// ABI 上 `vm_remap` 与 `mach_vm_remap` 参数个数、顺序、返回值都相同，
-    /// 只是 address/size 在 32 位地址空间内截断——本进程映射必然落在 4G 内，不影响。
-    private typealias VmRemapFn = @convention(c) (
+    private typealias MachVmRemapFn = @convention(c) (
         UInt32,                              // target_task
         UnsafeMutablePointer<UInt64>,        // *target_address
         UInt64,                              // size
@@ -171,7 +183,7 @@ final class MemoryProbe {
         Int32                                // inheritance
     ) -> KernReturn
 
-    private static let vmRemapFn = symbol("vm_remap", as: VmRemapFn.self)
+    private static let machVmRemapFn = symbol("mach_vm_remap", as: MachVmRemapFn.self)
 
     /// `mach_vm_protect` —— 映射建立之后把权限压到只读。
     ///
@@ -189,64 +201,19 @@ final class MemoryProbe {
 
     private static let machVmProtectFn = symbol("mach_vm_protect", as: MachVmProtectFn.self)
 
-    /// `mlock` —— 把已建好的映射窗口锁进物理内存，禁止被换出。
-    ///
-    /// 样本在建窗之后立刻做这一步（见样本 `0x100F75AF0` 的循环）：
-    ///     0x0100f75af0  ldr  x0, [x22, #0xf8]   ; 映射窗口的本地 VA
-    ///     0x0100f75af4  ldr  x1, [x26, #0x70]   ; 页大小（运行时探测的 0x4000 / 0x40000）
-    ///     0x0100f75af8  bl   _mlock
-    ///     0x0100f75b30  b    #0x100f75af0       ; 循环
-    ///
-    /// 为什么要锁：整条读写原语悬在「那个物理页一直在那儿」这个前提上。
-    /// 页一旦被换出再换回来，物理地址可能变，之前算好的映射目标就指错了 ——
-    /// 轻则读到垃圾，重则崩溃。锁住之后窗口常驻，映射目标始终有效。
-    private typealias MlockFn = @convention(c) (
-        UInt64,                              // addr
-        UInt64                               // len
-    ) -> Int32
-
-    private static let mlockFn = symbol("mlock", as: MlockFn.self)
-
-    /*
-     * 计数与诊断串的跨线程可见性。
-     *
-     * 这些值在 AutoTracker 的读取队列上写（1Hz/20Hz），但 `DebugProcView` 在主线程
-     * 直接读（`MemoryProbe.mappedBlockCount`、`lastProtectFailure`）。
-     * `String` 不是原子类型 —— 主线程读、后台写同一个 String 可能读到半更新的
-     * 内部缓冲；`Int` 的竞争虽不致命，但会让「验收数字」读到一个撕裂值。
-     *
-     * 用一把轻量锁把读写都圈住。这里刻意**不**复用 AutoTracker 的串行队列：
-     * MemoryProbe 是底层模块，不该依赖上层状态机，而且队列同步会把 UI 主线程
-     * 压在 1Hz 的全量扫描后面。
-     */
-    private static let stateLock = NSLock()
-
-    private static func withLock<T>(_ body: () -> T) -> T {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        return body()
-    }
-
-    /// `mlock` 失败的累计次数。**验收要求它是 0**：
-    /// 失败意味着那块窗口可能被换出，之后读到垃圾。但不致命，所以只记不丢弃。
-    private static var _mlockFailures = 0
-    static var mlockFailures: Int { withLock { _mlockFailures } }
-
     private static let vmProtRead: Int32 = 0x1
     private static let vmProtWrite: Int32 = 0x2
 
     /// 降权失败的累计次数。**验收要求它是 0**：每失败一次就意味着有一块映射被主动丢弃
     /// （那是正确行为），但它同时说明 `mach_vm_protect` 在这个环境上不工作，要查。
-    private static var _protectFailures = 0
-    static var protectFailures: Int { withLock { _protectFailures } }
+    private(set) static var protectFailures = 0
 
     /// 最近一次降权失败的详情（地址 + 大小 + 返回码）。
     ///
     /// 光有次数定不了位。返回码能直接分开「参数/地址」和「权限」两类原因：
     /// `KERN_INVALID_ADDRESS` 指向「范围超出实际映射」—— `vm_remap` 会按源 region 的
     /// 边界把映射截短，而这里仍按原始 `total` 去 protect，多出来的那截没有映射。
-    private static var _lastProtectFailure = ""
-    static var lastProtectFailure: String { withLock { _lastProtectFailure } }
+    private(set) static var lastProtectFailure = ""
 
     /// 把一块刚建立的共享映射压到只读，**失败清理收在函数内部**。
     ///
@@ -287,10 +254,10 @@ final class MemoryProbe {
                     + " max=0x\(String(maxProt, radix: 16)) \(why)"
                 : "源region查询失败"
                     + " max=0x\(String(maxProt, radix: 16)) \(why)"
-            withLock { _lastProtectFailure = head + "\n" + tail }
+            lastProtectFailure = head + "\n" + tail
             // 降权失败 = 手上握着一块能改游戏内存的映射。宁可不要。
             _ = vmDeallocateFn?(mach_task_self_, UInt(target), total)
-            withLock { _protectFailures += 1 }
+            protectFailures += 1
         }
         return ok
     }
@@ -329,7 +296,7 @@ final class MemoryProbe {
     /// 这是样本（Music）用的原语，也是我们必须换过去的那一步：
     ///
     ///   `mach_vm_read`  每次都要进内核、抢游戏 vm_map 的**读锁**、再拷一份出来。
-    ///   `vm_remap` 只在**建立映射**时进一次内核，之后读数据就是普通内存访问
+    ///   `mach_vm_remap` 只在**建立映射**时进一次内核，之后读数据就是普通内存访问
     ///                   —— 零内核调用、零锁、零拷贝。
     ///
     /// 游戏的 vm_map 锁是读写互斥的：它主线程每帧写坐标拿写锁，我们每读一次拿一次读锁，
@@ -342,7 +309,10 @@ final class MemoryProbe {
     ///
     /// 代价是共享映射默认带写权限，所以建立之后立刻要走 `downgradeToReadOnly`。
     static func mapRange(pid: Int32, srcAddress: UInt64, size: UInt64) -> (local: UInt64, note: String) {
-        guard let fn = vmRemapFn else { return (0, "vm_remap 符号缺失") }
+        guard let fn = machVmRemapFn else { return (0, "mach_vm_remap 符号缺失") }
+        let (kr, p) = port(for: pid)
+        guard kr == KERN_SUCCESS, p != 0 else { return (0, "取端口失败 \(describe(kr))") }
+        defer { dropPort(p) }
 
         // iOS 上物理页是 16KB，映射必须页对齐
         let pageSize: UInt64 = 0x4000
@@ -353,29 +323,16 @@ final class MemoryProbe {
         var target: UInt64 = 0
         var curProt: Int32 = 0
         var maxProt: Int32 = 0
-        // 端口机制已移除：目标进程的共享映射需要它的 task port，而内核路径不产生 port。
-        // 这里退化为对本进程做 remap —— 结构保留，读取由 km_read_process 承担。
         let rk = fn(mach_task_self_, &target, total, 0, vmFlagsAnywhere,
-                    mach_task_self_, alignedStart, 0, &curProt, &maxProt, 0)
+                    p, alignedStart, 0, &curProt, &maxProt, 0)
         guard rk == KERN_SUCCESS, target != 0 else {
-            return (0, "vm_remap 失败 \(describe(rk))")
+            return (0, "mach_vm_remap 失败 \(describe(rk))")
         }
         // 降权与失败清理都在函数里，这里只判结果
         guard downgradeToReadOnly(target, total: total, src: alignedStart,
-                                  maxProt: maxProt, gamePort: mach_task_self_) else {
+                                  maxProt: maxProt, gamePort: p) else {
             return (0, "降权失败，已丢弃该映射（拒绝以可写状态持有游戏内存）")
         }
-
-        /*
-         * 锁定物理页 —— 样本建窗后的固定动作（见 mlockFn 的说明）。
-         * 失败只计数，不丢弃映射：没锁上只是有被换出的风险，比没有映射强。
-         */
-        if let lock = mlockFn {
-            if lock(target, total) != 0 {
-                withLock { _mlockFailures += 1 }
-            }
-        }
-
         mappedRanges.append((alignedStart, total, target))
         rangesSorted = false
         return (target + head,
@@ -444,9 +401,12 @@ final class MemoryProbe {
     /// region 起始），所以这里一次枚举 + 一次映射就够 —— 不需要从头扫地址空间。
     @discardableResult
     static func mapRegionContaining(pid: Int32, address: UInt64) -> String {
+        let (kr, p) = port(for: pid)
+        guard kr == KERN_SUCCESS, p != 0 else { return "取端口失败 \(describe(kr))" }
+        defer { dropPort(p) }
 
         var addr: UInt64 = address
-        let (ok, size, _, _) = nextRegion(task: mach_task_self_, addr: &addr)
+        let (ok, size, _, _) = nextRegion(task: p, addr: &addr)
         guard ok else { return "枚举失败 @0x\(String(address, radix: 16))" }
         guard address >= addr, address < addr &+ size else {
             return "0x\(String(address, radix: 16)) 不在返回的 region(0x\(String(addr, radix: 16)) +0x\(String(size, radix: 16))) 里"
@@ -470,7 +430,10 @@ final class MemoryProbe {
     @discardableResult
     static func mapAllRegions(pid: Int32, minSize: UInt64 = 256 << 10,
                               budget: TimeInterval = 2.5, maxBlocks: Int = 600) -> String {
-        guard let fn = vmRemapFn else { return "预映射: vm_remap 符号缺失" }
+        guard let fn = machVmRemapFn else { return "预映射: mach_vm_remap 符号缺失" }
+        let (kr, p) = port(for: pid)
+        guard kr == KERN_SUCCESS, p != 0 else { return "预映射: 取端口失败 \(describe(kr))" }
+        defer { dropPort(p) }
 
         let deadline = Date().addingTimeInterval(budget)
         let pageSize: UInt64 = 0x4000
@@ -487,7 +450,7 @@ final class MemoryProbe {
             rounds += 1
 
             let ask = probe
-            let (ok, size, prot, _) = nextRegion(task: mach_task_self_, addr: &probe)
+            let (ok, size, prot, _) = nextRegion(task: p, addr: &probe)
             guard ok, size > 0 else { break }
             let start = probe                      // nextRegion 会把 probe 写成 region 起始
             let next = start &+ size
@@ -505,11 +468,11 @@ final class MemoryProbe {
             var curProt: Int32 = 0
             var maxProt: Int32 = 0
             let rk = fn(mach_task_self_, &target, total, 0, vmFlagsAnywhere,
-                        mach_task_self_, aligned, 0, &curProt, &maxProt, 0)
+                        p, aligned, 0, &curProt, &maxProt, 0)
             // 降权（含失败清理）已收在 downgradeToReadOnly 里
             let downgraded = (rk == KERN_SUCCESS && target != 0)
                 ? downgradeToReadOnly(target, total: total, src: aligned,
-                                      maxProt: maxProt, gamePort: mach_task_self_)
+                                      maxProt: maxProt, gamePort: p)
                 : false
             if rk == KERN_SUCCESS, target != 0, downgraded {
                 mappedRanges.append((aligned, total, target))
@@ -536,11 +499,11 @@ final class MemoryProbe {
     /// 已建立的映射块数 —— 调用方用它判断"要不要先预映射一轮"。
     static var mappedBlockCount: Int { mappedRanges.count }
 
-    /// 真正落回内核读的次数。遍历类操作要盯着这个数，超预算就该收手。
-    static var hardReadCalls: Int { kernelReadCalls }
+    /// 真正落回 mach_vm_read 的次数。遍历类操作要盯着这个数，超预算就该收手。
+    static var hardReadCalls: Int { vmReadCalls }
 
     /// 走已建立映射、本地直读的次数。和 `hardReadCalls` 放一起看，一眼能分清
-    /// 这一轮走的是映射还是内核降级读 —— `hardReadCalls` 必须长期保持在低位，
+    /// 这一轮走的是映射还是内核 —— `hardReadCalls` 必须长期保持在低位，
     /// 它每涨一次游戏就多一次抢锁，那正是当初把游戏读崩的那条路。
     static var mappedHitCalls: Int { mappedHits }
 
@@ -571,15 +534,15 @@ final class MemoryProbe {
 
 
     /// **映射优先的读**：命中已建立的映射就本地读（零内核调用）；
-    /// 没命中就按需把那一块映射进来再读；映射也失败才退回内核读（km_read_process）。
+    /// 没命中就按需把那一块映射进来再读；映射也失败才退回 mach_vm_read。
     ///
-    /// 映射之后读数据就是普通内存访问；这比每次进内核翻译一遍地址便宜得多，
-    /// 而每个字段读一次的话后者累积起来相当可观。
+    /// 这是整个方案的核心。`mach_vm_read` 每次都要进内核、抢游戏 vm_map 的读锁，
+    /// 而我们读的每个字段都是一次这样的操作；映射之后读数据就是普通内存访问。
     ///
     /// **块数上限从 24 提到 512**：原来那个 24 是按「点读几个字段」估的，遍历整张对象表
-    /// 时远远不够，一撞上限剩下的读全变成内核读 —— 那条路要贵得多。
+    /// 时远远不够，一撞上限剩下的读全变成 mach_vm_read —— 那就是崩游戏的那条路。
     /// 正常路径是先用 mapAllRegions 把大块一次性铺好，这里只是兜底。
-    private static func readSmart(pid: Int32, address: MachVmAddress, count: Int) -> (KernReturn, [UInt8]) {
+    private static func readSmart(port: MachPort, address: MachVmAddress, count: Int) -> (KernReturn, [UInt8]) {
         let n = max(count, 1)
         guard n <= 0x10000 else { return (KERN_FAILURE, []) }
 
@@ -607,27 +570,16 @@ final class MemoryProbe {
             }
         }
 
-        /*
-         * 降级读走内核路径：pid → proc → task → vm_map → pmap → 页表 → PA → KVA。
-         * 不需要 task port，也不再调用 mach_vm_read —— 原语由 PUAFF 建立，
-         * 实现见 libmemrw/KernelMemory.c。
-         */
         noteRead()
-        var buf = [UInt8](repeating: 0, count: n)
-        let ok = buf.withUnsafeMutableBytes { raw -> Bool in
-            guard let base = raw.baseAddress else { return false }
-            return km_read_process(pid, address, base, UInt64(n))
-        }
-        guard ok else { return (KERN_FAILURE, []) }
-        kernelReadCalls += 1
-        return (KERN_SUCCESS, buf)
+        vmReadCalls += 1
+        return readBytesDirect(port: port, address: address, count: n)
     }
 
     /// 读一段字节：**优先走已建立的映射**，没命中就让 readSmart 按需映射。
     /// 原来这里直接就是 mach_vm_read —— 所有调用点现在自动升级成映射优先。
-    private static func readBytes(pid: Int32, address: MachVmAddress, count: Int)
+    private static func readBytes(port: MachPort, address: MachVmAddress, count: Int)
         -> (KernReturn, [UInt8]) {
-        readSmart(pid: pid, address: address, count: count)
+        readSmart(port: port, address: address, count: count)
     }
 
     static var mappedSummary: String {
@@ -646,16 +598,16 @@ final class MemoryProbe {
     private static func resetCounters() {
         probeCalls = 0
         mappedHits = 0
-        kernelReadCalls = 0
+        vmReadCalls = 0
         onDemandMaps = 0
     }
 
     /// 本次动作的成本。**只看 mach_vm_read 那一项** —— 映射命中是本地内存读，
     /// 不产生内核调用，也就没有成本。之前这里只报 probeCalls（读取总次数），
-    /// 文案却写成"次内核读"，把完全不同的两件事混成了一个数。
+    /// 文案却写成"次 mach_vm_read"，把完全不同的两件事混成了一个数。
     private static func costLine() -> String {
         "读取 \(probeCalls) 次 · 映射命中 \(mappedHits) · 按需映射 \(onDemandMaps) 块 · "
-            + "内核读 \(kernelReadCalls) 次"
+            + "mach_vm_read \(vmReadCalls) 次"
     }
 
     // MARK: - 阶段标记（崩了之后还能知道停在哪）
@@ -764,15 +716,15 @@ final class MemoryProbe {
     /// **字符宽度不假定。** iOS 上 UE4 的 TCHAR 是 4 字节（Apple 平台
     /// PLATFORM_TCHAR_IS_4_BYTES=1），但定制版可能退回 2 字节。三种宽度各解一遍，
     /// 用「解出的字符数是否等于 Num−1」这条自洽性判胜负 —— 不靠猜。
-    private static func readText(pid: Int32, addr: UInt64, maxChars: Int = 24) -> String {
-        let (rk, hdr) = readBytes(pid: pid, address: MachVmAddress(addr), count: 16)
+    private static func readText(port: MachPort, addr: UInt64, maxChars: Int = 24) -> String {
+        let (rk, hdr) = readBytes(port: port, address: MachVmAddress(addr), count: 16)
         guard rk == KERN_SUCCESS, hdr.count >= 16 else { return "" }
         let data = u64le(hdr, 0)
         let num = Int(u32le(hdr, 8))
         guard data > 0x100000000, num > 1, num <= 256 else { return "" }
 
         let n = min(num, maxChars)
-        let (rk2, raw) = readBytes(pid: pid, address: MachVmAddress(data), count: n * 4)
+        let (rk2, raw) = readBytes(port: port, address: MachVmAddress(data), count: n * 4)
         guard rk2 == KERN_SUCCESS, raw.count >= n * 2 else { return "" }
 
         func decode(width: Int) -> (String, Int) {
@@ -873,31 +825,31 @@ final class MemoryProbe {
     //      那是文件系统调用，绝不能出现在高频路径上
     //   ③ 两段式读取：短链（自己+相机）走高频，长链（actor 遍历）走低频
 
-    /// 当前挂载的目标 pid。0 = 未挂载。
+    /// 持有中的 task port。0 = 未 attach。
+    private static var longPort: MachPort = 0
     private static var longPid: Int32 = 0
 
-    static var isAttached: Bool { longPid != 0 }
+    static var isAttached: Bool { longPort != 0 }
     static var attachedPid: Int32 { longPid }
 
-    /// 挂载目标进程。**同一个 pid 重复调用直接复用。**
-    ///
-    /// 内核路径下「挂载」不再意味着持有 task port，而是确认这个 pid
-    /// 能在内核里定位到 proc —— 那正是后续所有读取的前提。
+    /// 建立长连接端口。**同一个 pid 重复调用直接复用，不重复 attach。**
     static func attachPort(_ pid: Int32) -> (ok: Bool, note: String) {
-        if longPid == pid, pid != 0 { return (true, "复用现有挂载") }
-        if longPid != 0 { detachPort() }
-
-        let proc = km_proc_for_pid(pid)
-        guard proc != 0 else {
-            return (false, "内核里找不到 pid=\(pid) 的 proc")
+        if longPort != 0, longPid == pid { return (true, "复用现有端口") }
+        if longPort != 0 { detachPort() }
+        let (kr, p) = port(for: pid)
+        guard kr == KERN_SUCCESS, p != 0 else {
+            return (false, "task_for_pid 失败 \(describe(kr))")
         }
+        longPort = p
         longPid = pid
         cachedOffsets = nil
-        return (true, "已挂载 pid=\(pid) proc=0x\(String(proc, radix: 16))")
+        return (true, "新建端口 pid=\(pid)")
     }
 
-    /// 卸载目标进程。
+    /// 释放长连接端口。**必须与 attachPort 配对。**
     static func detachPort() {
+        if longPort != 0 { dropPort(longPort) }
+        longPort = 0
         longPid = 0
     }
 
@@ -945,9 +897,9 @@ final class MemoryProbe {
         var note = ""
     }
 
-    private static func readWorldPointer(_ pid: Int32) -> UInt64? {
+    private static func readWorldPointer(_ p: MachPort) -> UInt64? {
         guard imageSlide != 0 else { return nil }
-        let (rk, w) = readRaw(pid: pid, address: MachVmAddress(runtime(offsets.gWorld, slide: imageSlide)))
+        let (rk, w) = readRaw(port: p, address: MachVmAddress(runtime(offsets.gWorld, slide: imageSlide)))
         return (rk == KERN_SUCCESS && w > 0x100000000) ? w : nil
     }
 
@@ -960,23 +912,24 @@ final class MemoryProbe {
     ///
     /// `hintPC` 来自低频层：LocalPlayers 那条路可能被 `bUseEncryptLocalPlayerPtr` 挡住，
     /// 那时用它兜底（本机实测就是这种情况）。
-    static func readSelfAndCamera(pid: Int32, hintPC: UInt64, world: UInt64) -> SelfSnapshot {
+    static func readSelfAndCamera(hintPC: UInt64, world: UInt64) -> SelfSnapshot {
         var snap = SelfSnapshot()
-        guard pid != 0 else { return snap }
+        guard longPort != 0 else { return snap }
+        let p = longPort
 
         // ① 自己的 PlayerController
         var pc: UInt64 = 0
         if world > 0x100000000 {
-            let (rkG, gi) = readRaw(pid: pid, address: MachVmAddress(world &+ 0xB20))
+            let (rkG, gi) = readRaw(port: p, address: MachVmAddress(world &+ 0xB20))
             if rkG == KERN_SUCCESS, gi > 0x100000000 {
-                let (rkL, lp) = readBytes(pid: pid, address: MachVmAddress(gi &+ 0x48), count: 16)
+                let (rkL, lp) = readBytes(port: p, address: MachVmAddress(gi &+ 0x48), count: 16)
                 if rkL == KERN_SUCCESS, lp.count >= 16 {
                     let data = u64le(lp, 0)
                     let cnt = u32le(lp, 8)
                     if data > 0x100000000, cnt > 0, cnt <= 8 {
-                        let (rkP0, lplayer) = readRaw(pid: pid, address: MachVmAddress(data))
+                        let (rkP0, lplayer) = readRaw(port: p, address: MachVmAddress(data))
                         if rkP0 == KERN_SUCCESS, lplayer > 0x100000000 {
-                            let (rkPC, got) = readRaw(pid: pid, address: MachVmAddress(lplayer &+ 0x30))
+                            let (rkPC, got) = readRaw(port: p, address: MachVmAddress(lplayer &+ 0x30))
                             if rkPC == KERN_SUCCESS, got > 0x100000000 { pc = got }
                         }
                     }
@@ -989,26 +942,26 @@ final class MemoryProbe {
 
         // ② Pawn 与世界坐标
         var pawn: UInt64 = 0
-        let (rkA, ack) = readRaw(pid: pid, address: MachVmAddress(pc &+ 0x660))
+        let (rkA, ack) = readRaw(port: p, address: MachVmAddress(pc &+ 0x660))
         if rkA == KERN_SUCCESS, ack > 0x100000000 {
             pawn = ack
         } else {
-            let (rkP, pw) = readRaw(pid: pid, address: MachVmAddress(pc &+ 0x5D8))
+            let (rkP, pw) = readRaw(port: p, address: MachVmAddress(pc &+ 0x5D8))
             if rkP == KERN_SUCCESS, pw > 0x100000000 { pawn = pw }
         }
         guard pawn > 0x100000000 else { return snap }
         snap.pawn = pawn
 
-        let (rkR, root) = readRaw(pid: pid, address: MachVmAddress(pawn &+ 0x260))
+        let (rkR, root) = readRaw(port: p, address: MachVmAddress(pawn &+ 0x260))
         guard rkR == KERN_SUCCESS, root > 0x100000000 else { return snap }
-        let (rkT, tf) = readBytes(pid: pid, address: MachVmAddress(root &+ 0x1F0 &+ 0x10), count: 12)
+        let (rkT, tf) = readBytes(port: p, address: MachVmAddress(root &+ 0x1F0 &+ 0x10), count: 12)
         guard rkT == KERN_SUCCESS, tf.count >= 12 else { return snap }
         snap.loc = (floatAt(tf, 0), floatAt(tf, 4), floatAt(tf, 8))
 
         // ③ 相机
-        let (rkC, cm) = readRaw(pid: pid, address: MachVmAddress(pc &+ 0x680))
+        let (rkC, cm) = readRaw(port: p, address: MachVmAddress(pc &+ 0x680))
         if rkC == KERN_SUCCESS, cm > 0x100000000 {
-            let (rkPov, pov) = readBytes(pid: pid,
+            let (rkPov, pov) = readBytes(port: p,
                                          address: MachVmAddress(cm &+ 0x640 &+ 0x10),
                                          count: 0x60)
             if rkPov == KERN_SUCCESS, pov.count >= 0x34 {
@@ -1032,19 +985,20 @@ final class MemoryProbe {
     ///     PersistentLevel 被跳过，角色数直接是 0
     ///   · 类名解析按 Class 指针**去重** —— 同类对象共享 Class，解析次数只跟
     ///     "有多少种类"有关，不跟 actor 数量有关
-    static func scanTargets(pid: Int32) -> TargetScan {
+    static func scanTargets() -> TargetScan {
         var out = TargetScan()
-        guard pid != 0 else { out.note = "未 attach"; return out }
+        guard longPort != 0 else { out.note = "未 attach"; return out }
+        let p = longPort
         let off = offsets
-        let vmBefore = kernelReadCalls
+        let vmBefore = vmReadCalls
 
-        guard let world = readWorldPointer(pid) else {
+        guard let world = readWorldPointer(p) else {
             // 失败要带数值：地址、返回码、读到的原始值 —— 光说"失败"没法定位
             let gwAddr = imageSlide != 0
                 ? runtime(offsets.gWorld, slide: imageSlide)
                 : 0
             let (rkW, w) = imageSlide != 0
-                ? readRaw(pid: pid, address: MachVmAddress(gwAddr))
+                ? readRaw(port: p, address: MachVmAddress(gwAddr))
                 : (KERN_FAILURE, 0)
             out.note = "读 GWorld 失败 rk=\(describe(rkW))"
                 + " slide=\(hexOf(imageSlide))"
@@ -1053,12 +1007,12 @@ final class MemoryProbe {
             return out
         }
         out.world = world
-        let (rkPool, pool) = readRaw(pid: pid, address: MachVmAddress(runtime(off.gNames, slide: imageSlide)))
+        let (rkPool, pool) = readRaw(port: p, address: MachVmAddress(runtime(off.gNames, slide: imageSlide)))
         guard rkPool == KERN_SUCCESS, pool > 0x100000000 else {
             out.note = "读 GNames 槽失败"
             return out
         }
-        let (rkChunk, chunk0) = readRaw(pid: pid, address: MachVmAddress(pool))
+        let (rkChunk, chunk0) = readRaw(port: p, address: MachVmAddress(pool))
         guard rkChunk == KERN_SUCCESS, chunk0 > 0x100000000 else {
             out.note = "读名字池 chunk0 失败"
             return out
@@ -1066,9 +1020,9 @@ final class MemoryProbe {
 
         // 收集 actor 源：PersistentLevel + UWorld::Levels 里的每一个
         var sources: [(label: String, data: UInt64, count: Int)] = []
-        let (rkL, level) = readRaw(pid: pid, address: MachVmAddress(world &+ 0xB8))
+        let (rkL, level) = readRaw(port: p, address: MachVmAddress(world &+ 0xB8))
         if rkL == KERN_SUCCESS, level > 0x100000000 {
-            let (rkA, arr) = readBytes(pid: pid, address: MachVmAddress(level &+ 0xA0), count: 16)
+            let (rkA, arr) = readBytes(port: p, address: MachVmAddress(level &+ 0xA0), count: 16)
             if rkA == KERN_SUCCESS, arr.count >= 16 {
                 let d = u64le(arr, 0)
                 let c = Int(u32le(arr, 8))
@@ -1077,18 +1031,18 @@ final class MemoryProbe {
                 }
             }
         }
-        let (rkLv, lvHdr) = readBytes(pid: pid, address: MachVmAddress(world &+ 0x0AF0), count: 16)
+        let (rkLv, lvHdr) = readBytes(port: p, address: MachVmAddress(world &+ 0x0AF0), count: 16)
         if rkLv == KERN_SUCCESS, lvHdr.count >= 16 {
             let d = u64le(lvHdr, 0)
             let c = Int(u32le(lvHdr, 8))
             if d > 0x100000000, c > 0, c <= 4096 {
                 let probe = min(c, 64)
-                let (rkP, ptrs) = readBytes(pid: pid, address: MachVmAddress(d), count: probe * 8)
+                let (rkP, ptrs) = readBytes(port: p, address: MachVmAddress(d), count: probe * 8)
                 if rkP == KERN_SUCCESS, ptrs.count >= probe * 8 {
                     for k in 0..<probe {
                         let lv = u64le(ptrs, k * 8)
                         guard lv > 0x100000000, lv != level else { continue }
-                        let (rkA2, a2) = readBytes(pid: pid, address: MachVmAddress(lv &+ 0xA0), count: 16)
+                        let (rkA2, a2) = readBytes(port: p, address: MachVmAddress(lv &+ 0xA0), count: 16)
                         guard rkA2 == KERN_SUCCESS, a2.count >= 16 else { continue }
                         let d2 = u64le(a2, 0)
                         let c2 = Int(u32le(a2, 8))
@@ -1109,7 +1063,7 @@ final class MemoryProbe {
         sourceLoop: for src in sources {
             var cursor = 0
             while cursor < src.count {
-                if kernelReadCalls - vmBefore > 200 {
+                if vmReadCalls - vmBefore > 200 {
                     stopped = "mach_vm_read 超预算，提前收手"
                     break sourceLoop
                 }
@@ -1118,20 +1072,20 @@ final class MemoryProbe {
                     break sourceLoop
                 }
                 let batch = min(500, src.count - cursor)
-                let (rkBuf, buf) = readBytes(pid: pid,
+                let (rkBuf, buf) = readBytes(port: p,
                                              address: MachVmAddress(src.data &+ UInt64(cursor * 8)),
                                              count: batch * 8)
                 guard rkBuf == KERN_SUCCESS, buf.count >= batch * 8 else { break }
                 for i in 0..<batch {
                     let actor = u64le(buf, i * 8)
                     guard actor > 0x100000000 else { continue }
-                    let (rkCls, cls) = readRaw(pid: pid, address: MachVmAddress(actor &+ 0x10))
+                    let (rkCls, cls) = readRaw(port: p, address: MachVmAddress(actor &+ 0x10))
                     guard rkCls == KERN_SUCCESS, cls > 0x100000000 else { continue }
                     var nm = classNames[cls]
                     if nm == nil {
-                        let (rkIX, clsIX) = readAt(pid: pid, address: MachVmAddress(cls &+ 0x18))
+                        let (rkIX, clsIX) = readAt(port: p, address: MachVmAddress(cls &+ 0x18))
                         nm = (rkIX == KERN_SUCCESS)
-                            ? resolveName(pid: pid, pool: pool, chunk0: chunk0, index: clsIX)
+                            ? resolveName(port: p, pool: pool, chunk0: chunk0, index: clsIX)
                             : "?"
                         classNames[cls] = nm
                     }
@@ -1140,10 +1094,10 @@ final class MemoryProbe {
 
                     // 顺手认出本机 PlayerController —— 高频层的锚点，见 TargetScan 注释
                     if name.contains("PlayerController"), out.localPC == 0 {
-                        let (rkLf, lf) = readAt(pid: pid, address: MachVmAddress(actor &+ 0xA8C))
+                        let (rkLf, lf) = readAt(port: p, address: MachVmAddress(actor &+ 0xA8C))
                         if rkLf == KERN_SUCCESS, (lf & 0xFF) == 1 {
                             out.localPC = actor
-                            let (rkPw, pw) = readRaw(pid: pid, address: MachVmAddress(actor &+ 0x5D8))
+                            let (rkPw, pw) = readRaw(port: p, address: MachVmAddress(actor &+ 0x5D8))
                             if rkPw == KERN_SUCCESS, pw > 0x100000000 { out.localPawn = pw }
                         }
                     }
@@ -1153,9 +1107,9 @@ final class MemoryProbe {
                     var t = TargetSnapshot()
                     t.actor = actor
                     t.cls = name
-                    let (rkR, root) = readRaw(pid: pid, address: MachVmAddress(actor &+ 0x260))
+                    let (rkR, root) = readRaw(port: p, address: MachVmAddress(actor &+ 0x260))
                     if rkR == KERN_SUCCESS, root > 0x100000000 {
-                        let (rkT, tf) = readBytes(pid: pid,
+                        let (rkT, tf) = readBytes(port: p,
                                                   address: MachVmAddress(root &+ 0x1F0 &+ 0x10),
                                                   count: 12)
                         if rkT == KERN_SUCCESS, tf.count >= 12 {
@@ -1170,7 +1124,7 @@ final class MemoryProbe {
         }
         out.scanned = seen
         out.usedMappings = mappedRanges.count
-        out.vmReads = kernelReadCalls - vmBefore
+        out.vmReads = vmReadCalls - vmBefore
         out.note = "\(sources.count) 个关卡 / 遍历 \(seen) 个 actor"
             + (stopped.map { "（\($0)）" } ?? "")
         return out
@@ -1179,8 +1133,8 @@ final class MemoryProbe {
     /// 按绝对地址读 4 字节。**只有 3 个参数**。
     /// mach_vm_region 那条路已被删除：它有两个出参，是之前连续出错的来源，
     /// 而读内存根本不需要枚举内存区。
-    private static func readAt(pid: Int32, address: MachVmAddress) -> (KernReturn, UInt32) {
-        let (kr, bytes) = readSmart(pid: pid, address: address, count: 4)
+    private static func readAt(port: MachPort, address: MachVmAddress) -> (KernReturn, UInt32) {
+        let (kr, bytes) = readSmart(port: port, address: address, count: 4)
         guard kr == KERN_SUCCESS, bytes.count >= 4 else { return (kr, 0) }
         let v = UInt32(bytes[0]) | (UInt32(bytes[1]) << 8)
             | (UInt32(bytes[2]) << 16) | (UInt32(bytes[3]) << 24)
@@ -1188,8 +1142,8 @@ final class MemoryProbe {
     }
 
     /// 按绝对地址读 8 字节 —— 只给值，供程序判断用。
-    private static func readRaw(pid: Int32, address: MachVmAddress) -> (KernReturn, UInt64) {
-        let (kr, bytes) = readSmart(pid: pid, address: address, count: 8)
+    private static func readRaw(port: MachPort, address: MachVmAddress) -> (KernReturn, UInt64) {
+        let (kr, bytes) = readSmart(port: port, address: address, count: 8)
         guard kr == KERN_SUCCESS, bytes.count >= 8 else { return (kr, 0) }
         return (KERN_SUCCESS, u64le(bytes, 0))
     }
@@ -1198,13 +1152,35 @@ final class MemoryProbe {
     ///
     /// 这是唯一允许的块读取，硬上限就卡在 4096：之前用 16KB 步进扫内存
     /// 把目标进程搞成过 jetsam 被杀，连续 fault 太多页是死因。
-    // 读取已统一走内核路径：readSmart 的降级分支直接调 km_read_process，
-    // 原先的 mach_vm_read 实现已整体移除。
+    private static func readBytesDirect(port: MachPort, address: MachVmAddress, count: Int)
+        -> (KernReturn, [UInt8]) {
+        guard let vmRead = vmReadFn else { return (KERN_FAILURE, []) }
+        guard count > 0, count <= 4096 else { return (KERN_FAILURE, []) }
+        noteRead()
+        var dataPtr: UInt = 0
+        var dataLen: MachVmSize = MachVmSize(count)
+        let kr = vmRead(port, address, MachVmSize(count), &dataPtr, &dataLen)
+        guard kr == KERN_SUCCESS, dataPtr != 0, dataLen > 0 else { return (kr, []) }
+        let n = min(Int(dataLen), count)
+        var out = [UInt8](repeating: 0, count: n)
+        if let src = UnsafeRawPointer(bitPattern: dataPtr) {
+            out.withUnsafeMutableBytes { dst in
+                if let d = dst.baseAddress {
+                    d.copyMemory(from: src, byteCount: n)
+                }
+            }
+        }
+        // 缓冲在**本进程**的地址空间里（mach_vm_read 是 vm_map_copyout 到 current_map），
+        // 所以释放也必须针对本进程 —— 传目标端口等于让内核去游戏的 vm_map 里找这个地址，
+        // 找不到就静默返回 KERN_INVALID_ADDRESS，于是每次都漏一个页。
+        _ = vmDeallocateFn?(mach_task_self_, dataPtr, dataLen)
+        return (KERN_SUCCESS, out)
+    }
 
     /// 给面板用的指针解读：值 + 是否像有效指针 + 高位（便于看落在哪个地址段）。
-    private static func pointerInfo(pid: Int32, address: MachVmAddress)
+    private static func pointerInfo(port: MachPort, address: MachVmAddress)
         -> (KernReturn, UInt64, Bool, String) {
-        let (kr, value) = readRaw(pid: pid, address: address)
+        let (kr, value) = readRaw(port: port, address: address)
         guard kr == KERN_SUCCESS else { return (kr, 0, false, "n/a") }
         // iOS arm64 用户态地址是 36 位宽
         let looksReal = value >= 0x100000000 && value < 0x10000000000
@@ -1212,8 +1188,13 @@ final class MemoryProbe {
         return (KERN_SUCCESS, value, looksReal, hi)
     }
 
-    // port(for:) 已移除：读取改走内核路径后不再需要 task port，
-    // 目标进程由 km_proc_for_pid 在内核里直接定位。
+    /// 取目标进程的 task port。
+    private static func port(for pid: Int32) -> (KernReturn, MachPort) {
+        guard let tfp = taskForPidFn else { return (KERN_FAILURE, 0) }
+        var p: MachPort = 0
+        let kr = tfp(mach_task_self_, pid, &p)
+        return (kr, p)
+    }
 
     /// 释放一个 task port。
     ///
@@ -1222,10 +1203,15 @@ final class MemoryProbe {
     /// 游戏的 task 对象多背一个引用 —— 游戏崩掉之后那个 task 对象也回收不掉，
     /// 反复"崩→重开→读"会把内核里堆一串收不掉的 task。
     /// 取端口的地方一律用 `defer { dropPort(p) }` 配对。
-    // dropPort 已移除：不再持有 task port，没有 right 需要释放。
+    private static func dropPort(_ p: MachPort) {
+        guard p != 0, let fn = portDeallocateFn else { return }
+        _ = fn(mach_task_self_, p)
+    }
 
     /// 给面板调用方用的释放入口（SilentProbe 这类需要跨回调持有端口的场景）。
-    // releasePort 已移除：内核路径不产生 port。
+    static func releasePort(_ p: UInt32) {
+        dropPort(MachPort(p))
+    }
 
     // MARK: - 地址换算（唯一入口）
 
@@ -1262,11 +1248,11 @@ final class MemoryProbe {
 
     /// 候选地址是不是真的 Mach-O 可执行头：magic == 0xFEEDFACF 且 filetype == MH_EXECUTE(2)。
     /// 两次 4 字节小读，不循环、不扫描。
-    private static func isExecutableMachO(pid: Int32, _ addr: UInt64) -> (Bool, String) {
-        let (rk1, magic) = readAt(pid: pid, address: MachVmAddress(addr))
+    private static func isExecutableMachO(port: MachPort, _ addr: UInt64) -> (Bool, String) {
+        let (rk1, magic) = readAt(port: port, address: MachVmAddress(addr))
         guard rk1 == KERN_SUCCESS else { return (false, "magic读失败/\(rk1)") }
         guard magic == 0xFEEDFACF else { return (false, "magic=0x\(String(magic, radix: 16))") }
-        let (rk2, filetype) = readAt(pid: pid, address: MachVmAddress(addr &+ 12))
+        let (rk2, filetype) = readAt(port: port, address: MachVmAddress(addr &+ 12))
         guard rk2 == KERN_SUCCESS else { return (false, "filetype读失败/\(rk2)") }
         guard filetype == 2 else { return (false, "filetype=\(filetype)") }
         return (true, "MH_EXECUTE")
@@ -1278,8 +1264,11 @@ final class MemoryProbe {
     /// 一次读取，不扫描 —— 扫大范围是之前出问题的来源。
     static func stepReadProof(pid: Int32) -> String {
         let off = Offsets.load()
+        let (kr, p) = port(for: pid)
+        guard kr == KERN_SUCCESS, p != 0 else { return "读证: 取端口失败 \(describe(kr))" }
+        defer { dropPort(p) }
 
-        let (rk, magic) = readAt(pid: pid, address: MachVmAddress(off.moduleBase))
+        let (rk, magic) = readAt(port: p, address: MachVmAddress(off.moduleBase))
         guard rk == KERN_SUCCESS else {
             return "读证: 读 0x\(String(off.moduleBase, radix: 16)) 失败 \(describe(rk))"
         }
@@ -1305,23 +1294,26 @@ final class MemoryProbe {
         guard baseReady(for: pid) else {
             return "定点读: 没有当前进程的基址 —— 先点「跑一次」（它会自动完成找基址）"
         }
+        let (kr, p) = port(for: pid)
+        guard kr == KERN_SUCCESS, p != 0 else { return "定点读: 取端口失败 \(describe(kr))" }
+        defer { dropPort(p) }
 
         let s = imageSlide
         let off = Offsets.load()
         let slot = runtime(off.gObjects, slide: s)
 
         // ① NumElements（UInt32）—— 唯一的验收数字
-        let (rkNum, num) = readAt(pid: pid, address: MachVmAddress(slot &+ 0x118))
+        let (rkNum, num) = readAt(port: p, address: MachVmAddress(slot &+ 0x118))
         guard rkNum == KERN_SUCCESS else {
             return "定点读: NumElements 读失败 \(describe(rkNum)) @0x\(String(slot &+ 0x118, radix: 16))"
         }
         // ② chunk0 指针（UInt64）
-        let (rkChunk, chunk0) = readRaw(pid: pid, address: MachVmAddress(slot &+ 0xE0))
+        let (rkChunk, chunk0) = readRaw(port: p, address: MachVmAddress(slot &+ 0xE0))
         // ③ 第一个 FUObjectItem 的 Object（UInt64）
         var obj0: UInt64 = 0
         var objNote = ""
         if rkChunk == KERN_SUCCESS, chunk0 != 0 {
-            let (rkObj, v) = readRaw(pid: pid, address: MachVmAddress(chunk0))
+            let (rkObj, v) = readRaw(port: p, address: MachVmAddress(chunk0))
             if rkObj == KERN_SUCCESS {
                 obj0 = v
             } else {
@@ -1399,8 +1391,8 @@ final class MemoryProbe {
 
     /// 从 FNameEntry + 0xE 读名字，同时报出用的是哪种字符宽度。
     /// 宽度是逐 entry 判断的：同一个池里窄字符和 UCS-2 可以混存。
-    private static func readNameDetail(pid: Int32, entry: UInt64) -> (name: String, width: String) {
-        let (rk, bytes) = readBytes(pid: pid,
+    private static func readNameDetail(port: MachPort, entry: UInt64) -> (name: String, width: String) {
+        let (rk, bytes) = readBytes(port: port,
                                     address: MachVmAddress(entry &+ nameEntryStringOffset),
                                     count: 96)
         guard rk == KERN_SUCCESS, !bytes.isEmpty else { return ("(读失败)", "?") }
@@ -1425,8 +1417,8 @@ final class MemoryProbe {
     }
 
     /// 从 FNameEntry + 0xE 读名字（不带宽度信息）。
-    private static func readName(pid: Int32, entry: UInt64) -> String {
-        readNameDetail(pid: pid, entry: entry).name
+    private static func readName(port: MachPort, entry: UInt64) -> String {
+        readNameDetail(port: port, entry: entry).name
     }
 
     /// GNames：把 FName 索引解成字符串。
@@ -1442,13 +1434,16 @@ final class MemoryProbe {
         guard baseReady(for: pid) else {
             return "GNames: 没有当前进程的基址 —— 先点「跑一次」（它会自动完成找基址）"
         }
+        let (kr, p) = port(for: pid)
+        guard kr == KERN_SUCCESS, p != 0 else { return "GNames: 取端口失败 \(describe(kr))" }
+        defer { dropPort(p) }
 
         let s = imageSlide
         let slotAddr = runtime(Offsets.load().gNames, slide: s)
 
         // ① 槽 → 名字池
         stageMark("名字 · 读池槽")
-        let (rkPool, pool) = readRaw(pid: pid, address: MachVmAddress(slotAddr))
+        let (rkPool, pool) = readRaw(port: p, address: MachVmAddress(slotAddr))
         guard rkPool == KERN_SUCCESS, pool != 0 else {
             return "GNames: 槽 0x\(String(slotAddr, radix: 16)) 读失败 \(describe(rkPool))"
         }
@@ -1458,7 +1453,7 @@ final class MemoryProbe {
 
         // ② 池头 hex：先看清布局，再决定解哪一层
         stageMark("名字 · 读池头")
-        let (rkHead, head) = readBytes(pid: pid, address: MachVmAddress(pool), count: 0x40)
+        let (rkHead, head) = readBytes(port: p, address: MachVmAddress(pool), count: 0x40)
         if rkHead == KERN_SUCCESS, !head.isEmpty {
             lines.append("池头 0x40 字节（偏移相对 pool）:")
             lines.append(contentsOf: hexLines(head, perLine: 16))
@@ -1478,9 +1473,9 @@ final class MemoryProbe {
 
         // ③ 两种布局各解一遍，用已知答案判定
         stageMark("名字 · 解候选")
-        let (rkA, lvlA) = readRaw(pid: pid, address: MachVmAddress(pool))
+        let (rkA, lvlA) = readRaw(port: p, address: MachVmAddress(pool))
         let (rkB, lvlB) = (rkA == KERN_SUCCESS)
-            ? readRaw(pid: pid, address: MachVmAddress(lvlA))
+            ? readRaw(port: p, address: MachVmAddress(lvlA))
             : (KERN_FAILURE, 0)
         let expect = ["None", "ByteProperty", "IntProperty"]
         let candidates: [(String, KernReturn, UInt64)] = [
@@ -1497,17 +1492,17 @@ final class MemoryProbe {
             var detail: [String] = []
             var prevEntry: UInt64 = 0
             for i in 0..<3 {
-                let (rke, entry) = readRaw(pid: pid, address: MachVmAddress(chunk &+ UInt64(i) * 8))
+                let (rke, entry) = readRaw(port: p, address: MachVmAddress(chunk &+ UInt64(i) * 8))
                 guard rke == KERN_SUCCESS, entry != 0 else {
                     names.append("(失败)")
                     detail.append("   [\(i)] 取 entry 失败 \(describe(rke))")
                     continue
                 }
-                let (nm, width) = readNameDetail(pid: pid, entry: entry)
+                let (nm, width) = readNameDetail(port: p, entry: entry)
                 names.append(nm)
                 // entry 自报的索引（dump: FNameEntry::Index = 0x8）：
                 // 名字若带 "_0" 之类的后缀，看这行就知道索引基准偏了多少
-                let (rkIdx, idxV) = readAt(pid: pid, address: MachVmAddress(entry &+ 0x8))
+                let (rkIdx, idxV) = readAt(port: p, address: MachVmAddress(entry &+ 0x8))
                 let idxNote = (rkIdx == KERN_SUCCESS)
                     ? "selfIdx=\(Int32(bitPattern: idxV))"
                     : "selfIdx=?"
@@ -1536,18 +1531,18 @@ final class MemoryProbe {
     ///   chunk_k = *(pool + k*8)     k = index / ElementsPerChunk
     ///   entry   = *(chunk_k + (index % ElementsPerChunk) * 8)
     /// chunk0 由调用方传入，索引落在第 0 块时省掉一次小读。
-    private static func resolveName(pid: Int32, pool: UInt64, chunk0: UInt64, index: UInt32) -> String {
+    private static func resolveName(port: MachPort, pool: UInt64, chunk0: UInt64, index: UInt32) -> String {
         let k = UInt64(index) / namesPerChunk
         let within = UInt64(index) % namesPerChunk
         var chunk = chunk0
         if k != 0 {
-            let (rkC, c) = readRaw(pid: pid, address: MachVmAddress(pool &+ k * 8))
+            let (rkC, c) = readRaw(port: port, address: MachVmAddress(pool &+ k * 8))
             guard rkC == KERN_SUCCESS, c != 0 else { return "(chunk\(k)读失败 \(describe(rkC)))" }
             chunk = c
         }
-        let (rkE, entry) = readRaw(pid: pid, address: MachVmAddress(chunk &+ within * 8))
+        let (rkE, entry) = readRaw(port: port, address: MachVmAddress(chunk &+ within * 8))
         guard rkE == KERN_SUCCESS, entry != 0 else { return "(entry读失败 \(describe(rkE)))" }
-        return readName(pid: pid, entry: entry)
+        return readName(port: port, entry: entry)
     }
 
     /// 对象表：批量读前 16 个 FUObjectItem，**每批只详解 4 个**。
@@ -1570,33 +1565,36 @@ final class MemoryProbe {
         guard baseReady(for: pid) else {
             return "对象: 没有当前进程的基址 —— 先点「跑一次」（它会自动完成找基址）"
         }
+        let (kr, p) = port(for: pid)
+        guard kr == KERN_SUCCESS, p != 0 else { return "对象: 取端口失败 \(describe(kr))" }
+        defer { dropPort(p) }
 
         let s = imageSlide
         let off = Offsets.load()
 
         // 名字池（布局已由「名字」按钮验收确认：一层，pool+0 就是 chunk0）
-        let (rkPool, pool) = readRaw(pid: pid, address: MachVmAddress(runtime(off.gNames, slide: s)))
+        let (rkPool, pool) = readRaw(port: p, address: MachVmAddress(runtime(off.gNames, slide: s)))
         guard rkPool == KERN_SUCCESS, pool != 0 else {
             return "对象: 名字池槽读取失败 \(describe(rkPool))"
         }
-        let (rkChunk, nameChunk0) = readRaw(pid: pid, address: MachVmAddress(pool))
+        let (rkChunk, nameChunk0) = readRaw(port: p, address: MachVmAddress(pool))
         guard rkChunk == KERN_SUCCESS, nameChunk0 != 0 else {
             return "对象: 名字池 chunk0 读取失败 \(describe(rkChunk))"
         }
 
         // 对象表头
         let slot = runtime(off.gObjects, slide: s)
-        let (rkNum, num) = readAt(pid: pid, address: MachVmAddress(slot &+ 0x118))
+        let (rkNum, num) = readAt(port: p, address: MachVmAddress(slot &+ 0x118))
         guard rkNum == KERN_SUCCESS else { return "对象: NumElements 读失败 \(describe(rkNum))" }
-        let (rkItems, items) = readRaw(pid: pid, address: MachVmAddress(slot &+ 0xE0))
+        let (rkItems, items) = readRaw(port: p, address: MachVmAddress(slot &+ 0xE0))
         guard rkItems == KERN_SUCCESS, items != 0 else {
             return "对象: items 指针读失败 \(describe(rkItems))"
         }
 
-        // ① items 数组一次读完：逐项读是 16 次内核读，数据在同一页，
+        // ① items 数组一次读完：逐项读是 16 次 mach_vm_read，数据在同一页，
         //    调用次数与内核里的 copy 分配却翻 16 倍，没有意义。
         let listCount = min(Int(num), 16)
-        let (rkBuf, buf) = readBytes(pid: pid, address: MachVmAddress(items), count: listCount * 0x18)
+        let (rkBuf, buf) = readBytes(port: p, address: MachVmAddress(items), count: listCount * 0x18)
         guard rkBuf == KERN_SUCCESS else {
             return "对象: items 数组读取失败 \(describe(rkBuf))"
         }
@@ -1624,15 +1622,15 @@ final class MemoryProbe {
                 lines.append("[\(i)] 0x\(String(obj, radix: 16))   （只列指针）")
                 continue
             }
-            let (rkCls, cls) = readRaw(pid: pid, address: MachVmAddress(obj &+ 0x10))
-            let (rkName, nameIX) = readAt(pid: pid, address: MachVmAddress(obj &+ 0x18))
-            let (rkNo, number) = readAt(pid: pid, address: MachVmAddress(obj &+ 0x1C))
+            let (rkCls, cls) = readRaw(port: p, address: MachVmAddress(obj &+ 0x10))
+            let (rkName, nameIX) = readAt(port: p, address: MachVmAddress(obj &+ 0x18))
+            let (rkNo, number) = readAt(port: p, address: MachVmAddress(obj &+ 0x1C))
 
             var clsName = "类名?"
             if rkCls == KERN_SUCCESS, cls != 0 {
-                let (rkCIX, clsIX) = readAt(pid: pid, address: MachVmAddress(cls &+ 0x18))
+                let (rkCIX, clsIX) = readAt(port: p, address: MachVmAddress(cls &+ 0x18))
                 if rkCIX == KERN_SUCCESS {
-                    clsName = resolveName(pid: pid, pool: pool, chunk0: nameChunk0, index: clsIX)
+                    clsName = resolveName(port: p, pool: pool, chunk0: nameChunk0, index: clsIX)
                 } else {
                     clsName = "类名读失败 \(describe(rkCIX))"
                 }
@@ -1642,7 +1640,7 @@ final class MemoryProbe {
 
             var objName = "名字?"
             if rkName == KERN_SUCCESS {
-                objName = resolveName(pid: pid, pool: pool, chunk0: nameChunk0, index: nameIX)
+                objName = resolveName(port: p, pool: pool, chunk0: nameChunk0, index: nameIX)
                 if rkNo == KERN_SUCCESS, number > 1 {
                     objName += "_\(number - 1)"
                 }
@@ -1679,6 +1677,9 @@ final class MemoryProbe {
         guard baseReady(for: pid) else {
             return "世界: 没有当前进程的基址 —— 先点「跑一次」（它会自动完成找基址）"
         }
+        let (kr, p) = port(for: pid)
+        guard kr == KERN_SUCCESS, p != 0 else { return "世界: 取端口失败 \(describe(kr))" }
+        defer { dropPort(p) }
 
         let s = imageSlide
         let off = Offsets.load()
@@ -1692,18 +1693,18 @@ final class MemoryProbe {
         }
 
         // 解类名要用名字池
-        let (rkPool, pool) = readRaw(pid: pid, address: MachVmAddress(runtime(off.gNames, slide: s)))
+        let (rkPool, pool) = readRaw(port: p, address: MachVmAddress(runtime(off.gNames, slide: s)))
         guard rkPool == KERN_SUCCESS, pool != 0 else {
             return "世界: 名字池槽读取失败 \(describe(rkPool))"
         }
-        let (rkChunk, nameChunk0) = readRaw(pid: pid, address: MachVmAddress(pool))
+        let (rkChunk, nameChunk0) = readRaw(port: p, address: MachVmAddress(pool))
         guard rkChunk == KERN_SUCCESS, nameChunk0 != 0 else {
             return "世界: 名字池 chunk0 读取失败 \(describe(rkChunk))"
         }
 
         // ① UWorld
         stageMark("世界 · UWorld")
-        let (rkW, world) = readRaw(pid: pid, address: MachVmAddress(runtime(off.gWorld, slide: s)))
+        let (rkW, world) = readRaw(port: p, address: MachVmAddress(runtime(off.gWorld, slide: s)))
         guard rkW == KERN_SUCCESS, world != 0 else {
             return "世界: 读 GWorld 失败 \(describe(rkW))"
         }
@@ -1711,7 +1712,7 @@ final class MemoryProbe {
 
         // ② PersistentLevel
         stageMark("世界 · PersistentLevel")
-        let (rkL, level) = readRaw(pid: pid, address: MachVmAddress(world &+ 0xB8))
+        let (rkL, level) = readRaw(port: p, address: MachVmAddress(world &+ 0xB8))
         guard rkL == KERN_SUCCESS, level != 0 else {
             return lines.joined(separator: "\n") + "\n读 PersistentLevel 失败 \(describe(rkL))"
         }
@@ -1719,7 +1720,7 @@ final class MemoryProbe {
 
         // ③ Actors TArray
         stageMark("世界 · Actors")
-        let (rkA, arr) = readBytes(pid: pid, address: MachVmAddress(level &+ 0xA0), count: 16)
+        let (rkA, arr) = readBytes(port: p, address: MachVmAddress(level &+ 0xA0), count: 16)
         guard rkA == KERN_SUCCESS, arr.count >= 16 else {
             return lines.joined(separator: "\n") + "\n读 Actors TArray 失败 \(describe(rkA))"
         }
@@ -1749,25 +1750,25 @@ final class MemoryProbe {
         }
         var levelTotal = 0
 
-        let (rkAct, actHdr) = readBytes(pid: pid, address: MachVmAddress(world &+ 0x0AB8), count: 16)
+        let (rkAct, actHdr) = readBytes(port: p, address: MachVmAddress(world &+ 0x0AB8), count: 16)
         if rkAct == KERN_SUCCESS, actHdr.count >= 16 {
             lines.append("ActiveLevelActors: count=\(Int(u32le(actHdr, 8)))（客户端恒为 0，仅记录）")
         }
 
-        let (rkLv, lvHdr) = readBytes(pid: pid, address: MachVmAddress(world &+ 0x0AF0), count: 16)
+        let (rkLv, lvHdr) = readBytes(port: p, address: MachVmAddress(world &+ 0x0AF0), count: 16)
         if rkLv == KERN_SUCCESS, lvHdr.count >= 16 {
             let d = u64le(lvHdr, 0)
             let c = Int(u32le(lvHdr, 8))
             lines.append("UWorld::Levels: count=\(c)")
             if d > 0x100000000, c > 0, c <= 4096 {
                 let probe = min(c, 64)                  // 全读完，上次 min(c, 12) 把第 13 个漏了
-                let (rkP, ptrs) = readBytes(pid: pid, address: MachVmAddress(d), count: probe * 8)
+                let (rkP, ptrs) = readBytes(port: p, address: MachVmAddress(d), count: probe * 8)
                 if rkP == KERN_SUCCESS, ptrs.count >= probe * 8 {
                     for k in 0..<probe {
                         let lv = u64le(ptrs, k * 8)
                         guard lv > 0x100000000 else { continue }
                         if lv == level { continue }     // 就是 PersistentLevel，已经在 sources 里
-                        let (rkA2, a2) = readBytes(pid: pid, address: MachVmAddress(lv &+ 0xA0), count: 16)
+                        let (rkA2, a2) = readBytes(port: p, address: MachVmAddress(lv &+ 0xA0), count: 16)
                         guard rkA2 == KERN_SUCCESS, a2.count >= 16 else { continue }
                         let d2 = u64le(a2, 0)
                         let c2 = Int(u32le(a2, 8))
@@ -1806,7 +1807,7 @@ final class MemoryProbe {
                 // 预算闸门：一旦真的落回 mach_vm_read 太多次，立刻收手。
                 // 上一版没有这道闸门，一路读到底，游戏就没了。
                 if hardReadCalls > 200 {
-                    lines.append("⚠ 已用 \(hardReadCalls) 次内核读 —— 主动停止遍历，保住游戏")
+                    lines.append("⚠ 已用 \(hardReadCalls) 次 mach_vm_read —— 主动停止遍历，保住游戏")
                     stopped = true
                     break sourceLoop
                 }
@@ -1815,7 +1816,7 @@ final class MemoryProbe {
                     break sourceLoop
                 }
                 let batch = min(500, src.count - cursor)
-                let (rkBuf, buf) = readBytes(pid: pid,
+                let (rkBuf, buf) = readBytes(port: p,
                                              address: MachVmAddress(src.data &+ UInt64(cursor * 8)),
                                              count: batch * 8)
                 guard rkBuf == KERN_SUCCESS, buf.count >= batch * 8 else {
@@ -1825,14 +1826,14 @@ final class MemoryProbe {
                 for i in 0..<batch {
                     let actor = u64le(buf, i * 8)
                     guard actor > 0x100000000 else { continue }
-                    let (rkCls, cls) = readRaw(pid: pid, address: MachVmAddress(actor &+ 0x10))
+                    let (rkCls, cls) = readRaw(port: p, address: MachVmAddress(actor &+ 0x10))
                     guard rkCls == KERN_SUCCESS, cls > 0x100000000 else { continue }
 
                     var nm = classNames[cls]
                     if nm == nil {
-                        let (rkIX, clsIX) = readAt(pid: pid, address: MachVmAddress(cls &+ 0x18))
+                        let (rkIX, clsIX) = readAt(port: p, address: MachVmAddress(cls &+ 0x18))
                         nm = (rkIX == KERN_SUCCESS)
-                            ? resolveName(pid: pid, pool: pool, chunk0: nameChunk0, index: clsIX)
+                            ? resolveName(port: p, pool: pool, chunk0: nameChunk0, index: clsIX)
                             : "?"
                         classNames[cls] = nm
                     }
@@ -1877,10 +1878,10 @@ final class MemoryProbe {
             for (i, c) in ctrlActors.prefix(8).enumerated() {
                 // AController::Pawn 0x5D8 · APlayerController::AcknowledgedPawn 0x660
                 // APlayerController::bIsLocalPlayerController 0xA8C · AController::PlayerState 0x5F0
-                let (r1, pawn) = readRaw(pid: pid, address: MachVmAddress(c &+ 0x5D8))
-                let (r2, ack) = readRaw(pid: pid, address: MachVmAddress(c &+ 0x660))
-                let (r3, lf) = readAt(pid: pid, address: MachVmAddress(c &+ 0xA8C))
-                let (r4, ps) = readRaw(pid: pid, address: MachVmAddress(c &+ 0x5F0))
+                let (r1, pawn) = readRaw(port: p, address: MachVmAddress(c &+ 0x5D8))
+                let (r2, ack) = readRaw(port: p, address: MachVmAddress(c &+ 0x660))
+                let (r3, lf) = readAt(port: p, address: MachVmAddress(c &+ 0xA8C))
+                let (r4, ps) = readRaw(port: p, address: MachVmAddress(c &+ 0x5F0))
                 var line = "  [\(i)] PC=\(hexOf(c))"
                 line += "  local=\(r3 == KERN_SUCCESS ? "\(lf & 0xFF)" : "读失败")"
                 line += "  Pawn=\(r1 == KERN_SUCCESS ? hexOf(pawn) : "失败")"
@@ -1888,7 +1889,7 @@ final class MemoryProbe {
                 line += "  PS=\(r4 == KERN_SUCCESS ? hexOf(ps) : "失败")"
                 lines.append(line)
                 if r4 == KERN_SUCCESS, ps > 0x100000000 {
-                    let nm = readText(pid: pid, addr: ps &+ 0x5D8)
+                    let nm = readText(port: p, addr: ps &+ 0x5D8)
                     if !nm.isEmpty { lines.append("        名字: \"\(nm)\"") }
                 }
             }
@@ -1902,20 +1903,20 @@ final class MemoryProbe {
         var myPC: UInt64 = 0
         var myName = ""
         for c in ctrlActors {
-            let (r3, lf) = readAt(pid: pid, address: MachVmAddress(c &+ 0xA8C))
+            let (r3, lf) = readAt(port: p, address: MachVmAddress(c &+ 0xA8C))
             guard r3 == KERN_SUCCESS, (lf & 0xFF) == 1 else { continue }
             myPC = c
-            let (r1, pawn) = readRaw(pid: pid, address: MachVmAddress(c &+ 0x5D8))
+            let (r1, pawn) = readRaw(port: p, address: MachVmAddress(c &+ 0x5D8))
             if r1 == KERN_SUCCESS, pawn > 0x100000000 { myPawn = pawn }
-            let (r4, ps) = readRaw(pid: pid, address: MachVmAddress(c &+ 0x5F0))
-            if r4 == KERN_SUCCESS, ps > 0x100000000 { myName = readText(pid: pid, addr: ps &+ 0x5D8) }
+            let (r4, ps) = readRaw(port: p, address: MachVmAddress(c &+ 0x5F0))
+            if r4 == KERN_SUCCESS, ps > 0x100000000 { myName = readText(port: p, addr: ps &+ 0x5D8) }
             break
         }
         var myLoc: (Float, Float, Float)?
         if myPawn > 0x100000000 {
-            let (rkMr, root) = readRaw(pid: pid, address: MachVmAddress(myPawn &+ 0x260))
+            let (rkMr, root) = readRaw(port: p, address: MachVmAddress(myPawn &+ 0x260))
             if rkMr == KERN_SUCCESS, root > 0x100000000 {
-                let (rkMt, tf) = readBytes(pid: pid, address: MachVmAddress(root &+ 0x1F0 + 0x10), count: 12)
+                let (rkMt, tf) = readBytes(port: p, address: MachVmAddress(root &+ 0x1F0 + 0x10), count: 12)
                 if rkMt == KERN_SUCCESS, tf.count >= 12 {
                     myLoc = (floatAt(tf, 0), floatAt(tf, 4), floatAt(tf, 8))
                 }
@@ -1937,9 +1938,9 @@ final class MemoryProbe {
         var camFov: Float = 0
         var camReady = false
         if myPC > 0x100000000 {
-            let (rkCm, cm) = readRaw(pid: pid, address: MachVmAddress(myPC &+ 0x680))
+            let (rkCm, cm) = readRaw(port: p, address: MachVmAddress(myPC &+ 0x680))
             if rkCm == KERN_SUCCESS, cm > 0x100000000 {
-                let (rkPov, pov) = readBytes(pid: pid,
+                let (rkPov, pov) = readBytes(port: p,
                                              address: MachVmAddress(cm &+ 0x640 &+ 0x10),
                                              count: 0x60)
                 if rkPov == KERN_SUCCESS, pov.count >= 0x34 {
@@ -1977,9 +1978,9 @@ final class MemoryProbe {
         if !psActors.isEmpty {
             lines.append("PlayerState（\(psActors.count) 个）:")
             for (i, s) in psActors.prefix(16).enumerated() {
-                let nm = readText(pid: pid, addr: s &+ 0x5D8)
-                let (rkCh, ch) = readRaw(pid: pid, address: MachVmAddress(s &+ 0x16C0))
-                let (rkHp, hpSeg) = readBytes(pid: pid, address: MachVmAddress(s &+ 0x16D0), count: 8)
+                let nm = readText(port: p, addr: s &+ 0x5D8)
+                let (rkCh, ch) = readRaw(port: p, address: MachVmAddress(s &+ 0x16C0))
+                let (rkHp, hpSeg) = readBytes(port: p, address: MachVmAddress(s &+ 0x16D0), count: 8)
                 var l = "  [\(i)]"
                 if !nm.isEmpty { l += " \"\(nm)\"" }
                 if rkHp == KERN_SUCCESS, hpSeg.count >= 8 {
@@ -2002,23 +2003,23 @@ final class MemoryProbe {
                 var extra = ""
                 // 身份：APawn + 0x608 → AController，再读 APlayerController + 0xA8C
                 // 的 bIsLocalPlayerController。这条路不碰 LocalPlayers，不受加密影响。
-                let (rkC, ctrl) = readRaw(pid: pid, address: MachVmAddress(a &+ 0x608))
+                let (rkC, ctrl) = readRaw(port: p, address: MachVmAddress(a &+ 0x608))
                 if rkC == KERN_SUCCESS, ctrl > 0x100000000 {
-                    let (rkL, lf) = readAt(pid: pid, address: MachVmAddress(ctrl &+ 0xA8C))
+                    let (rkL, lf) = readAt(port: p, address: MachVmAddress(ctrl &+ 0xA8C))
                     if rkL == KERN_SUCCESS, (lf & 0xFF) == 1 { extra += "  [本机控制器]" }
                 }
                 // 名字：APawn + 0x5F0 → APlayerState，再从 PlayerState + 0x5D8 读 FString
-                let (rkPS, ps) = readRaw(pid: pid, address: MachVmAddress(a &+ 0x5F0))
+                let (rkPS, ps) = readRaw(port: p, address: MachVmAddress(a &+ 0x5F0))
                 if rkPS == KERN_SUCCESS, ps > 0x100000000 {
-                    let nm = readText(pid: pid, addr: ps &+ 0x5D8)
+                    let nm = readText(port: p, addr: ps &+ 0x5D8)
                     if !nm.isEmpty { extra += "  \"\(nm)\"" }
                 }
-                let (rkR, root) = readRaw(pid: pid, address: MachVmAddress(a &+ 0x260))
+                let (rkR, root) = readRaw(port: p, address: MachVmAddress(a &+ 0x260))
                 guard rkR == KERN_SUCCESS, root > 0x100000000 else {
                     lines.append("  [\(i)]        @\(hexOf(a))  RootComponent 无效" + extra)
                     continue
                 }
-                let (rkT, tf) = readBytes(pid: pid, address: MachVmAddress(root &+ 0x1F0 + 0x10), count: 12)
+                let (rkT, tf) = readBytes(port: p, address: MachVmAddress(root &+ 0x1F0 + 0x10), count: 12)
                 if rkT == KERN_SUCCESS, tf.count >= 12 {
                     let x = floatAt(tf, 0), y = floatAt(tf, 4), z = floatAt(tf, 8)
                     let ok = (x != 0 || y != 0) && abs(x) < 5e6 && abs(y) < 5e6 && abs(z) < 1e5
@@ -2067,17 +2068,17 @@ final class MemoryProbe {
     /// 上一次读到的内存账本，用来算差值。
     private static var lastMem: (footprint: UInt64, compressed: UInt64, resident: UInt64)?
 
-    /// 读内存账本。**一个字节的目标内存都不碰** —— 只是让内核查一下它自己的记账。
+    /// 读游戏进程的内存账本。**一个字节的游戏内存都不碰** —— 只是让内核查一下它自己的记账。
     ///
-    /// 这是把「读冷页 → 加内存 → 崩」这条假说变成数字的唯一直接手段：
-    ///   phys_footprint  是 jetsam 判定用的那个数（决定自己会不会被杀）
-    ///   compressed      是当前被压缩的内存量 —— 读冷页会强制解压，这个数应该往下掉
+    /// 这是把「读冷页 → 给游戏加内存 → 崩」这条假说变成数字的唯一直接手段：
+    ///   phys_footprint  是 jetsam 判定用的那个数（决定游戏会不会被杀）
+    ///   compressed      是当前被压缩的内存量 —— 我们读冷页会强制解压，这个数应该往下掉
     /// 在「对象」这类动作前后各点一次，差值自己会说话。
-    ///
-    /// 注：端口机制移除后，这里查的是**本进程**的账本（原来查的是目标进程）。
-    /// 要查目标进程需要它的 task port，而内核路径不产生 port。
     static func stepMemory(pid: Int32) -> String {
         guard let fn = taskInfoFn else { return "内存: task_info 符号缺失" }
+        let (kr, p) = port(for: pid)
+        guard kr == KERN_SUCCESS, p != 0 else { return "内存: 取端口失败 \(describe(kr))" }
+        defer { dropPort(p) }
 
         var raw = [UInt8](repeating: 0, count: 512)
         var count = UInt32(raw.count / 4)
@@ -2085,7 +2086,7 @@ final class MemoryProbe {
             guard let base = rb.baseAddress?.assumingMemoryBound(to: Int32.self) else {
                 return KERN_FAILURE
             }
-            return fn(mach_task_self_, 22, base, &count)          // TASK_VM_INFO = 22
+            return fn(p, 22, base, &count)          // TASK_VM_INFO = 22
         }
         guard rk == KERN_SUCCESS, count > 0 else {
             return "内存: task_info 失败 \(describe(rk))"
@@ -2211,10 +2212,14 @@ final class MemoryProbe {
         stageMark("枚举 · C 符号已取到")
         lines.append("C vm_region_64 符号 ✓")
 
-        // 端口机制已移除：枚举改为对本进程自己做，验证 vm_region_64 这个调用本身是否可用。
-        let p = mach_task_self_
+        stageMark("枚举 · D 取端口前")
+        let (kr, p) = port(for: pid)
+        guard kr == KERN_SUCCESS, p != 0 else {
+            return lines.joined(separator: "\n") + "\nD ✗ 取端口失败 \(describe(kr))"
+        }
+        defer { dropPort(p) }
         stageMark("枚举 · D 端口已拿到")
-        lines.append("D 端口已拿到 ✓ task=0x\(String(p, radix: 16))（本进程）")
+        lines.append("D 端口已拿到 ✓ port=0x\(String(p, radix: 16))")
 
         // 第一次调用：只调一次，不做循环
         stageMark("枚举 · E 第一次调用前")
@@ -2270,6 +2275,9 @@ final class MemoryProbe {
         guard baseReady(for: pid) else {
             return "自己: 没有当前进程的基址 —— 先点「世界」或「映射」"
         }
+        let (kr, p) = port(for: pid)
+        guard kr == KERN_SUCCESS, p != 0 else { return "自己: 取端口失败 \(describe(kr))" }
+        defer { dropPort(p) }
 
         let s = imageSlide
         let off = Offsets.load()
@@ -2277,7 +2285,7 @@ final class MemoryProbe {
 
 
         // ① UWorld
-        let (rkW, world) = readRaw(pid: pid, address: MachVmAddress(runtime(off.gWorld, slide: s)))
+        let (rkW, world) = readRaw(port: p, address: MachVmAddress(runtime(off.gWorld, slide: s)))
         guard rkW == KERN_SUCCESS, world != 0 else {
             return "自己: 读 GWorld 失败 \(describe(rkW))"
         }
@@ -2285,7 +2293,7 @@ final class MemoryProbe {
 
         // ② GameInstance
         stageMark("自己 · GameInstance")
-        let (rkG, game) = readRaw(pid: pid, address: MachVmAddress(world &+ 0xB20))
+        let (rkG, game) = readRaw(port: p, address: MachVmAddress(world &+ 0xB20))
         guard rkG == KERN_SUCCESS, game != 0 else {
             return lines.joined(separator: "\n")
                 + "\n读 OwningGameInstance 失败 \(describe(rkG)) @UWorld+0xB20"
@@ -2294,12 +2302,12 @@ final class MemoryProbe {
 
         // ③ 加密标志 + LocalPlayers
         stageMark("自己 · LocalPlayers")
-        let (rkEnc, enc) = readAt(pid: pid, address: MachVmAddress(game &+ 0x80))
+        let (rkEnc, enc) = readAt(port: p, address: MachVmAddress(game &+ 0x80))
         let encFlag = (rkEnc == KERN_SUCCESS) ? (enc & 0xFF) : 0xFF
         lines.append("bUseEncryptLocalPlayerPtr=\(encFlag) "
             + (encFlag == 0 ? "✓ 明文指针，可以直接用" : "⚠️ 指针被加密，这条路要另行处理"))
 
-        let (rkL, larr) = readBytes(pid: pid, address: MachVmAddress(game &+ 0x48), count: 16)
+        let (rkL, larr) = readBytes(port: p, address: MachVmAddress(game &+ 0x48), count: 16)
         guard rkL == KERN_SUCCESS, larr.count >= 16 else {
             return lines.joined(separator: "\n") + "\n读 LocalPlayers 失败 \(describe(rkL))"
         }
@@ -2315,7 +2323,7 @@ final class MemoryProbe {
 
         // ④ ULocalPlayer
         stageMark("自己 · ULocalPlayer")
-        let (rkLP, localPlayer) = readRaw(pid: pid, address: MachVmAddress(lData))
+        let (rkLP, localPlayer) = readRaw(port: p, address: MachVmAddress(lData))
         guard rkLP == KERN_SUCCESS, localPlayer != 0 else {
             return lines.joined(separator: "\n") + "\n读 LocalPlayers[0] 失败 \(describe(rkLP))"
         }
@@ -2323,7 +2331,7 @@ final class MemoryProbe {
 
         // ⑤ PlayerController（UPlayer::PlayerController 在 0x30）
         stageMark("自己 · PlayerController")
-        let (rkPC, pc) = readRaw(pid: pid, address: MachVmAddress(localPlayer &+ 0x30))
+        let (rkPC, pc) = readRaw(port: p, address: MachVmAddress(localPlayer &+ 0x30))
         guard rkPC == KERN_SUCCESS, pc != 0 else {
             lines.append("读 PlayerController 失败 \(describe(rkPC)) @LocalPlayer+0x30")
             lines.append(costLine())
@@ -2333,7 +2341,7 @@ final class MemoryProbe {
 
         // ⑥ AcknowledgedPawn
         stageMark("自己 · Pawn")
-        let (rkPawn, pawn) = readRaw(pid: pid, address: MachVmAddress(pc &+ 0x660))
+        let (rkPawn, pawn) = readRaw(port: p, address: MachVmAddress(pc &+ 0x660))
         guard rkPawn == KERN_SUCCESS, pawn != 0 else {
             lines.append("读 AcknowledgedPawn 失败 \(describe(rkPawn)) @PC+0x660")
             lines.append(costLine())
@@ -2343,7 +2351,7 @@ final class MemoryProbe {
 
         // ⑦ RootComponent
         stageMark("自己 · 坐标")
-        let (rkRoot, root) = readRaw(pid: pid, address: MachVmAddress(pawn &+ 0x260))
+        let (rkRoot, root) = readRaw(port: p, address: MachVmAddress(pawn &+ 0x260))
         guard rkRoot == KERN_SUCCESS, root != 0 else {
             lines.append("读 RootComponent 失败 \(describe(rkRoot)) @Pawn+0x260")
             lines.append(costLine())
@@ -2352,7 +2360,7 @@ final class MemoryProbe {
         lines.append("RootComponent=\(hexOf(root))")
 
         // ⑧ ComponentToWorld + 0x10 → FVector
-        let (rkT, tf) = readBytes(pid: pid, address: MachVmAddress(root &+ 0x1F0 + 0x10), count: 12)
+        let (rkT, tf) = readBytes(port: p, address: MachVmAddress(root &+ 0x1F0 + 0x10), count: 12)
         guard rkT == KERN_SUCCESS, tf.count >= 12 else {
             lines.append("读 ComponentToWorld 失败 \(describe(rkT))")
             lines.append(costLine())
@@ -2396,13 +2404,16 @@ final class MemoryProbe {
         guard baseReady(for: pid) else {
             return "玩家: 没有当前进程的基址 —— 先点「世界」或「映射」"
         }
+        let (kr, p) = port(for: pid)
+        guard kr == KERN_SUCCESS, p != 0 else { return "玩家: 取端口失败 \(describe(kr))" }
+        defer { dropPort(p) }
 
         let s = imageSlide
         let off = Offsets.load()
         var lines: [String] = []
 
         func coordRaw(of actor: UInt64) -> (text: String, ok: Bool) {
-            let (rkR, root) = readRaw(pid: pid, address: MachVmAddress(actor &+ 0x260))
+            let (rkR, root) = readRaw(port: p, address: MachVmAddress(actor &+ 0x260))
             guard rkR == KERN_SUCCESS, root != 0 else {
                 return ("Actor=\(hexOf(actor))  读 RootComponent 失败 \(describe(rkR))", false)
             }
@@ -2411,8 +2422,8 @@ final class MemoryProbe {
             //   ComponentToWorld   0x01F0 (FTransform, 0x30)  —— Translation 在 +0x10
             // 实测过：根组件没有父组件时 UE4 保证两者相等，真机上确实逐位相同。
             // 以 ToWorld 为准，RelLoc 留作对照 —— 哪天角色挂到载具上时两者会分开。
-            let (rkRel, rel) = readBytes(pid: pid, address: MachVmAddress(root &+ 0x1CC), count: 12)
-            let (rkT, tf) = readBytes(pid: pid, address: MachVmAddress(root &+ 0x1F0 + 0x10), count: 12)
+            let (rkRel, rel) = readBytes(port: p, address: MachVmAddress(root &+ 0x1CC), count: 12)
+            let (rkT, tf) = readBytes(port: p, address: MachVmAddress(root &+ 0x1F0 + 0x10), count: 12)
 
             var out = "Actor=\(hexOf(actor))  RootComponent=\(hexOf(root))"
             var ok = false
@@ -2438,21 +2449,21 @@ final class MemoryProbe {
         /// **这条路不碰 LocalPlayers**，所以不受 bUseEncryptLocalPlayerPtr 影响。
         /// 返回 nil 表示读不到 —— 那时调用方会退回 PlayerState 比对。
         func localFlag(character: UInt64) -> Int? {
-            let (rkC, ctrl) = readRaw(pid: pid, address: MachVmAddress(character &+ 0x608))
+            let (rkC, ctrl) = readRaw(port: p, address: MachVmAddress(character &+ 0x608))
             guard rkC == KERN_SUCCESS, ctrl > 0x100000000 else { return nil }
-            let (rkL, v) = readAt(pid: pid, address: MachVmAddress(ctrl &+ 0xA8C))
+            let (rkL, v) = readAt(port: p, address: MachVmAddress(ctrl &+ 0xA8C))
             guard rkL == KERN_SUCCESS else { return nil }
             return Int(v & 0xFF)
         }
 
         // ① UWorld
-        let (rkW, world) = readRaw(pid: pid, address: MachVmAddress(runtime(off.gWorld, slide: s)))
+        let (rkW, world) = readRaw(port: p, address: MachVmAddress(runtime(off.gWorld, slide: s)))
         guard rkW == KERN_SUCCESS, world != 0 else { return "玩家: 读 GWorld 失败 \(describe(rkW))" }
         lines.append("UWorld=\(hexOf(world))")
 
         // ② GameState
         stageMark("玩家 · GameState")
-        let (rkGS, gameState) = readRaw(pid: pid, address: MachVmAddress(world &+ 0xAD8))
+        let (rkGS, gameState) = readRaw(port: p, address: MachVmAddress(world &+ 0xAD8))
         guard rkGS == KERN_SUCCESS, gameState != 0 else {
             return lines.joined(separator: "\n")
                 + "\n读 GameState 失败 \(describe(rkGS)) @UWorld+0xAD8 —— 多半还在大厅"
@@ -2464,13 +2475,13 @@ final class MemoryProbe {
         //     0x141C AlivePlayerNum · 0x1420 AliveRealPlayerNum
         //   这几个数是服务器给的**权威人数**。拿它和下面 PlayerArray.count 一比，
         //   就能直接看出服务器把玩家列表裁剪了多少 —— 不用再靠推测。
-        let (rkN1, n1) = readBytes(pid: pid, address: MachVmAddress(gameState &+ 0x0D98), count: 8)
+        let (rkN1, n1) = readBytes(port: p, address: MachVmAddress(gameState &+ 0x0D98), count: 8)
         if rkN1 == KERN_SUCCESS, n1.count >= 8 {
             lines.append("  人数(总): TotalPlayerNum=\(i32le(n1, 0))   PlayerNum=\(i32le(n1, 4))")
         } else {
             lines.append("  人数(总): 读失败 \(describe(rkN1)) @GameState+0x0D98")
         }
-        let (rkN2, n2) = readBytes(pid: pid, address: MachVmAddress(gameState &+ 0x141C), count: 8)
+        let (rkN2, n2) = readBytes(port: p, address: MachVmAddress(gameState &+ 0x141C), count: 8)
         if rkN2 == KERN_SUCCESS, n2.count >= 8 {
             lines.append("  人数(存活): AlivePlayerNum=\(i32le(n2, 0))   AliveRealPlayerNum=\(i32le(n2, 4))")
         } else {
@@ -2479,7 +2490,7 @@ final class MemoryProbe {
 
         // ③ PlayerArray
         stageMark("玩家 · PlayerArray")
-        let (rkPA, parr) = readBytes(pid: pid, address: MachVmAddress(gameState &+ 0x5E8), count: 16)
+        let (rkPA, parr) = readBytes(port: p, address: MachVmAddress(gameState &+ 0x5E8), count: 16)
         guard rkPA == KERN_SUCCESS, parr.count >= 16 else {
             return lines.joined(separator: "\n") + "\n读 PlayerArray 失败 \(describe(rkPA))"
         }
@@ -2498,14 +2509,14 @@ final class MemoryProbe {
 
         // ④ 逐个玩家：所有数据都挂在 PlayerState 自己身上
         let n = min(Int(paCount), 8)
-        let (rkList, list) = readBytes(pid: pid, address: MachVmAddress(paData), count: n * 8)
+        let (rkList, list) = readBytes(port: p, address: MachVmAddress(paData), count: n * 8)
         guard rkList == KERN_SUCCESS, list.count >= n * 8 else {
             lines.append("读 PlayerArray 元素失败 \(describe(rkList))")
             lines.append(costLine())
             return lines.joined(separator: "\n")
         }
         // 顺带标出名单里"哪个是你"：任一环失败就静默跳过，不影响主流程
-        let (selfPS, selfTrace) = findSelfPlayerState(pid: pid, world: world)
+        let (selfPS, selfTrace) = findSelfPlayerState(port: p, world: world)
 
         stageMark("玩家 · 遍历")
         var withChar = 0
@@ -2516,12 +2527,12 @@ final class MemoryProbe {
             guard ps != 0 else { continue }
 
             // 段 A 身份：0x5D0 score · 0x5D4 Ping · 0x5D8 PlayerName · 0x5F8 PlayerID
-            let (rkA, segA) = readBytes(pid: pid, address: MachVmAddress(ps &+ 0x5D0), count: 0x30)
+            let (rkA, segA) = readBytes(port: p, address: MachVmAddress(ps &+ 0x5D0), count: 0x30)
             // 段 B 状态：0x1648 LiveState · 0x1649 AILiveState · 0x16C0 CharacterOwner
             //           0x16D0 Health · 0x16D4 HealthMax · 0x16E0 SelfLocAndRot(0x18)
-            let (rkB, segB) = readBytes(pid: pid, address: MachVmAddress(ps &+ 0x1648), count: 0xB8)
+            let (rkB, segB) = readBytes(port: p, address: MachVmAddress(ps &+ 0x1648), count: 0xB8)
 
-            let name = readText(pid: pid, addr: ps &+ 0x5D8)
+            let name = readText(port: p, addr: ps &+ 0x5D8)
             let playerID = i32le(segA, 0x28)
             let ping = (rkA == KERN_SUCCESS && segA.count > 4) ? Int(segA[4]) : -1
             let live = (rkB == KERN_SUCCESS && segB.count > 0) ? Int(segB[0]) : -1
@@ -2590,18 +2601,18 @@ final class MemoryProbe {
     /// **只用于在名单里打一个 ★ 标记。** 任一环读不到就返回 0，绝不阻塞主流程 ——
     /// LocalPlayers 那条路可能被 bUseEncryptLocalPlayerPtr 挡住，那是它自己的事。
     /// 同时把断在哪一环写成 trace 带回去：失败也要有理由，不靠猜。
-    private static func findSelfPlayerState(pid: Int32, world: UInt64) -> (ps: UInt64, trace: String) {
+    private static func findSelfPlayerState(port: MachPort, world: UInt64) -> (ps: UInt64, trace: String) {
         func plausible(_ v: UInt64) -> Bool { v > 0x100000000 && v < 0xF000000000000000 }
 
-        let (rkG, gi) = readRaw(pid: pid, address: MachVmAddress(world &+ 0xB20))
+        let (rkG, gi) = readRaw(port: port, address: MachVmAddress(world &+ 0xB20))
         guard rkG == KERN_SUCCESS, plausible(gi) else {
             return (0, "断在 OwningGameInstance（\(describe(rkG)) @UWorld+0xB20）")
         }
 
-        let (rkE, enc) = readAt(pid: pid, address: MachVmAddress(gi &+ 0x80))
+        let (rkE, enc) = readAt(port: port, address: MachVmAddress(gi &+ 0x80))
         let encFlag = rkE == KERN_SUCCESS ? Int(enc & 0xFF) : -1
 
-        let (rkL, lp) = readBytes(pid: pid, address: MachVmAddress(gi &+ 0x48), count: 16)
+        let (rkL, lp) = readBytes(port: port, address: MachVmAddress(gi &+ 0x48), count: 16)
         guard rkL == KERN_SUCCESS, lp.count >= 16 else {
             return (0, "断在 LocalPlayers（\(describe(rkL)) @GI+0x48，加密标志=\(encFlag)）")
         }
@@ -2611,17 +2622,17 @@ final class MemoryProbe {
             return (0, "LocalPlayers 空（count=\(cnt)，data=\(hexOf(data))，加密标志=\(encFlag)）")
         }
 
-        let (rkP0, lplayer) = readRaw(pid: pid, address: MachVmAddress(data))
+        let (rkP0, lplayer) = readRaw(port: port, address: MachVmAddress(data))
         guard rkP0 == KERN_SUCCESS, plausible(lplayer) else {
             return (0, "LocalPlayers[0] 不是有效指针（\(hexOf(u64le(lp, 0)))，加密标志=\(encFlag)）")
         }
 
-        let (rkPC, pc) = readRaw(pid: pid, address: MachVmAddress(lplayer &+ 0x30))
+        let (rkPC, pc) = readRaw(port: port, address: MachVmAddress(lplayer &+ 0x30))
         guard rkPC == KERN_SUCCESS, plausible(pc) else {
             return (0, "断在 UPlayer+0x30 → PlayerController（\(describe(rkPC))，加密标志=\(encFlag)）")
         }
 
-        let (rkPS, pstate) = readRaw(pid: pid, address: MachVmAddress(pc &+ 0x5F0))
+        let (rkPS, pstate) = readRaw(port: port, address: MachVmAddress(pc &+ 0x5F0))
         guard rkPS == KERN_SUCCESS, plausible(pstate) else {
             return (0, "断在 AController+0x5F0 → PlayerState（\(describe(rkPS))，PC=\(hexOf(pc))）")
         }
@@ -2703,9 +2714,7 @@ final class MemoryProbe {
             return fn(task, &addr, &size, 9, base, &count, &objectName)
         }
         // object_name 是内核引用，不还回去就是内核对象泄漏 —— 跑几百轮就能看出来
-        if objectName != 0, let fn = portDeallocateFn {
-            _ = fn(mach_task_self_, objectName)
-        }
+        if objectName != 0 { dropPort(objectName) }
         guard kr == KERN_SUCCESS, size > 0 else { return (false, 0, 0, 0) }
         return (true, size, info[0], UInt32(bitPattern: info[5]))
     }
@@ -2753,10 +2762,13 @@ final class MemoryProbe {
             return "找基址: 参数自检失败（对自己枚举就不成功），未碰游戏"
         }
 
-        // ---- 端口机制已移除 ----
-        // 原来这里要 `port(for: pid)` 拿游戏的 task port，再用 `defer { dropPort(p) }` 归还。
-        // 内核路径不产生 port，所以这两步连同它们的 guard 一起删掉了。
-        // 下面所有枚举/读取改走 pid（内核里自己定位 proc/task），见 km_read_process。
+        // ---- 拿游戏的 task port ----
+        stageMark("找村口 · 取端口")
+        let (kr, p) = port(for: pid)
+        guard kr == KERN_SUCCESS, p != 0 else {
+            return "找基址: 取端口失败 \(describe(kr))"
+        }
+        defer { dropPort(p) }
 
         // ---- 不在这里预先校验"这是不是游戏" ----
         // 原来这里读 0x100000000 处的 Mach-O 头做 pid 校验，那是个错误假设：
@@ -2793,7 +2805,7 @@ final class MemoryProbe {
         while scanned < scanLimit {
             if Date() > deadline { timedOut = true; break }
 
-            let (ok, size, prot, offset) = nextRegion(task: mach_task_self_, addr: &addr)
+            let (ok, size, prot, offset) = nextRegion(task: p, addr: &addr)
             guard ok else { break }
             scanned += 1
             if scanned % 100 == 0 { stageMark("找村口 · 已枚举 \(scanned) 个 region") }
@@ -2805,7 +2817,7 @@ final class MemoryProbe {
             if (prot & 0x4) != 0,          // VM_PROT_EXECUTE
                offset == 0,
                size >= 0x1000000 {          // ≥16MB 的可执行映像才可能是主二进制
-                let (okMagic, why) = isExecutableMachO(pid: pid, addr)
+                let (okMagic, why) = isExecutableMachO(port: p, addr)
                 if okMagic {
                     hitBase = addr
                     hitName = "MH_EXECUTE \(size / 1048576)MB"

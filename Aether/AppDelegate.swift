@@ -19,6 +19,21 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         FangUIBridge.setPowerCallback { [weak self] on in
             self?.state.setPower(on)
         }
+
+        // 内核内存层自检。kopen 是重操作（PUAFF 要跑几十秒），
+        // 放后台队列，绝不出现在启动路径上。
+        DispatchQueue.global(qos: .userInitiated).async {
+            var error: UnsafePointer<CChar>?
+            let ok = km_init(&error)
+            if ok {
+                var buffer = [CChar](repeating: 0, count: 512)
+                km_self_test(&buffer, buffer.count)
+                print("[KernelMemory] ready\n" + String(cString: buffer))
+            } else {
+                let reason = error.map { String(cString: $0) } ?? "unknown"
+                print("[KernelMemory] not available: " + reason)
+            }
+        }
         return true
     }
 

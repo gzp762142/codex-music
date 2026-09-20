@@ -43,25 +43,58 @@ final class AutoTracker {
         var isSelf = false
     }
 
-    private(set) var state: State = .idle
-    private(set) var detail = ""
-    private(set) var targets: [RenderTarget] = []
-    private(set) var selfSnap = MemoryProbe.SelfSnapshot()
+    /*
+     * 状态的跨线程可见性 —— 用计算属性把**写**收在队列里，**读**也走队列。
+     *
+     * 为什么不能裸读：这些值全部只在 `queue` 上写，但 `DebugProcView` 在主线程
+     * 直接读（`t.state.rawValue`、`AutoTracker.shared.protectionNote`、
+     * `lastScanNote`）。`String` 不是原子类型，主线程读、后台写同一个 String
+     * 可能读到半更新的内部缓冲；`[RenderTarget]` 更是有崩溃面。
+     *
+     * `syncExternal` 自己会先查 `DispatchSpecificKey`，已在队列上就直接调、
+     * 不重入 `queue.sync` —— 所以这些访问器在队列内部读也安全。
+     * 代价是 UI 每读一个字段一次 `queue.sync`，读发生在 4Hz 的列表刷新上，
+     * 不在热路径。
+     */
+    private func withState<T>(_ body: () -> T) -> T {
+        syncExternal(body)
+    }
+
+    private var _state: State = .idle
+    private var _detail = ""
+    private var _targets: [RenderTarget] = []
+    private var _selfSnap = MemoryProbe.SelfSnapshot()
+
+    var state: State { withState { _state } }
+    var detail: String { withState { _detail } }
+    var targets: [RenderTarget] { withState { _targets } }
+    var selfSnap: MemoryProbe.SelfSnapshot { withState { _selfSnap } }
+
+    private var _fastHz: Double = 20
+    private var _tickCount = 0
+    private var _lastScanNote = ""
+    private var _lastScanKernelReads = 0
+    private var _lastScanMappedHits = 0
+    private var _lastScanOnDemand = 0
+    private var _fastTickKernelReads = 0
+    private var _mappingBlocks = 0
+    private var _protectionNote = "保护位: 等待首次抽查"
+    private var _running = false
 
     /// 自检数字（验收要看的就是这几个）
-    private(set) var fastHz: Double = 20
-    private(set) var tickCount = 0
-    private(set) var lastScanNote = ""
-    private(set) var lastScanVMReads = 0
+    var fastHz: Double { withState { _fastHz } }
+    var tickCount: Int { withState { _tickCount } }
+    var lastScanNote: String { withState { _lastScanNote } }
+    var lastScanKernelReads: Int { withState { _lastScanKernelReads } }
     /// 本轮扫描走映射本地读的次数（累计值在 MemoryProbe 里）
-    private(set) var lastScanMappedHits = 0
+    var lastScanMappedHits: Int { withState { _lastScanMappedHits } }
     /// 本轮扫描现场补建的映射块数
-    private(set) var lastScanOnDemand = 0
-    private(set) var fastTickVMReads = 0
-    private(set) var mappingBlocks = 0
+    var lastScanOnDemand: Int { withState { _lastScanOnDemand } }
+    var fastTickKernelReads: Int { withState { _fastTickKernelReads } }
+    var mappingBlocks: Int { withState { _mappingBlocks } }
     /// 保护位抽查结果（每轮一块，轮换覆盖）。在后台队列里算好，UI 只负责读 ——
     /// `vm_region_64` 是内核调用，不该落在主线程上。
-    private(set) var protectionNote = "保护位: 等待首次抽查"
+    var protectionNote: String { withState { _protectionNote } }
 
     /// 状态行（主线程回调）
     var onStatus: ((String) -> Void)?
@@ -102,8 +135,8 @@ final class AutoTracker {
 
     func start() {
         queue.async { [weak self] in
-            guard let self = self, !self.running else { return }
-            self.running = true
+            guard let self = self, !self._running else { return }
+            self._running = true
             self.degraded = false          // 重新启动时复位降级状态
             self.normalHz = 20
             self.pushStatus("自动: 启动")
@@ -115,14 +148,15 @@ final class AutoTracker {
     func stop() {
         queue.async { [weak self] in
             guard let self = self else { return }
-            self.running = false
+            self._running = false
             self.stopTimers()
             self.teardownLocked(reason: "手动停止")
             self.pushStatus("自动: 已停止")
         }
     }
 
-    var isRunning: Bool { running }
+    /// `_running` 只在队列上写；这里同步取，避免主线程裸读。
+    var isRunning: Bool { withState { _running } }
 
     /// 手动按钮专用：在读取队列上**同步**执行。
     /// 这样按钮和状态机天然互斥，不会同时碰 `MemoryProbe` 的静态状态。
@@ -152,7 +186,7 @@ final class AutoTracker {
     private func makeFastTimer() {
         fastTimer?.cancel()
         let t = DispatchSource.makeTimerSource(queue: queue)
-        let iv = 1.0 / max(1.0, fastHz)
+        let iv = 1.0 / max(1.0, _fastHz)
         t.schedule(deadline: .now() + 0.05, repeating: iv, leeway: .milliseconds(5))
         t.setEventHandler { [weak self] in self?.fastTick() }
         t.resume()
@@ -163,7 +197,7 @@ final class AutoTracker {
     /// 前后台切换和自检降级都走这里，两边不会互相冲掉。
     private func applyFrequency() {
         let base = degraded ? max(5, normalHz / 2) : normalHz
-        fastHz = max(1, min(base, 30))
+        _fastHz = max(1, min(base, 30))
         makeFastTimer()
     }
 
@@ -175,15 +209,16 @@ final class AutoTracker {
 
     /// 释放一切：端口 + 映射 + 缓存地址。
     /// **必须成对**：attachPort ↔ detachPort，映射 ↔ releaseAllMappings。
-    private func teardownLocked(reason: String) {        MemoryProbe.detachPort()
+    private func teardownLocked(reason: String) {
+        MemoryProbe.detachPort()
         MemoryProbe.releaseAllMappings()
         targetPid = 0
         hintPC = 0
         world = 0
         baseReady = false
-        targets = []
-        selfSnap = MemoryProbe.SelfSnapshot()
-        mappingBlocks = 0
+        _targets = []
+        _selfSnap = MemoryProbe.SelfSnapshot()
+        _mappingBlocks = 0
         setState(.waiting, "已释放（\(reason)）")
     }
 
@@ -208,16 +243,16 @@ final class AutoTracker {
     }
 
     private func setBackground(_ bg: Bool) {
-        guard running else { return }
+        guard _running else { return }
         normalHz = bg ? 2 : 20
         applyFrequency()
-        pushStatus(bg ? "自动: 进入后台，降到 \(Int(fastHz))Hz" : "自动: 回到前台，恢复 \(Int(fastHz))Hz")
+        pushStatus(bg ? "自动: 进入后台，降到 \(Int(_fastHz))Hz" : "自动: 回到前台，恢复 \(Int(_fastHz))Hz")
     }
 
     // MARK: - 心跳层（1Hz，只做生命周期）
 
     private func heartbeat() {
-        guard running else { return }
+        guard _running else { return }
         scanner.invalidate()
         let list = scanner.scan()
         // 把 comm 一起带出来：`exact` 只说明 comm/路径匹配了白名单，
@@ -257,12 +292,12 @@ final class AutoTracker {
             baseReady = true
             // 首次挂载主动铺一次映射，之后靠按需兜底
             let mapNote = MemoryProbe.mapAllRegions(pid: pid)
-            mappingBlocks = MemoryProbe.mappedBlockCount
+            _mappingBlocks = MemoryProbe.mappedBlockCount
             setState(.running, "已挂载 \(hit.comm) pid=\(pid) · \(mapNote)")
             return
         }
 
-        if state != .running {
+        if _state != .running {
             setState(.running, "已挂载 \(hit.comm) pid=\(pid)")
         }
     }
@@ -270,16 +305,16 @@ final class AutoTracker {
     // MARK: - 慢分频（1Hz，Actors 全量）
 
     private func slowTick() {
-        guard running, MemoryProbe.isAttached, baseReady else { return }
+        guard _running, MemoryProbe.isAttached, baseReady else { return }
         // 计数器一律取「本轮差值」：累计值看不出当下走的是映射还是内核
         let mappedBefore = MemoryProbe.mappedHitCalls
         let onDemandBefore = MemoryProbe.onDemandMapBlocks
-        let scan = MemoryProbe.scanTargets()
-        lastScanNote = scan.note
-        lastScanVMReads = scan.vmReads
-        lastScanMappedHits = MemoryProbe.mappedHitCalls - mappedBefore
-        lastScanOnDemand = MemoryProbe.onDemandMapBlocks - onDemandBefore
-        mappingBlocks = scan.usedMappings
+        let scan = MemoryProbe.scanTargets(pid: targetPid)
+        _lastScanNote = scan.note
+        _lastScanKernelReads = scan.vmReads
+        _lastScanMappedHits = MemoryProbe.mappedHitCalls - mappedBefore
+        _lastScanOnDemand = MemoryProbe.onDemandMapBlocks - onDemandBefore
+        _mappingBlocks = scan.usedMappings
 
         // 世界指针和本机 PlayerController **每拍更新** —— 换图/重生都会换对象，
         // 抱着旧指针去读只会得到一串 0。
@@ -305,7 +340,7 @@ final class AutoTracker {
             rt.isSelf = (selfPawn != 0 && t.actor == selfPawn)
             tmp.append(rt)
         }
-        targets = tmp
+        _targets = tmp
         // 先算好距离与屏幕坐标再推。否则这一拍交给 UI 的是 dist=0、screen=nil 的原始
         // 对象，列表会显示成一片「0m / 屏幕(身后)」，要等下一次 fastTick 才被填上 ——
         // 慢分频 1Hz 而快照 2Hz，肉眼就是距离在 0 和真实值之间来回跳。
@@ -316,18 +351,18 @@ final class AutoTracker {
     // MARK: - 快照层（20Hz，自己 + 相机）
 
     private func fastTick() {
-        guard running, MemoryProbe.isAttached, baseReady else { return }
-        tickCount += 1
+        guard _running, MemoryProbe.isAttached, baseReady else { return }
+        _tickCount += 1
 
         let vmBefore = MemoryProbe.hardReadCalls
-        let snap = MemoryProbe.readSelfAndCamera(hintPC: hintPC, world: world)
+        let snap = MemoryProbe.readSelfAndCamera(pid: targetPid, hintPC: hintPC, world: world)
         let vmDelta = MemoryProbe.hardReadCalls - vmBefore
-        fastTickVMReads = vmDelta
+        _fastTickKernelReads = vmDelta
 
         // ── 自检：降级了要**明确降频**，不静默继续 ──
         if vmDelta > 50 {
             fastFailStreak += 1
-            if fastFailStreak >= 3 { degrade("单轮 mach_vm_read \(vmDelta) 次 > 50，映射没铺好") }
+            if fastFailStreak >= 3 { degrade("单轮内核读 \(vmDelta) 次 > 50，映射没铺好") }
             return
         }
         if MemoryProbe.mappedBlockCount >= 2048 {
@@ -339,11 +374,11 @@ final class AutoTracker {
 
         guard snap.valid else {
             // 短链读不到（在加载画面/观战/重生中），不算失败，只是这拍没数据
-            selfSnap = snap
+            _selfSnap = snap
             return
         }
 
-        selfSnap = snap
+        _selfSnap = snap
         hintPC = snap.pc
         projectAll()
         pushTargets()
@@ -356,16 +391,16 @@ final class AutoTracker {
                 : "cam无"
             // 双口径：括号里是本轮增量（看当下走哪条路），前面是累计（看趋势 ——
             // 内核读的累计值涨得太快，说明映射覆盖率不够，那是个独立信号）
-            let counters = "映射命中 \(MemoryProbe.mappedHitCalls)(+\(lastScanMappedHits))"
-                + " 按需映射 \(MemoryProbe.onDemandMapBlocks)(+\(lastScanOnDemand))"
-                + " 内核读 \(MemoryProbe.hardReadCalls)(+\(lastScanVMReads))"
+            let counters = "映射命中 \(MemoryProbe.mappedHitCalls)(+\(_lastScanMappedHits))"
+                + " 按需映射 \(MemoryProbe.onDemandMapBlocks)(+\(_lastScanOnDemand))"
+                + " 内核读 \(MemoryProbe.hardReadCalls)(+\(_lastScanKernelReads))"
             // 抽查放后台队列算，结果留给列表单独一行 —— 状态行已经塞不下它了。
             // 降权失败数挂在这行上：它必须是 0，而且要在状态机跑着的时候也看得见 ——
             // 手动按钮的报告会被状态行/列表覆写，靠点按钮读不到它。
-            protectionNote = MemoryProbe.spotCheckProtection()
+            _protectionNote = MemoryProbe.spotCheckProtection()
                 + " · 降权失败 \(MemoryProbe.protectFailures)"
-            setState(state == .degraded ? .degraded : .running,
-                     "pid=\(targetPid) \(Int(fastHz))Hz tick=\(tickCount) 目标\(targets.count) 映射\(MemoryProbe.mappedBlockCount)块 \(cam) vm=\(fastTickVMReads)"
+            setState(_state == .degraded ? .degraded : .running,
+                     "pid=\(targetPid) \(Int(_fastHz))Hz tick=\(_tickCount) 目标\(_targets.count) 映射\(MemoryProbe.mappedBlockCount)块 \(cam) vm=\(_fastTickKernelReads)"
                      + " | \(counters)")
         }
     }
@@ -373,39 +408,39 @@ final class AutoTracker {
     /// 用高频层的相机给慢分频拿到的坐标做投影 —— 坐标 1Hz、相机 20Hz，
     /// 两者分开采样，画出来才不会因为列表刷新而卡顿。
     private func projectAll() {
-        let cam = selfSnap.camera
+        let cam = _selfSnap.camera
         let sw = Double(MemoryProbe.screenSize.width)
         let sh = Double(MemoryProbe.screenSize.height)
-        let me = selfSnap.loc
-        for i in targets.indices {
-            let p = targets[i].loc
+        let me = _selfSnap.loc
+        for i in _targets.indices {
+            let p = _targets[i].loc
             let dx = Double(p.0 - me.0), dy = Double(p.1 - me.1), dz = Double(p.2 - me.2)
-            targets[i].dist = (dx * dx + dy * dy + dz * dz).squareRoot() / 100.0
+            _targets[i].dist = (dx * dx + dy * dy + dz * dz).squareRoot() / 100.0
             let s = MemoryProbe.projectPoint(p.0, p.1, p.2, camera: cam, screenW: sw, screenH: sh)
-            targets[i].screen = s
+            _targets[i].screen = s
             if let s = s {
-                targets[i].onScreen = (s.0 >= 0 && s.0 <= sw && s.1 >= 0 && s.1 <= sh)
+                _targets[i].onScreen = (s.0 >= 0 && s.0 <= sw && s.1 >= 0 && s.1 <= sh)
             } else {
-                targets[i].onScreen = false
+                _targets[i].onScreen = false
             }
         }
     }
 
     private func degrade(_ why: String) {
         if degraded {
-            setState(.degraded, "自检持续不通过（\(why)），已是最低频 \(Int(fastHz))Hz")
+            setState(.degraded, "自检持续不通过（\(why)），已是最低频 \(Int(_fastHz))Hz")
             return
         }
         degraded = true
         applyFrequency()
-        setState(.degraded, "自检不通过（\(why)）→ 频率降到 \(Int(fastHz))Hz")
+        setState(.degraded, "自检不通过（\(why)）→ 频率降到 \(Int(_fastHz))Hz")
     }
 
     // MARK: - 状态推送（一律回主线程）
 
     private func setState(_ s: State, _ d: String) {
-        state = s
-        detail = d
+        _state = s
+        _detail = d
         let text = "自动[\(s.rawValue)] \(d)"
         pushStatus(text)
     }
@@ -416,8 +451,8 @@ final class AutoTracker {
     }
 
     private func pushTargets() {
-        let t = targets
-        let s = selfSnap
+        let t = _targets
+        let s = _selfSnap
         let cb = onTargets
         DispatchQueue.main.async { cb?(t, s) }
     }

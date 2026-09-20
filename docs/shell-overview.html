@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Aether / Music — 项目壳子总览</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --ink: #14161a;
+    --muted: #6b7280;
+    --line: #e5e7eb;
+    --card: #ffffff;
+    --accent: #2563eb;
+    --green: #059669;
+    --amber: #d97706;
+    --violet: #7c3aed;
+    --rose: #e11d48;
+    --mono: "SF Mono", "Cascadia Code", Consolas, "PingFang SC", monospace;
+    --sans: -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: var(--sans);
+    background: var(--bg);
+    color: var(--ink);
+    line-height: 1.55;
+    padding: 28px 24px 48px;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+  header {
+    margin-bottom: 22px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--line);
+  }
+  header h1 {
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+  }
+  header .sub {
+    margin-top: 6px;
+    color: var(--muted);
+    font-size: 13px;
+  }
+  .badge-row { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 8px; }
+  .badge {
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 3px 8px;
+    border-radius: 999px;
+    background: #eef2ff;
+    color: #3730a3;
+    border: 1px solid #c7d2fe;
+  }
+  .badge.ok { background: #ecfdf5; color: #065f46; border-color: #a7f3d0; }
+  .badge.warn { background: #fffbeb; color: #92400e; border-color: #fde68a; }
+
+  h2 {
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 28px 0 12px;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+  }
+  @media (max-width: 820px) { .grid { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 16px 18px;
+  }
+  .card h3 {
+    font-size: 14px;
+    font-weight: 650;
+    margin-bottom: 8px;
+  }
+  .card p, .card li {
+    font-size: 13px;
+    color: #374151;
+  }
+  .card ul { padding-left: 18px; }
+  .card li { margin: 4px 0; }
+  code {
+    font-family: var(--mono);
+    font-size: 12px;
+    background: #f3f4f6;
+    padding: 1px 5px;
+    border-radius: 4px;
+  }
+  pre {
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.55;
+    background: #0f172a;
+    color: #e2e8f0;
+    border-radius: 10px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    white-space: pre;
+  }
+  pre .c { color: #94a3b8; }
+  pre .k { color: #7dd3fc; }
+  pre .s { color: #86efac; }
+  pre .n { color: #fcd34d; }
+
+  .flow {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 18px;
+  }
+  .flow-track {
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    flex-wrap: wrap;
+  }
+  .node {
+    flex: 1 1 140px;
+    min-width: 140px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 12px 12px 10px;
+    background: #fafafa;
+    position: relative;
+  }
+  .node + .node { margin-left: 28px; }
+  .node + .node::before {
+    content: "→";
+    position: absolute;
+    left: -22px;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--muted);
+    font-weight: 700;
+  }
+  @media (max-width: 720px) {
+    .node + .node { margin-left: 0; margin-top: 18px; }
+    .node + .node::before { content: "↓"; left: 50%; top: -16px; transform: translateX(-50%); }
+  }
+  .node .tag {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--muted);
+    margin-bottom: 4px;
+  }
+  .node .name {
+    font-size: 14px;
+    font-weight: 700;
+    margin-bottom: 4px;
+  }
+  .node .desc {
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .node.loading { border-top: 3px solid var(--violet); }
+  .node.unlock  { border-top: 3px solid var(--amber); }
+  .node.control { border-top: 3px solid var(--green); }
+  .node.fangui  { border-top: 3px solid var(--accent); }
+
+  .kv {
+    display: grid;
+    grid-template-columns: 120px 1fr;
+    gap: 6px 12px;
+    font-size: 13px;
+  }
+  .kv dt { color: var(--muted); font-family: var(--mono); font-size: 12px; }
+  .kv dd { color: var(--ink); }
+
+  .tree {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.7;
+    color: #1f2937;
+  }
+  .tree .dir { color: var(--accent); font-weight: 600; }
+  .tree .file { color: #374151; }
+  .tree .note { color: var(--muted); }
+  .tree .hi { background: #fef3c7; border-radius: 3px; padding: 0 3px; }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  th, td {
+    text-align: left;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--line);
+    vertical-align: top;
+  }
+  th {
+    background: #f9fafb;
+    font-weight: 650;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  tr:last-child td { border-bottom: none; }
+  td.mono { font-family: var(--mono); font-size: 12px; }
+
+  .footer {
+    margin-top: 28px;
+    padding-top: 14px;
+    border-top: 1px solid var(--line);
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .note-box {
+    margin-top: 10px;
+    padding: 10px 12px;
+    background: #eff6ff;
+    border: 1px solid #bfdbfe;
+    border-radius: 8px;
+    font-size: 12.5px;
+    color: #1e3a8a;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Aether · Music 壳子总览</h1>
+    <div class="sub">只读结构图 · 未改动任何代码 · 源路径 <code>D:\工作区\Aether</code></div>
+    <div class="badge-row">
+      <span class="badge">Bundle: com.apple.Music</span>
+      <span class="badge">Name: Music</span>
+      <span class="badge">iOS 13.0+</span>
+      <span class="badge">v1.02 (1)</span>
+      <span class="badge">XcodeGen · objectVersion 60</span>
+      <span class="badge warn">Unsigned tipa (CI)</span>
+      <span class="badge ok">身份皮 = Apple Music</span>
+    </div>
+  </header>
+
+  <h2>启动壳 · 三段状态机 + 悬浮层</h2>
+  <div class="flow">
+    <div class="flow-track">
+      <div class="node loading">
+        <div class="tag">AppPhase.loading</div>
+        <div class="name">LoadingView</div>
+        <div class="desc">玫瑰线加载 0→100%，约 2.8s，完成后 completeLoading()</div>
+      </div>
+      <div class="node unlock">
+        <div class="tag">AppPhase.unlock</div>
+        <div class="name">UnlockView</div>
+        <div class="desc">卡密校验 stub（demo: AETHER-2026 / ≥8 位），enterControl()</div>
+      </div>
+      <div class="node control">
+        <div class="tag">AppPhase.control</div>
+        <div class="name">ControlView</div>
+        <div class="desc">控制台：电源环 / 开启·关闭 / 状态·权限·时长</div>
+      </div>
+      <div class="node fangui">
+        <div class="tag">Overlay</div>
+        <div class="name">FangUIBridge</div>
+        <div class="desc">系统级悬浮卡片窗；音量+ 弹出 / 音量− 收起</div>
+      </div>
+    </div>
+    <div class="note-box">
+      入口链：<code>AppDelegate</code> → <code>SceneDelegate</code> → <code>UIHostingController(RootView)</code>。
+      <code>AppState</code> 是唯一状态源；默认 <code>isPoweredOn = false</code>，卡密通过后仍须手动「开启」。
+    </div>
+  </div>
+
+  <h2>仓库壳 · 目录</h2>
+  <div class="card">
+    <div class="tree">
+<span class="dir">Aether/</span>                          <span class="note"># 工程根</span>
+├── <span class="file">project.yml</span>                    <span class="note"># XcodeGen 配置（Music target）</span>
+├── <span class="file">Info.plist</span>                     <span class="note"># Bundle 皮 / Scene / audio 后台</span>
+├── <span class="file">Music.entitlements</span>              <span class="note"># 私有权限壳（窗口托管 / 内核等）</span>
+├── <span class="file">MusicIdentity.xcconfig</span>          <span class="note"># 身份皮 build settings</span>
+├── <span class="file">README.md</span>
+├── <span class="file">LICENSE</span>
+├── <span class="dir">Aether/</span>                        <span class="note"># 源码（Swift / ObjC / kfd）</span>
+│   ├── <span class="hi file">AppDelegate.swift</span>          <span class="note"># 启动：崩溃捕获 / 保活 / km 自检</span>
+│   ├── <span class="hi file">SceneDelegate.swift</span>         <span class="note"># 挂 RootView</span>
+│   ├── <span class="hi file">RootView.swift</span>              <span class="note"># 状态机 + 三屏切换</span>
+│   ├── <span class="hi file">LoadingView.swift</span>           <span class="note"># 加载屏</span>
+│   ├── <span class="hi file">UnlockView.swift</span>            <span class="note"># 卡密屏</span>
+│   ├── <span class="hi file">ControlView.swift</span>           <span class="note"># 控制台</span>
+│   ├── <span class="hi file">FangUIBridge.swift</span>          <span class="note"># 悬浮窗桥</span>
+│   ├── <span class="file">VolumeButtonMonitor.swift</span>
+│   ├── <span class="file">BackgroundKeepAlive.swift</span>
+│   ├── <span class="file">PanelOrientation.swift</span>
+│   ├── <span class="file">Bridging-Bridge.h</span>           <span class="note"># Swift↔ObjC/C 头</span>
+│   ├── <span class="file">FangUISystemWindow.{h,mm}</span>
+│   ├── <span class="file">FangUISBSHosting.{h,mm}</span>
+│   ├── <span class="file">FangUIOrientationBridge.{h,mm}</span>
+│   ├── <span class="dir">FangUI/</span>                     <span class="note"># Effects / Memory / Theme / UI</span>
+│   └── <span class="dir">libmemrw/</span>                   <span class="note"># KernelMemory + libkfd(kfd/puaf/krkw)</span>
+├── <span class="dir">Assets.xcassets/</span>               <span class="note"># AppIcon 图集</span>
+├── <span class="dir">AppIcons/</span>                      <span class="note"># 原始 AppIcon PNG（folder resource）</span>
+├── <span class="dir">.github/workflows/build.yml</span>    <span class="note"># CI → unsigned Music.tipa</span>
+├── <span class="dir">docs/</span>                          <span class="note"># 规格 / 预览 / 本总览</span>
+├── <span class="dir">tools/</span>                         <span class="note"># swift_lint / full_audit / swift_guard</span>
+└── <span class="dir">_backup/</span>                       <span class="note"># MemoryProbe.swift.bak…</span>
+    </div>
+  </div>
+
+  <h2>身份皮 · 关键配置</h2>
+  <div class="grid">
+    <div class="card">
+      <h3>project.yml · Music target</h3>
+      <dl class="kv">
+        <dt>PRODUCT_NAME</dt><dd>Music</dd>
+        <dt>MODULE</dt><dd>Music</dd>
+        <dt>BUNDLE_ID</dt><dd><code>com.apple.Music</code></dd>
+        <dt>VERSION</dt><dd>1.02 / 1</dd>
+        <dt>DEPLOY</dt><dd>iOS 13.0 · iPhone+iPad</dd>
+        <dt>SIGN</dt><dd>空 identity · 禁止签名</dd>
+        <dt>BRIDGE</dt><dd><code>Aether/Bridging-Bridge.h</code></dd>
+        <dt>HEADERS</dt><dd><code>$(SRCROOT)/Aether/libmemrw</code></dd>
+        <dt>SOURCES</dt><dd>Aether · Assets · AppIcons(folder)</dd>
+      </dl>
+    </div>
+    <div class="card">
+      <h3>Info.plist · 皮面</h3>
+      <ul>
+        <li>DisplayName / BundleName = <code>Music</code></li>
+        <li>图标：AppIcon20/29/40/57/60 + iPad 扩展尺寸</li>
+        <li>Scene：Default Configuration → <code>Music.SceneDelegate</code></li>
+        <li>后台：<code>UIBackgroundModes = [audio]</code></li>
+        <li>ATS：允许任意加载</li>
+        <li>方向：iPhone 仅 Portrait；iPad 四向</li>
+        <li>能力：armv7 + arm64</li>
+        <li>分类：developer-tools</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>启动时副作用（AppDelegate）</h2>
+  <div class="card">
+    <pre><span class="c">// didFinishLaunchingWithOptions</span>
+CrashCatcher.install()                          <span class="c">// 闪退原因写盘</span>
+BackgroundKeepAlive.shared.start()              <span class="c">// audio 保活，悬浮窗常驻</span>
+FangUIBridge.setPowerCallback { state.setPower } <span class="c">// 悬浮层关闭 → 控制台同步</span>
+DispatchQueue.global {
+  km_init(&amp;error); km_self_test(...)            <span class="c">// 内核内存自检（后台，不挡启动）</span>
+}</pre>
+  </div>
+
+  <h2>FangUI 悬浮壳（README 对齐 TrollEngine）</h2>
+  <div class="grid">
+    <div class="card">
+      <h3>窗口</h3>
+      <ul>
+        <li><code>FangUISystemWindow</code>：系统窗标记 / Secure / 不托管 WindowServer</li>
+        <li>层级：<code>statusBar + 2000</code></li>
+        <li><code>FangUISBSHosting</code>：SBSAccessibilityWindowHosting 注册</li>
+        <li>进后台不释放；心跳 reassert + 重新 register</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>形态</h3>
+      <ul>
+        <li>悬浮卡片：不透明、圆角 22、阴影；窗口只盖卡片</li>
+        <li>宽 <code>min(max(屏宽×0.42, 360), 560)</code></li>
+        <li>高 <code>min(max(屏高×0.62, 320), 470)</code></li>
+        <li>顶栏拖拽把手写回 <code>setPanelFrame</code></li>
+        <li>方向纠偏：transform 每轮布局强制归位</li>
+        <li>结构：顶栏 / 滚动内容 / 底栏</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>模块地图</h2>
+  <table>
+    <thead>
+      <tr><th>层</th><th>文件 / 目录</th><th>壳职责</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>App 入口</td>
+        <td class="mono">AppDelegate · SceneDelegate</td>
+        <td>生命周期、状态单例、副作用装配</td>
+      </tr>
+      <tr>
+        <td>状态机</td>
+        <td class="mono">RootView.swift · AppState</td>
+        <td>loading → unlock → control；电源 / 音量回调</td>
+      </tr>
+      <tr>
+        <td>三屏 UI</td>
+        <td class="mono">LoadingView · UnlockView · ControlView</td>
+        <td>加载 / 卡密 / 控制台</td>
+      </tr>
+      <tr>
+        <td>悬浮层</td>
+        <td class="mono">FangUIBridge · FangUI/* · PanelOrientation</td>
+        <td>跨 App 菜单窗、主题、几何、方向</td>
+      </tr>
+      <tr>
+        <td>保活 / 杂项</td>
+        <td class="mono">BackgroundKeepAlive · VolumeButtonMonitor</td>
+        <td>audio 心跳；音量键显隐菜单</td>
+      </tr>
+      <tr>
+        <td>内核内存</td>
+        <td class="mono">libmemrw/ · KernelMemory · libkfd</td>
+        <td>C 接口 kopen/kread/kwrite；仅 KernelMemory.m 含 libkfd.h</td>
+      </tr>
+      <tr>
+        <td>桥接</td>
+        <td class="mono">Bridging-Bridge.h</td>
+        <td>FangUI ObjC 头 + KernelMemory.h + sysctl</td>
+      </tr>
+      <tr>
+        <td>构建 / CI</td>
+        <td class="mono">project.yml · build.yml · xcconfig</td>
+        <td>xcodegen → xcodebuild → unsigned tipa</td>
+      </tr>
+      <tr>
+        <td>工具</td>
+        <td class="mono">tools/</td>
+        <td>swift_lint / full_audit / swift_guard（非 App 运行时）</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>状态机（Swift 源码摘要）</h2>
+  <div class="card">
+    <pre><span class="k">enum</span> AppPhase { <span class="k">case</span> loading, unlock, control }
+
+<span class="k">final class</span> AppState: ObservableObject {
+  @Published <span class="k">var</span> phase: AppPhase = .loading
+  @Published <span class="k">var</span> isPoweredOn = <span class="n">false</span>   <span class="c">// 默认关，卡密通过后仍须手动开</span>
+  @Published <span class="k">var</span> sessionStart: Date?
+  <span class="k">private let</span> volumeMonitor = VolumeButtonMonitor()
+  <span class="c">// Vol+ → FangUIBridge.setVisible(true)  仅 control 阶段</span>
+  <span class="c">// Vol- → FangUIBridge.setVisible(false)</span>
+}
+
+RootView.body:
+  phase == .loading  → LoadingView { completeLoading() }
+  phase == .unlock   → UnlockHostView { enterControl() }
+  <span class="k">else</span>               → ControlView().environmentObject(state)
+  <span class="c">// 前台通知 → resyncOverlay()：control 只保 monitor，其它清 overlay</span></pre>
+  </div>
+
+  <h2>Entitlements 壳（摘要）</h2>
+  <div class="card">
+    <p style="margin-bottom:8px;">身份与私有权限皮（节选，完整见 <code>Music.entitlements</code>）：</p>
+    <div class="tree">
+application-identifier = com.apple.Music
+platform-application · no-sandbox · no-container
+task_for_pid-allow · proc_info-allow
+persona-mgmt · container-manager · MobileContainerManager
+storage: AppBundles / MobileDocuments / storage-exempt.heritable
+tcc: kTCCServiceSystemPolicyAllFiles
+kernel: extended-virtual-addressing · increased-memory-limit · memorystatus · jetsam
+springboard: accessibility-window-hosting · launchapplications · disallowCC/NC
+QuartzCore: displayable-context · secure-mode
+iokit-user-client: AGXDevice / IOSurfaceRoot / AppleKeyStore / IOPMPowerSource
+keychain: group.com.apple.Music.shared
+network: client + server
+mobileinstall SPI + uninstall.deletion
+    </div>
+  </div>
+
+  <h2>CI 壳（GitHub Actions）</h2>
+  <div class="card">
+    <pre><span class="c">// .github/workflows/build.yml · name: Build tipa</span>
+on: push [main|master] + workflow_dispatch
+runs-on: macos-14
+1) checkout
+2) 选 Xcode 15.4 / 15.3 / 15.2 / 默认
+3) brew install xcodegen ldid
+4) xcodegen generate + 强制 objectVersion=60（兼容 Xcode 15.4）
+5) xcodebuild Release · generic/platform=iOS · CODE_SIGNING_ALLOWED=NO
+6) 打包 Payload → Music.tipa → Artifacts
+   打 tag（如 v1.02）附到 Release</pre>
+  </div>
+
+  <div class="footer">
+    只读汇总 · 源文件未修改 · 展示文件：<code>docs/shell-overview.html</code>
+  </div>
+</div>
+</body>
+</html>

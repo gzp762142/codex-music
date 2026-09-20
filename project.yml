@@ -38,6 +38,11 @@ targets:
         CODE_SIGNING_REQUIRED: NO
         CODE_SIGNING_ALLOWED: NO
         SWIFT_OBJC_BRIDGING_HEADER: Aether/Bridging-Bridge.h
+        # libkfd.h is header-only and includes its own tree by relative path,
+        # so one search root is enough. Only KernelMemory.m may include it:
+        # kopen/kread/kwrite/kclose are non-static and would collide if a
+        # second translation unit pulled the header in.
+        HEADER_SEARCH_PATHS: $(SRCROOT)/Aether/libmemrw
         CLANG_ENABLE_MODULES: YES
         ALWAYS_SEARCH_USER_PATHS: NO
 schemes:

@@ -1,0 +1,4 @@
+﻿备份时间: 2026-09-20 08:54:48
+备份内容: libmemrw 全目录（KernelMemory.h/.m + 15 个 kfd 文件）
+状态: 读取路径已切到内核（km_read_process），kread/kwrite 用 libkfd 的 sem_open 组合
+用途: 换 IOSurface 后端失败时回滚用

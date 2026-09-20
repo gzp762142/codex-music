@@ -1,0 +1,668 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>特征码与偏移 · 好坏评估手册</title>
+<style>
+  :root {
+    --bg:        #f0efe9;
+    --panel:     #fbfaf6;
+    --panel-2:   #e7e5db;
+    --ink:       #14202b;
+    --ink-soft:  #4a5762;
+    --ink-faint: #858e96;
+    --blue:      #1b3a5c;
+    --blue-dim:  #a8bed4;
+    --orange:    #bf5b16;
+    --orange-dim:#e8c3a3;
+    --green:     #2f6b4f;
+    --green-dim: #b3d1bf;
+    --red:       #9c2f1c;
+    --red-dim:   #e2b8af;
+    --rule:      #cec9ba;
+    --mono: "SF Mono", Menlo, Consolas, "Courier New", monospace;
+    --sans: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+    --serif: "Songti SC", "Source Han Serif SC", "Noto Serif CJK SC", "SimSun", Georgia, serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    padding: 0 20px 110px;
+    background-color: var(--bg);
+    background-image:
+      linear-gradient(rgba(27,58,92,.05) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(27,58,92,.05) 1px, transparent 1px),
+      radial-gradient(circle at 82% 4%, rgba(191,91,22,.07), transparent 44%);
+    background-size: 30px 30px, 30px 30px, 100% 100%;
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.74;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap { max-width: 880px; margin: 0 auto; }
+
+  /* ── 页头 ── */
+  header {
+    padding: 74px 0 46px;
+    border-bottom: 3px solid var(--blue);
+  }
+  .kicker {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .24em;
+    text-transform: uppercase; color: var(--orange); margin: 0 0 18px;
+  }
+  h1 {
+    font-family: var(--serif); font-size: clamp(30px, 6vw, 48px);
+    font-weight: 700; line-height: 1.15; letter-spacing: -.015em;
+    margin: 0 0 20px;
+  }
+  h1 em { font-style: normal; color: var(--orange); }
+  .lede {
+    font-family: var(--serif); font-size: clamp(17px, 2.4vw, 19.5px);
+    line-height: 1.7; color: var(--ink-soft); margin: 0; max-width: 45em;
+  }
+
+  /* ── 章节 ── */
+  section { padding: 56px 0 0; }
+  h2 {
+    font-family: var(--serif); font-size: clamp(22px, 3.5vw, 30px);
+    font-weight: 700; line-height: 1.3; margin: 0 0 22px; letter-spacing: -.01em;
+  }
+  h2 .num {
+    display: block; font-family: var(--mono); font-size: .44em;
+    font-weight: 400; letter-spacing: .16em; text-transform: uppercase;
+    color: var(--orange); margin-bottom: 10px;
+  }
+  h3 { font-size: 17px; font-weight: 700; margin: 34px 0 12px; }
+  p { margin: 0 0 16px; }
+  code {
+    font-family: var(--mono); font-size: .87em;
+    background: var(--panel-2); padding: .12em .4em;
+    border-radius: 3px; color: #33240f;
+  }
+  strong { font-weight: 700; }
+  .hl { background: linear-gradient(transparent 60%, var(--orange-dim) 60%); font-weight: 700; }
+  .hl-b { background: linear-gradient(transparent 60%, var(--blue-dim) 60%); font-weight: 700; }
+
+  /* ── 天梯 ── */
+  .ladder { margin: 30px 0; }
+  .rung {
+    display: grid; grid-template-columns: 44px 1fr auto;
+    gap: 18px; align-items: start;
+    padding: 20px 0; border-top: 1px solid var(--rule);
+  }
+  .rung:last-child { border-bottom: 1px solid var(--rule); }
+  .rung .rank {
+    font-family: var(--mono); font-size: 12px; font-weight: 700;
+    color: #fff; background: var(--ink-faint);
+    width: 26px; height: 26px; border-radius: 50%;
+    display: grid; place-items: center; margin-top: 3px;
+  }
+  .rung.t1 .rank { background: var(--red); }
+  .rung.t2 .rank { background: var(--orange); }
+  .rung.t3 .rank { background: var(--green); }
+  .rung h4 { font-size: 16.5px; margin: 0 0 7px; font-family: var(--serif); }
+  .rung p { margin: 0 0 8px; font-size: 15px; color: var(--ink-soft); }
+  .rung p:last-child { margin-bottom: 0; }
+  .rung .tag {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .08em;
+    padding: 5px 10px; border-radius: 3px; white-space: nowrap; margin-top: 2px;
+  }
+  .t1 .tag { background: var(--red-dim); color: #6d1c0d; }
+  .t2 .tag { background: var(--orange-dim); color: #6b3208; }
+  .t3 .tag { background: var(--green-dim); color: #17402f; }
+
+  /* ── 诊断面板 ── */
+  .diag {
+    background: var(--ink); color: #dfe6ec;
+    border-radius: 5px; padding: 24px 26px; margin: 28px 0;
+    font-family: var(--mono); font-size: 13.5px; line-height: 2;
+    overflow-x: auto;
+  }
+  .diag .cm { color: #7d8b98; }
+  .diag .k  { color: #d8b27a; }
+  .diag .v  { color: #9ecfae; }
+  .diag .w  { color: #e8996c; }
+  .diag .t  { color: #8fb4d8; }
+
+  /* ── 评分卡 ── */
+  .score { margin: 28px 0; border: 1px solid var(--rule); border-radius: 5px; overflow: hidden; background: var(--panel); }
+  .score-head {
+    background: var(--blue); color: #eaf0f5;
+    padding: 14px 22px; font-family: var(--mono);
+    font-size: 12.5px; letter-spacing: .1em; text-transform: uppercase;
+  }
+  .score-row {
+    display: grid; grid-template-columns: 34px 1fr;
+    gap: 16px; padding: 18px 22px; border-top: 1px solid var(--rule);
+  }
+  .score-row:first-of-type { border-top: none; }
+  .score-row .n {
+    font-family: var(--mono); font-size: 12px; font-weight: 700;
+    color: var(--blue); padding-top: 3px;
+  }
+  .score-row h5 { margin: 0 0 7px; font-size: 16px; font-family: var(--serif); }
+  .score-row p { margin: 0 0 7px; font-size: 14.5px; color: var(--ink-soft); }
+  .score-row p:last-child { margin-bottom: 0; }
+  .rubric {
+    font-family: var(--mono); font-size: 12.5px; line-height: 1.85;
+    background: var(--panel-2); padding: 11px 14px; border-radius: 3px;
+    margin-top: 10px; color: #3d4a55; overflow-x: auto;
+  }
+  .rubric b { color: var(--green); }
+  .rubric i { color: var(--red); font-style: normal; }
+
+  /* ── 检验法 ── */
+  .test {
+    border-left: 4px solid var(--green);
+    background: rgba(47,107,79,.06);
+    padding: 18px 22px; margin: 22px 0; border-radius: 0 4px 4px 0;
+  }
+  .test h4 { margin: 0 0 9px; font-size: 16px; color: var(--green); font-family: var(--serif); }
+  .test p { margin: 0 0 8px; font-size: 15px; }
+  .test p:last-child { margin-bottom: 0; }
+
+  .warnbox {
+    border-left: 4px solid var(--red);
+    background: rgba(156,47,28,.06);
+    padding: 18px 22px; margin: 22px 0; border-radius: 0 4px 4px 0;
+  }
+  .warnbox h4 { margin: 0 0 9px; font-size: 16px; color: var(--red); font-family: var(--serif); }
+  .warnbox p { margin: 0 0 8px; font-size: 15px; }
+  .warnbox p:last-child { margin-bottom: 0; }
+
+  /* ── 优先级清单 ── */
+  .todo { margin: 28px 0; }
+  .todo-item {
+    display: grid; grid-template-columns: 62px 1fr; gap: 16px;
+    padding: 18px 0; border-top: 1px solid var(--rule); align-items: start;
+  }
+  .todo-item:last-child { border-bottom: 1px solid var(--rule); }
+  .pri {
+    font-family: var(--mono); font-size: 11px; font-weight: 700;
+    letter-spacing: .06em; padding: 6px 8px; border-radius: 3px;
+    text-align: center; color: #fff;
+  }
+  .pri.p0 { background: var(--red); }
+  .pri.p1 { background: var(--orange); }
+  .pri.p2 { background: var(--blue); }
+  .pri.p3 { background: var(--ink-faint); }
+  .todo-item h5 { margin: 0 0 6px; font-size: 15.5px; }
+  .todo-item p { margin: 0; font-size: 14.5px; color: var(--ink-soft); }
+
+  /* ── 收尾 ── */
+  .final {
+    margin-top: 54px; padding: 32px 30px;
+    border: 2px solid var(--blue); border-radius: 5px;
+    background: var(--panel);
+  }
+  .final h3 { font-family: var(--serif); font-size: 21px; margin: 0 0 16px; }
+  .final ol { margin: 0; padding-left: 22px; }
+  .final li { margin-bottom: 12px; }
+  .final li:last-child { margin-bottom: 0; }
+
+  .rise { opacity: 0; transform: translateY(14px); transition: opacity .6s ease, transform .6s ease; }
+  .rise.in { opacity: 1; transform: none; }
+  @media (prefers-reduced-motion: reduce) { .rise { opacity: 1; transform: none; transition: none; } }
+
+  @media (max-width: 680px) {
+    body { padding: 0 16px 76px; font-size: 15.5px; }
+    header { padding: 48px 0 36px; }
+    section { padding: 42px 0 0; }
+    .rung { grid-template-columns: 34px 1fr; gap: 12px; }
+    .rung .tag { grid-column: 2; justify-self: start; margin-top: 6px; }
+    .score-row { grid-template-columns: 1fr; gap: 6px; padding: 16px 18px; }
+    .score-row .n { padding-top: 0; }
+    .todo-item { grid-template-columns: 1fr; gap: 10px; }
+    .pri { justify-self: start; }
+    .final { padding: 24px 20px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <p class="kicker">Aether · 定位手段评估</p>
+  <h1>你的偏移<br>到底<em>结不结实</em></h1>
+  <p class="lede">
+    「特征码」和「偏移」不是一回事，失效的原因也完全不同。
+    这一页先分清三类定位手段的稳定性天梯，再给出能直接打分用的评判标准，
+    最后落到 Aether 现在手里到底是哪一类。
+  </p>
+</header>
+
+<section class="rise">
+  <h2><span class="num">第 0 节 · 先看现状</span>你手里现在是什么</h2>
+
+  <p>翻了 <code>Offsets.swift</code>，实际情况是这样：</p>
+
+  <div class="diag"><span class="cm">// Offsets.swift — 当前默认值</span>
+<span class="k">moduleBase</span> = <span class="w">0x1047D0000</span>   <span class="cm">// dump 时的模块基址</span>
+<span class="k">gObjects</span>   = <span class="w">0x111251B00</span>   <span class="cm">// 静态 vmaddr 域地址</span>
+<span class="k">gNames</span>     = <span class="w">0x111FBA198</span>
+<span class="k">gWorld</span>     = <span class="w">0x11148B608</span>
+
+<span class="cm">// MemoryProbe.swift — 结构体内部偏移（硬编码在读取链里）</span>
+<span class="t">UWorld.PersistentLevel</span>   = <span class="v">0xB8</span>
+<span class="t">ULevel.Actors</span>            = <span class="v">0xA0</span>
+<span class="t">UWorld.OwningGameInstance</span>= <span class="v">0xB20</span>
+<span class="t">APlayerController.Pawn</span>    = <span class="v">0x660</span>
+
+<span class="cm">// 特征码：</span>
+<span class="w">一个都没有。</span></div>
+
+  <p>
+    这张单子说明两件事：<strong>你的结构体偏移没有问题</strong>（这类东西天生比较稳），
+    <strong>但三个全局地址是最脆弱的那一类</strong>——而且没有任何兜底手段。
+    另外 <code>offsets.txt</code> 现在还不存在，所以跑的是源码里的默认值。
+  </p>
+</section>
+
+<section class="rise">
+  <h2><span class="num">第 1 节 · 分类</span>三类定位手段的稳定性天梯</h2>
+
+  <p>
+    这三样东西经常被混着叫"偏移"，但它们的失效原因完全不同。
+    分清楚了，才知道该往哪儿使劲。
+  </p>
+
+  <div class="ladder">
+    <div class="rung t1">
+      <div class="rank">3</div>
+      <div>
+        <h4>绝对地址 / 静态域地址</h4>
+        <p>
+          比如 <code>gWorld = 0x11148B608</code>。它本质是「模块起始 + 一个固定偏移」，
+          直接写死在代码里。
+        </p>
+        <p>
+          <strong>为什么最脆：</strong>这个数字取决于链接时每个段的排列顺序和大小。
+          游戏更新时只要任何一个段变大变小、编译器换个版本、静态初始化顺序动一下，
+          <span class="hl">后面所有地址整体移位</span>，三个全废。
+        </p>
+      </div>
+      <span class="tag">版本绑定</span>
+    </div>
+
+    <div class="rung t2">
+      <div class="rank">2</div>
+      <div>
+        <h4>特征码（Pattern Scan）</h4>
+        <p>
+          在代码段里搜一段字节序列，命中处就是你要找的函数或变量。
+          比如找「谁在读 GWorld」，就搜那条 <code>adrp</code> + <code>ldr</code> 指令对。
+        </p>
+        <p>
+          <strong>为什么中等：</strong>它是从<strong>语义</strong>上定位——只要那段代码还在做同样的事，
+          地址怎么变都能找到。<span class="hl-b">但它依赖编译器的输出</span>，
+          编译器换版本、优化等级变化、函数被内联，特征码就可能失配。
+        </p>
+      </div>
+      <span class="tag">代码绑定</span>
+    </div>
+
+    <div class="rung t3">
+      <div class="rank">1</div>
+      <div>
+        <h4>结构体内部偏移</h4>
+        <p>
+          比如 <code>UWorld.PersistentLevel = 0xB8</code>。这是从基类指针往后数的字节数。
+        </p>
+        <p>
+          <strong>为什么最稳：</strong>UE 的结构体布局是引擎层面的东西，
+          游戏更新时改动很慢。而且小的偏移（像 <code>0xB8</code>）通常落在结构体头部，
+          那块区域被改动的概率更低。
+          <span class="hl-b">代价是：它需要一个可靠的起点</span>——起点断了，它再稳也没用。
+        </p>
+      </div>
+      <span class="tag">布局绑定</span>
+    </div>
+  </div>
+
+  <p>
+    这张梯子说明一个反直觉的结论：<strong>你缺的不是"更好的偏移"，是"更可靠的起点"</strong>。
+    结构体偏移已经是最稳的那一类了，问题全在它前面那三个全局地址上。
+  </p>
+</section>
+
+<section class="rise">
+  <h2><span class="num">第 2 节 · 评分卡 A</span>特征码好不好，看这六项</h2>
+
+  <p>给你以后写特征码时自查用。每一项都能当场判断，不需要跑工具。</p>
+
+  <div class="score">
+    <div class="score-head">特征码质量评分 · 六项</div>
+
+    <div class="score-row">
+      <div class="n">A1</div>
+      <div>
+        <h5>唯一性</h5>
+        <p>在整块代码段里，这个字节序列<strong>只能命中一次</strong>。命中两次以上就完全没用——你没法知道该信哪一个。</p>
+        <div class="rubric"><b>合格</b>：全段扫描命中数 = 1　　<i>不合格</i>：命中 2 次以上，或你自己说不清命中了几次</div>
+      </div>
+    </div>
+
+    <div class="score-row">
+      <div class="n">A2</div>
+      <div>
+        <h5>长度</h5>
+        <p>太短会误伤，太长等于把周围的代码也一起绑上——周围代码改动的概率比核心代码高得多。</p>
+        <div class="rubric"><b>合格</b>：约 12～24 字节（3～6 条指令）　　<i>不合格</i>：少于 8 字节，或超过 40 字节</div>
+      </div>
+    </div>
+
+    <div class="score-row">
+      <div class="n">A3</div>
+      <div>
+        <h5>通配符比例</h5>
+        <p>
+          <code>adrp</code> 这类指令的立即数会随地址变化，必须打通配符。
+          但通配符一多，特征码就退化成"模糊匹配"，唯一性会崩。
+        </p>
+        <div class="rubric"><b>合格</b>：通配符占比 &lt; 30%，且都集中在地址类指令上　　<i>不合格</i>：通配符成片出现，或用来"猜"不确定的字节</div>
+      </div>
+    </div>
+
+    <div class="score-row">
+      <div class="n">A4</div>
+      <div>
+        <h5>是否跨函数边界</h5>
+        <p>
+          跨两个函数的特征码，等于<strong>同时依赖两个函数的相对位置</strong>——
+          而这恰恰是编译器最容易调整的东西（函数重排、内联、冷热分离）。
+        </p>
+        <div class="rubric"><b>合格</b>：完整落在一个函数体内　　<i>不合格</i>：跨越 <code>ret</code>、跨越函数对齐填充</div>
+      </div>
+    </div>
+
+    <div class="score-row">
+      <div class="n">A5</div>
+      <div>
+        <h5>是否依赖编译器脾气</h5>
+        <p>
+          内联、向量化、指令调度、常量折叠——这些优化一开一关，字节序列就变了。
+          依赖具体寄存器编号或指令顺序的特征码尤其脆。
+        </p>
+        <div class="rubric"><b>合格</b>：锚在跨函数的调用约定、字符串引用、常量比较上　　<i>不合格</i>：锚在寄存器分配细节上</div>
+      </div>
+    </div>
+
+    <div class="score-row">
+      <div class="n">A6</div>
+      <div>
+        <h5>锚点质量</h5>
+        <p>
+          不同锚点天生不等价。这是从稳到脆的顺序：
+        </p>
+        <div class="rubric">
+          <b>字符串引用</b> &gt; <b>跨模块调用</b> &gt; <b>独特常量比较</b> &gt; <b>指令序列</b> &gt; <i>纯字节填充</i>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="warnbox">
+    <h4>最常见的错法</h4>
+    <p>
+      拿一段<strong>看着很独特</strong>的指令直接当特征码，从没验证过唯一性。
+      这种特征码在编写它的那个版本上跑得通，换个版本就静默失配——
+      而且因为你不检查命中数，它<strong>可能命中到了别的地方</strong>，读回来一堆垃圾，你还以为是偏移错了。
+    </p>
+  </div>
+</section>
+
+<section class="rise">
+  <h2><span class="num">第 3 节 · 评分卡 B</span>偏移链好不好，看这五项</h2>
+
+  <p>这里说的"偏移"指的是——从起点出发、经过若干级指针跳转、到达目标字段的整条路径。</p>
+
+  <div class="score">
+    <div class="score-head">偏移链质量评分 · 五项</div>
+
+    <div class="score-row">
+      <div class="n">B1</div>
+      <div>
+        <h5>链长</h5>
+        <p>每多一级指针，就多一个失效点。<strong>五级链的存活率约为三级链的一半</strong>——不是说每一级的失效率特别高，而是它们会连乘。</p>
+        <div class="rubric"><b>合格</b>：≤ 4 级　　<i>警惕</i>：5～6 级　　<i>不合格</i>：7 级以上，几乎必然有更短的等价路径</div>
+      </div>
+    </div>
+
+    <div class="score-row">
+      <div class="n">B2</div>
+      <div>
+        <h5>位移量大小</h5>
+        <p>
+          小偏移通常落在结构体头部——那里是基类、虚表指针、常用成员，
+          布局多年不变。大偏移往往意味着"翻过半个结构体去够一个成员"，
+          中间被插入字段的概率高得多。
+        </p>
+        <div class="rubric"><b>稳</b>：&lt; 0x100　　<b>一般</b>：0x100 ～ 0x400　　<i>脆</i>：&gt; 0x1000（尤其 <code>0xB20</code>、<code>0x660</code> 这类跨结构体的大跳跃）</div>
+      </div>
+    </div>
+
+    <div class="score-row">
+      <div class="n">B3</div>
+      <div>
+        <h5>每一级的有效性校验</h5>
+        <p>
+          这是<strong>整份清单里最实用、也最常被跳过的一项</strong>。
+          链断掉的时候，你读到的不是崩溃，而是"一个看似正常的野值"——
+          然后这个野值被当成坐标喂进后续计算，屏幕上画出一个荒唐的东西，你还得回头查半天。
+        </p>
+        <div class="rubric">
+          每一级指针解引用前检查：<br>
+          <b>1</b> 非 0　　<b>2</b> 8 字节对齐　　<b>3</b> 落在合法地址区间（模块内或已知堆区）<br>
+          <i>缺任意一条，链路失效就会伪装成"读到了错误的数据"而不是"读失败了"</i>
+        </div>
+      </div>
+    </div>
+
+    <div class="score-row">
+      <div class="n">B4</div>
+      <div>
+        <h5>是否有替代路径</h5>
+        <p>
+          同一个目标，如果存在<strong>两条互相独立的到达路径</strong>，你就能拿它们互相对照。
+          一条断了，另一条还在；两条结果不一致，说明中间有一级不可信。
+        </p>
+        <div class="rubric"><b>好</b>：≥ 2 条独立路径，且能交叉验证　　<i>差</i>：只有一条，断了就全瞎</div>
+      </div>
+    </div>
+
+    <div class="score-row">
+      <div class="n">B5</div>
+      <div>
+        <h5>失效时可检测性</h5>
+        <p>
+          链断了以后，你怎么知道？——这是设计时就要想的问题，不是出事后才补。
+        </p>
+        <div class="rubric">
+          合格的标准：<b>能说出是哪一级先不成立的</b>，而不是笼统报"读取失败"<br>
+          <i>不合格</i>：只报一个总结果，无法定位断点
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="rise">
+  <h2><span class="num">第 4 节 · 三个检验法</span>不写代码也能做的实测</h2>
+
+  <p>下面三个方法都是"跑一次就有结论"的类型，不需要额外工具。</p>
+
+  <div class="test">
+    <h4>检验一 · 交叉验证</h4>
+    <p>
+      你现在有 <code>stepWorld</code> 和 <code>stepObjects</code> 两条独立的遍历路径。
+      让它们<strong>都去取同一个目标</strong>（比如 UWorld 指针），对比结果。
+    </p>
+    <p>
+      两条路径算出来的值一致 → 这一级的可信度高。
+      不一致 → 至少有一条中间环节不可信，先别往下走。
+    </p>
+    <p>
+      这是<strong>唯一一个不需要外部信息就能判断可信度的方法</strong>，成本几乎为零。
+    </p>
+  </div>
+
+  <div class="test">
+    <h4>检验二 · 值合理性</h4>
+    <p>
+      读到的每一个指针，都应该能过一遍常识检查：
+    </p>
+    <div class="rubric" style="font-family:var(--mono);font-size:12.5px;background:var(--panel-2);padding:11px 14px;border-radius:3px;margin-top:10px;overflow-x:auto;color:#3d4a55">
+      指针非 0　　指针 8 字节对齐　　地址 &gt; 0x100000000（不是小数巧合）<br>
+      落在模块区间内，或落在已知的堆/栈区间
+    </div>
+    <p style="margin-top:10px">
+      四项全过，才继续往下跳。任何一项不过，立刻停下并记录<strong>是哪一级</strong>。
+    </p>
+  </div>
+
+  <div class="test">
+    <h4>检验三 · 时间稳定性</h4>
+    <p>
+      让读取循环连续跑 5 分钟，把每一级的地址记下来。
+    </p>
+    <p>
+      <strong>好的表现</strong>：链路中间几级是<strong>稳定不变</strong>的（对象没被回收就不该动），
+      只有叶子节点（坐标、血量）在变。
+    </p>
+    <p>
+      <strong>坏的表现</strong>：中间级的指针一直在跳。这说明你读的地址本身是错的，
+      只是每次都恰好是个能读的野值——这种情况最阴，因为不崩。
+    </p>
+  </div>
+</section>
+
+<section class="rise">
+  <h2><span class="num">第 5 节 · 改造顺序</span>按这个优先级动</h2>
+
+  <div class="todo">
+    <div class="todo-item">
+      <div class="pri p0">P0</div>
+      <div>
+        <h5>先给链路每一级加校验</h5>
+        <p>
+          这件事<strong>不需要任何新信息</strong>，纯代码改动，而且立刻见效：
+          从"读到一个野值"变成"明确告诉你第三级断了"。
+          在加特征码之前，这是性价比最高的一步。
+        </p>
+      </div>
+    </div>
+
+    <div class="todo-item">
+      <div class="pri p1">P1</div>
+      <div>
+        <h5>给三个全局地址做特征码</h5>
+        <p>
+          这才是真正解决"版本换代就得重来"的办法。做法是：反汇编游戏，
+          找到<strong>引用这三个全局变量的代码点</strong>，提取那段指令做特征码，
+          运行时拿命中地址反算出变量地址。
+        </p>
+        <p>
+          顺序上建议先做 <code>GWorld</code>——它的引用点最集中（世界 Tick 里到处在用），
+          最容易找到高唯一性的片段。
+        </p>
+      </div>
+    </div>
+
+    <div class="todo-item">
+      <div class="pri p2">P2</div>
+      <div>
+        <h5>特征码加"命中数"自检</h5>
+        <p>
+          搜完必须报告<strong>命中了几次</strong>。命中 0 次是失配，命中 2 次以上是特征码不合格，
+          只有恰好 1 次才算可用。没有这个检查，上面 P1 做的功可能白做。
+        </p>
+      </div>
+    </div>
+
+    <div class="todo-item">
+      <div class="pri p3">P3</div>
+      <div>
+        <h5>保留绝对地址作为备用路径</h5>
+        <p>
+          别急着把写死的地址删掉。让它和特征码<strong>并存</strong>：
+          两者结果一致 → 高可信；不一致 → 说明版本变了，特征码该重新提取。
+          这本身就是一条免费的交叉验证。
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="rise">
+  <h2><span class="num">第 6 节 · 一张速查表</span>看到数字时该问什么</h2>
+
+  <table style="width:100%;border-collapse:collapse;font-size:14.5px;margin:24px 0">
+    <thead>
+      <tr>
+        <th style="text-align:left;padding:12px 14px;border-bottom:1px solid var(--rule);font-family:var(--mono);font-size:11.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--ink-faint);font-weight:400">看到什么</th>
+        <th style="text-align:left;padding:12px 14px;border-bottom:1px solid var(--rule);font-family:var(--mono);font-size:11.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--ink-faint);font-weight:400">说明</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td style="padding:12px 14px;border-bottom:1px solid var(--rule);vertical-align:top"><code>0x11148B608</code> 这样的长地址</td>
+        <td style="padding:12px 14px;border-bottom:1px solid var(--rule);vertical-align:top">静态域地址。跨版本不可移植，每次更新都要重新 dump。</td>
+      </tr>
+      <tr>
+        <td style="padding:12px 14px;border-bottom:1px solid var(--rule);vertical-align:top"><code>0xB8</code>、<code>0xA0</code> 这样的小偏移</td>
+        <td style="padding:12px 14px;border-bottom:1px solid var(--rule);vertical-align:top">结构体头部成员。<strong>这是好偏移</strong>，不用担心它。</td>
+      </tr>
+      <tr>
+        <td style="padding:12px 14px;border-bottom:1px solid var(--rule);vertical-align:top"><code>0xB20</code>、<code>0x660</code> 这样的大偏移</td>
+        <td style="padding:12px 14px;border-bottom:1px solid var(--rule);vertical-align:top">跨了半个结构体。能用，但要知道它的失效概率比小偏移高。</td>
+      </tr>
+      <tr>
+        <td style="padding:12px 14px;border-bottom:1px solid var(--rule);vertical-align:top">一段指令字节</td>
+        <td style="padding:12px 14px;border-bottom:1px solid var(--rule);vertical-align:top">特征码。<strong>必须问：命中几次？通配符占多少？跨没跨函数？</strong></td>
+      </tr>
+      <tr>
+        <td style="padding:12px 14px;border-bottom:1px solid var(--rule);vertical-align:top">读到一个非零但明显不对的值</td>
+        <td style="padding:12px 14px;border-bottom:1px solid var(--rule);vertical-align:top">典型的"链断在中间"。不是崩溃，是野值。查 B3 那一项。</td>
+      </tr>
+      <tr>
+        <td style="padding:12px 14px;vertical-align:top">中间级指针每帧都在变</td>
+        <td style="padding:12px 14px;vertical-align:top">地址本身错了。正常对象在生命周期内地址不该动。</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<div class="final rise">
+  <h3>四句话收尾</h3>
+  <ol>
+    <li><strong>你的结构体偏移是好的那一类</strong>，别去动它。真正脆的是 <code>gObjects</code> / <code>gNames</code> / <code>gWorld</code> 这三个静态域地址——它们决定了整条链的起点。</li>
+    <li><strong>没有特征码，就没有跨版本能力。</strong>现在每次游戏更新都得重新 dump 一遍全量偏移，这是最大的时间成本，也是加特征码能省下的东西。</li>
+    <li><strong>加校验的收益比加特征码来得更快。</strong>校验不需要新信息、当天就能做完，而它会把"读到一个荒唐的值"变成"第三级断了"——排查时间从几小时变成几秒。</li>
+    <li><strong>两条独立路径互相对照，是免费的可信度检测。</strong>你已经有 <code>stepWorld</code> 和 <code>stepObjects</code> 了，让它们互证，比任何单向检查都可靠。</li>
+  </ol>
+</div>
+
+</div>
+
+<script>
+(function () {
+  var risers = document.querySelectorAll('.rise');
+  if ('IntersectionObserver' in window) {
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }
+      });
+    }, { rootMargin: '0px 0px -8% 0px', threshold: 0.06 });
+    risers.forEach(function (el) { io.observe(el); });
+  } else {
+    risers.forEach(function (el) { el.classList.add('in'); });
+  }
+})();
+</script>
+</body>
+</html>

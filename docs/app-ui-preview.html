@@ -1,0 +1,786 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Music · 进 App 界面预览</title>
+<style>
+  :root {
+    --bg: #0c0d10;
+    --ink: #e8eaef;
+    --muted: #8b90a0;
+    --phone-bg: #f2f2f7;
+    --accent: #007aff;
+    --green: #34c759;
+    --red: #ff3b30;
+    --card: #fbfaf7;
+    --violet: #6c63ff;
+    --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Microsoft YaHei", sans-serif;
+    --mono: "SF Mono", Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    padding: 24px 18px 40px;
+    line-height: 1.45;
+  }
+  .head {
+    max-width: 1200px;
+    margin: 0 auto 20px;
+  }
+  .head h1 { font-size: 18px; font-weight: 700; letter-spacing: -0.02em; }
+  .head p { margin-top: 6px; color: var(--muted); font-size: 13px; }
+  .controls {
+    margin-top: 12px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .controls button {
+    font-family: inherit;
+    font-size: 12.5px;
+    padding: 7px 12px;
+    border-radius: 999px;
+    border: 1px solid #2a2d36;
+    background: #16181e;
+    color: #c9cdd8;
+    cursor: pointer;
+  }
+  .controls button.on {
+    background: #2a3350;
+    border-color: #4a5a9a;
+    color: #dce6ff;
+  }
+
+  .stage {
+    max-width: 1200px;
+    margin: 0 auto;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 22px;
+    align-items: start;
+  }
+
+  .slot { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+  .slot-label {
+    font-size: 12px;
+    color: var(--muted);
+    letter-spacing: 0.04em;
+  }
+  .slot-label strong { color: #cfd5e4; font-weight: 600; }
+
+  /* iPhone frame */
+  .phone {
+    width: 280px;
+    height: 580px;
+    border-radius: 36px;
+    background: #1a1b20;
+    padding: 10px;
+    box-shadow:
+      0 0 0 2px #2c2e36,
+      0 24px 48px rgba(0,0,0,.55);
+    position: relative;
+  }
+  .phone-screen {
+    width: 100%;
+    height: 100%;
+    border-radius: 28px;
+    overflow: hidden;
+    position: relative;
+    background: var(--phone-bg);
+  }
+  .notch {
+    position: absolute;
+    top: 8px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 96px;
+    height: 26px;
+    background: #1a1b20;
+    border-radius: 20px;
+    z-index: 20;
+  }
+  .statusbar {
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 44px;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    padding: 0 18px 6px;
+    font-size: 11px;
+    font-weight: 600;
+    color: #111;
+    z-index: 15;
+  }
+  .home-ind {
+    position: absolute;
+    bottom: 7px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 110px;
+    height: 4px;
+    border-radius: 4px;
+    background: rgba(0,0,0,.22);
+    z-index: 15;
+  }
+
+  /* ========== 1. Loading ========== */
+  .loading-bg { background: #f5f5f7; }
+  .loading-brand {
+    position: absolute;
+    top: 58px; left: 0; right: 0;
+    text-align: center;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 6px;
+    color: rgba(60,60,67,.28);
+  }
+  .rose-wrap {
+    position: absolute;
+    top: 50%; left: 50%;
+    transform: translate(-50%,-50%);
+    width: 200px; height: 200px;
+  }
+  .rose-wrap svg { width: 100%; height: 100%; }
+  .rose-pct {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    pointer-events: none;
+  }
+  .rose-pct .num {
+    font-size: 36px;
+    font-weight: 600;
+    letter-spacing: -1px;
+    color: #1c1c1e;
+    font-variant-numeric: tabular-nums;
+  }
+  .rose-pct .lbl {
+    font-size: 11px;
+    letter-spacing: 2px;
+    color: rgba(60,60,67,.35);
+  }
+  .rose-pct.done .num { color: var(--green); }
+
+  /* ========== 2. Unlock ========== */
+  .unlock-bg { background: #f2f2f7; }
+  .unlock-center {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+  }
+  .lock-tile {
+    width: 56px; height: 56px;
+    border-radius: 16px;
+    background: rgba(120,120,128,.16);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .lock-tile svg { width: 24px; height: 24px; fill: rgba(60,60,67,.3); }
+  .unlock-center .need {
+    font-size: 15px;
+    font-weight: 500;
+    color: rgba(60,60,67,.55);
+  }
+  .dim {
+    position: absolute; inset: 0;
+    background: rgba(0,0,0,.32);
+  }
+  .sheet {
+    position: absolute;
+    left: 0; right: 0; bottom: 0;
+    background: #fff;
+    border-radius: 12px 12px 0 0;
+    padding: 8px 24px 28px;
+    box-shadow: 0 -8px 30px rgba(0,0,0,.12);
+  }
+  .sheet .grab {
+    width: 36px; height: 5px;
+    border-radius: 3px;
+    background: rgba(60,60,67,.18);
+    margin: 0 auto 16px;
+  }
+  .key-field {
+    height: 48px;
+    border-radius: 14px;
+    background: #f2f2f7;
+    border: 1.5px solid rgba(60,60,67,.12);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--mono);
+    font-size: 15px;
+    letter-spacing: 2px;
+    color: #1c1c1e;
+  }
+  .key-field .caret {
+    width: 2px; height: 18px;
+    background: var(--accent);
+    margin-left: 2px;
+    animation: blink 1s steps(1) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+  .continue-btn {
+    margin-top: 14px;
+    height: 50px;
+    border-radius: 14px;
+    background: var(--accent);
+    color: #fff;
+    font-size: 17px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .hint {
+    margin-top: 10px;
+    text-align: center;
+    font-size: 12px;
+    color: rgba(60,60,67,.3);
+    height: 16px;
+  }
+  .hint.ok { color: var(--green); }
+  .hint.err { color: var(--red); }
+
+  /* ========== 3. Control off ========== */
+  .ctl-bg {
+    background: linear-gradient(180deg, #f2f2f7 0%, #f2f2f7 100%);
+  }
+  .ctl {
+    position: absolute;
+    inset: 0;
+    padding: 52px 24px 36px;
+    display: flex;
+    flex-direction: column;
+  }
+  .ctl-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .ctl-brand {
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 4px;
+    color: rgba(60,60,67,.28);
+  }
+  .pill {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 10px;
+    border-radius: 999px;
+    background: rgba(120,120,128,.12);
+    font-size: 12px;
+    font-weight: 600;
+    color: rgba(60,60,67,.5);
+  }
+  .pill .dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: rgba(60,60,67,.25);
+  }
+  .pill.on {
+    background: rgba(52,199,89,.12);
+    color: var(--green);
+  }
+  .pill.on .dot { background: var(--green); }
+
+  .ring-wrap {
+    margin: 28px auto 20px;
+    width: 176px; height: 176px;
+    position: relative;
+  }
+  .ring-wrap svg { width: 100%; height: 100%; }
+  .ring-center {
+    position: absolute; inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+  }
+  .ring-center .st {
+    font-size: 15px;
+    font-weight: 600;
+    color: rgba(60,60,67,.28);
+  }
+  .ring-center .en {
+    font-size: 12px;
+    color: rgba(60,60,67,.45);
+  }
+  .ctl.on .ring-center .st { color: #1c1c1e; }
+  .ctl.on .ring-center .en { color: rgba(60,60,67,.55); }
+
+  .ctl-title {
+    text-align: center;
+    font-size: 28px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    color: #1c1c1e;
+  }
+  .ctl-sub {
+    text-align: center;
+    font-size: 14px;
+    color: rgba(60,60,67,.45);
+    margin-top: 4px;
+    margin-bottom: 24px;
+  }
+  .ctl.on .ctl-sub { color: rgba(28,28,30,.7); }
+
+  .power-row {
+    display: flex;
+    gap: 10px;
+    padding: 0 16px;
+  }
+  .pbtn {
+    flex: 1;
+    height: 56px;
+    border-radius: 16px;
+    font-size: 17px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .pbtn.off-state {
+    background: #fff;
+    color: rgba(60,60,67,.4);
+    border: 1.5px solid rgba(60,60,67,.12);
+  }
+  .pbtn.on-active {
+    background: var(--green);
+    color: #fff;
+    box-shadow: 0 8px 20px rgba(52,199,89,.28);
+  }
+  .pbtn.off-active {
+    background: #1c1c1e;
+    color: #fff;
+    box-shadow: 0 8px 20px rgba(0,0,0,.16);
+  }
+  .pbtn.off-inactive {
+    background: #fff;
+    color: rgba(60,60,67,.4);
+    border: 1.5px solid rgba(60,60,67,.12);
+  }
+
+  .meta-row {
+    margin-top: auto;
+    display: flex;
+    gap: 8px;
+  }
+  .meta {
+    flex: 1;
+    padding: 10px 4px;
+    border-radius: 12px;
+    background: #fff;
+    border: 0.5px solid rgba(60,60,67,.12);
+    text-align: center;
+  }
+  .meta .v {
+    font-size: 13px;
+    font-weight: 600;
+    color: #1c1c1e;
+  }
+  .meta .l {
+    font-size: 11px;
+    color: rgba(60,60,67,.4);
+    margin-top: 2px;
+  }
+
+  /* ========== 4. FangUI overlay ========== */
+  .overlay-bg {
+    background:
+      linear-gradient(180deg, rgba(200,205,215,.55), rgba(180,185,200,.45)),
+      #c8cdd7;
+  }
+  .fake-home {
+    position: absolute;
+    inset: 44px 16px 28px;
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 12px;
+    align-content: start;
+    opacity: .35;
+    pointer-events: none;
+  }
+  .fake-app {
+    aspect-ratio: 1;
+    border-radius: 14px;
+    background: rgba(255,255,255,.55);
+  }
+  .fangui-card {
+    position: absolute;
+    top: 50%; left: 50%;
+    transform: translate(-50%,-54%);
+    width: 210px;
+    height: 300px;
+    border-radius: 28px;
+    background:
+      radial-gradient(ellipse at 50% 30%, rgba(255,255,255,.75) 0%, rgba(255,255,255,0) 70%),
+      #fbfaf7;
+    box-shadow:
+      0 18px 40px rgba(26,26,46,.18),
+      0 0 0 0.5px rgba(0,0,0,.04);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  .fangui-body {
+    flex: 1;
+    padding: 18px 16px 8px;
+  }
+  .fangui-empty {
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: rgba(27,27,34,.25);
+    font-size: 12px;
+  }
+  .proc-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .proc-row {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: #1b1b22;
+    background: rgba(108,99,255,.08);
+    border: 0.5px solid rgba(108,99,255,.15);
+    border-radius: 8px;
+    padding: 6px 8px;
+  }
+  .proc-row .pid { color: var(--violet); font-weight: 600; }
+  .seg {
+    margin: 0 auto 16px;
+    display: flex;
+    background: rgba(27,27,34,.06);
+    border-radius: 10px;
+    padding: 3px;
+    gap: 2px;
+  }
+  .seg span {
+    flex: 1;
+    text-align: center;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 7px 0;
+    border-radius: 8px;
+    color: rgba(27,27,34,.4);
+  }
+  .seg span.on {
+    background: #fff;
+    color: var(--violet);
+    box-shadow: 0 1px 4px rgba(0,0,0,.08);
+  }
+  .diag {
+    position: absolute;
+    bottom: 22px; left: 0; right: 0;
+    text-align: center;
+    font-family: var(--mono);
+    font-size: 9px;
+    color: rgba(27,27,34,.35);
+  }
+
+  .note {
+    max-width: 1200px;
+    margin: 22px auto 0;
+    padding: 12px 14px;
+    border-radius: 10px;
+    background: #14161c;
+    border: 1px solid #262a34;
+    color: #9aa3b5;
+    font-size: 12.5px;
+    line-height: 1.6;
+  }
+  .note code {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: #c4ccff;
+    background: #1c2030;
+    padding: 1px 5px;
+    border-radius: 4px;
+  }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div class="head">
+  <h1>Music · 进 App 后长什么样</h1>
+  <p>按 <code style="font-family:var(--mono);color:#9aa">RootView / LoadingView / UnlockView / ControlView / FangUI</code> 源码还原的界面预览 · 未改项目代码</p>
+  <div class="controls">
+    <button type="button" data-show="all" class="on">全流程</button>
+    <button type="button" data-show="loading">① 加载</button>
+    <button type="button" data-show="unlock">② 卡密</button>
+    <button type="button" data-show="control-off">③ 控制台·未开</button>
+    <button type="button" data-show="control-on">④ 控制台·已开</button>
+    <button type="button" data-show="fangui">⑤ 悬浮面板</button>
+  </div>
+</div>
+
+<div class="stage">
+  <!-- 1 Loading -->
+  <div class="slot" data-slot="loading">
+    <div class="slot-label"><strong>① 加载</strong> · LoadingView</div>
+    <div class="phone">
+      <div class="notch"></div>
+      <div class="phone-screen loading-bg">
+        <div class="statusbar"><span>9:41</span><span>●●●  Wi-Fi  ▮</span></div>
+        <div class="loading-brand">Music</div>
+        <div class="rose-wrap">
+          <svg viewBox="0 0 100 100" aria-hidden="true">
+            <path id="roseTrack" fill="none" stroke="rgba(0,0,0,.06)" stroke-width="3.5" stroke-linecap="round"/>
+            <path id="roseFill" fill="none" stroke="#1c1c1e" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.55"/>
+          </svg>
+          <div class="rose-pct" id="loadingPct">
+            <div class="num">0</div>
+            <div class="lbl">Loading</div>
+          </div>
+        </div>
+        <div class="home-ind"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 2 Unlock -->
+  <div class="slot" data-slot="unlock">
+    <div class="slot-label"><strong>② 卡密</strong> · UnlockHostView</div>
+    <div class="phone">
+      <div class="notch"></div>
+      <div class="phone-screen unlock-bg">
+        <div class="statusbar"><span>9:41</span><span>●●●  Wi-Fi  ▮</span></div>
+        <div class="unlock-center">
+          <div class="lock-tile">
+            <svg viewBox="0 0 24 24"><path d="M17 9V7a5 5 0 0 0-10 0v2H5v12h14V9h-2zm-8-2a3 3 0 0 1 6 0v2H9V7z"/></svg>
+          </div>
+          <div class="need">需要验证</div>
+        </div>
+        <div class="dim"></div>
+        <div class="sheet">
+          <div class="grab"></div>
+          <div class="key-field"><span id="keyText">AETHER-2026</span><span class="caret"></span></div>
+          <div class="continue-btn">继续</div>
+          <div class="hint ok">验证成功</div>
+        </div>
+        <div class="home-ind"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 3 Control off -->
+  <div class="slot" data-slot="control-off">
+    <div class="slot-label"><strong>③ 控制台 · 未开</strong> · 默认进控制台</div>
+    <div class="phone">
+      <div class="notch"></div>
+      <div class="phone-screen ctl-bg">
+        <div class="statusbar"><span>9:41</span><span>●●●  Wi-Fi  ▮</span></div>
+        <div class="ctl">
+          <div class="ctl-top">
+            <div class="ctl-brand">Music</div>
+            <div class="pill"><span class="dot"></span>未运行</div>
+          </div>
+          <div class="ring-wrap">
+            <svg viewBox="0 0 100 100">
+              <circle cx="50" cy="50" r="44" fill="none" stroke="rgba(0,0,0,.06)" stroke-width="6"/>
+              <circle cx="50" cy="50" r="44" fill="none" stroke="rgba(60,60,67,.25)" stroke-width="6"
+                      stroke-linecap="round" stroke-dasharray="0 276"/>
+            </svg>
+            <div class="ring-center">
+              <div class="st">已停止</div>
+              <div class="en">Off</div>
+            </div>
+          </div>
+          <div class="ctl-title">控制台</div>
+          <div class="ctl-sub">服务已关闭</div>
+          <div class="power-row">
+            <div class="pbtn off-state">开启</div>
+            <div class="pbtn off-inactive">关闭</div>
+          </div>
+          <div class="meta-row">
+            <div class="meta"><div class="v">Off</div><div class="l">状态</div></div>
+            <div class="meta"><div class="v">Premium</div><div class="l">权限</div></div>
+            <div class="meta"><div class="v">—</div><div class="l">本次</div></div>
+          </div>
+        </div>
+        <div class="home-ind"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 4 Control on -->
+  <div class="slot" data-slot="control-on">
+    <div class="slot-label"><strong>④ 控制台 · 已开</strong> · isPoweredOn = true</div>
+    <div class="phone">
+      <div class="notch"></div>
+      <div class="phone-screen ctl-bg" style="background:linear-gradient(180deg,rgba(52,199,89,.08) 0%,#f2f2f7 55%)">
+        <div class="statusbar"><span>9:41</span><span>●●●  Wi-Fi  ▮</span></div>
+        <div class="ctl on">
+          <div class="ctl-top">
+            <div class="ctl-brand">Music</div>
+            <div class="pill on"><span class="dot"></span>已激活</div>
+          </div>
+          <div class="ring-wrap">
+            <svg viewBox="0 0 100 100">
+              <circle cx="50" cy="50" r="44" fill="none" stroke="rgba(0,0,0,.06)" stroke-width="6"/>
+              <circle cx="50" cy="50" r="44" fill="none" stroke="#34c759" stroke-width="6"
+                      stroke-linecap="round" stroke-dasharray="276 276"
+                      transform="rotate(-90 50 50)"
+                      style="filter:drop-shadow(0 0 6px rgba(52,199,89,.45))"/>
+              <circle cx="50" cy="50" r="38" fill="#fff" stroke="rgba(0,0,0,.05)" stroke-width="0.5"/>
+              <circle cx="50" cy="50" r="38" fill="none" stroke="rgba(52,199,89,.08)" stroke-width="6"/>
+            </svg>
+            <div class="ring-center">
+              <div class="st">运行中</div>
+              <div class="en">On</div>
+            </div>
+          </div>
+          <div class="ctl-title">控制台</div>
+          <div class="ctl-sub">服务状态正常</div>
+          <div class="power-row">
+            <div class="pbtn on-active">开启</div>
+            <div class="pbtn off-inactive">关闭</div>
+          </div>
+          <div class="meta-row">
+            <div class="meta"><div class="v">On</div><div class="l">状态</div></div>
+            <div class="meta"><div class="v">Premium</div><div class="l">权限</div></div>
+            <div class="meta"><div class="v">12s</div><div class="l">本次</div></div>
+          </div>
+        </div>
+        <div class="home-ind"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 5 FangUI -->
+  <div class="slot" data-slot="fangui">
+    <div class="slot-label"><strong>⑤ 悬浮面板</strong> · FangUI · 开启后 / 音量+</div>
+    <div class="phone">
+      <div class="notch"></div>
+      <div class="phone-screen overlay-bg">
+        <div class="statusbar"><span>9:41</span><span>●●●  Wi-Fi  ▮</span></div>
+        <div class="fake-home">
+          <div class="fake-app"></div><div class="fake-app"></div><div class="fake-app"></div>
+          <div class="fake-app"></div><div class="fake-app"></div><div class="fake-app"></div>
+        </div>
+        <div class="fangui-card">
+          <div class="fangui-body" id="fanguiBody">
+            <div class="fangui-empty" id="pageEmpty">透视 / 追踪页暂为空</div>
+            <div class="proc-list hidden" id="pageDebug">
+              <div class="proc-row"><span class="pid">pid 1842</span> · 游戏进程</div>
+              <div class="proc-row"><span class="pid">pid 902</span> · SpringBoard</div>
+              <div class="proc-row"><span class="pid">pid 2211</span> · 未识别</div>
+              <div class="proc-row">符号 step · 基址就绪</div>
+            </div>
+          </div>
+          <div class="seg" id="fanguiSeg">
+            <span data-i="0">透视</span>
+            <span data-i="1">追踪</span>
+            <span data-i="2" class="on">设置</span>
+          </div>
+        </div>
+        <div class="diag">win / card / tf · 米白卡片 · 圆角 28</div>
+        <div class="home-ind"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="note">
+  真实流程：<code>loading 2.8s</code> → 卡密 sheet（demo <code>AETHER-2026</code> / ≥8 位）→ 控制台默认 <b>未开</b>。
+  点「开启」或音量+ 才弹出 FangUI 悬浮卡片；音量− 只收起菜单，服务可继续跑。
+  当前面板实现：圆角 28 米白卡片 + 底栏分段 <code>透视 / 追踪 / 设置</code>，仅「设置」挂进程调试页。
+</div>
+
+<script>
+(function () {
+  // Rose curve: x=7cos(t)-3s*cos(9t), y=7sin(t)-3s*sin(9t), scale*3.9, center 50
+  function rosePath(s) {
+    var pts = [];
+    for (var i = 0; i <= 480; i++) {
+      var t = i / 480 * Math.PI * 2;
+      var x = 7 * Math.cos(t) - 3 * s * Math.cos(9 * t);
+      var y = 7 * Math.sin(t) - 3 * s * Math.sin(9 * t);
+      pts.push((i === 0 ? "M" : "L") + (50 + x * 3.9).toFixed(2) + "," + (50 + y * 3.9).toFixed(2));
+    }
+    return pts.join("");
+  }
+  var track = document.getElementById("roseTrack");
+  var fill = document.getElementById("roseFill");
+  track.setAttribute("d", rosePath(0.78));
+  var full = rosePath(0.78);
+  fill.setAttribute("d", full);
+
+  // Simulate loading progress 0→100
+  var pctEl = document.getElementById("loadingPct");
+  var numEl = pctEl.querySelector(".num");
+  var lblEl = pctEl.querySelector(".lbl");
+  var start = Date.now();
+  var dur = 2800;
+  function tick() {
+    var t = Math.min((Date.now() - start) / dur, 1);
+    var eased = 1 - Math.pow(1 - t, 2.4);
+    var p = Math.round(eased * 100);
+    numEl.textContent = p;
+    // partial stroke via dasharray on a long path — approximate by opacity
+    fill.style.opacity = String(0.1 + eased * 0.35);
+    var s = 0.52 + ((Math.sin(Date.now() / 3800 * Math.PI * 2 + 0.55) + 1) / 2) * 0.48;
+    fill.setAttribute("d", rosePath(s));
+    if (t < 1) requestAnimationFrame(tick);
+    else {
+      pctEl.classList.add("done");
+      numEl.textContent = "100";
+      lblEl.textContent = "";
+      fill.style.stroke = "#34c759";
+      fill.style.opacity = "0.45";
+    }
+  }
+  requestAnimationFrame(tick);
+
+  // Screen filter buttons
+  var btns = document.querySelectorAll(".controls button");
+  var slots = document.querySelectorAll(".slot");
+  btns.forEach(function (b) {
+    b.addEventListener("click", function () {
+      btns.forEach(function (x) { x.classList.remove("on"); });
+      b.classList.add("on");
+      var key = b.getAttribute("data-show");
+      slots.forEach(function (s) {
+        var id = s.getAttribute("data-slot");
+        var show = key === "all" || id === key;
+        s.classList.toggle("hidden", !show);
+      });
+    });
+  });
+
+  // FangUI tabs
+  var seg = document.getElementById("fanguiSeg");
+  var empty = document.getElementById("pageEmpty");
+  var debug = document.getElementById("pageDebug");
+  seg.querySelectorAll("span").forEach(function (sp) {
+    sp.addEventListener("click", function () {
+      seg.querySelectorAll("span").forEach(function (x) { x.classList.remove("on"); });
+      sp.classList.add("on");
+      var i = sp.getAttribute("data-i");
+      var isDebug = i === "2";
+      empty.classList.toggle("hidden", isDebug);
+      debug.classList.toggle("hidden", !isDebug);
+    });
+  });
+})();
+</script>
+</body>
+</html>
