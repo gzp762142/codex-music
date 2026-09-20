@@ -20,6 +20,8 @@
 
 #import <Foundation/Foundation.h>
 #include <sys/sysctl.h>
+/* 自检里用 _mh_execute_header 拿本进程 Mach-O 头，它定义在 <mach-o/ldsyms.h>。 */
+#include <mach-o/ldsyms.h>
 
 #include "KernelMemory.h"
 #include "libkfd.h"
@@ -821,6 +823,16 @@ uint64_t km_proc_for_pid(int32_t pid)
 bool km_translate(int32_t pid, uint64_t uaddr, uint64_t *pa_out)
 {
     if (!g_linear_map_valid || pa_out == NULL) {
+        return false;
+    }
+
+    /*
+     * dynamic_info(...) 展开成 kern_versions[kfd->info.env.vid].xxx，
+     * 所以用到它的函数必须先有一个叫 `kfd` 的局部变量 —— 宏是靠名字
+     * 捕获的，不是参数。这里补上，否则编译期就是「未声明标识符 kfd」。
+     */
+    struct kfd *kfd = (struct kfd *)g_handle;
+    if (kfd == NULL) {
         return false;
     }
 
