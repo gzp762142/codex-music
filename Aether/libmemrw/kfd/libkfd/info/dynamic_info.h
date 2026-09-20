@@ -103,6 +103,46 @@ const struct dynamic_info kern_versions[] = {
         .kernelcache__ptov_table = 0,
         .kernelcache__vn_kqfilter = 0,
     },
+    /*
+     * iOS 16.4.1 - Darwin 22.4.0
+     *
+     * 偏移取自 Lrdsnow/kfd_offsets 的 M1/iOS_16.4.1 表，与上面 22.5.0 那条逐字段
+     * 核对过：proc__object_size 0x730、task__map 0x28、proc__p_pid 0x60、
+     * proc__p_fd__fd_ofiles 0xf8、proc__p_list__le_prev 0x0008 完全一致 ——
+     * 16.4 与 16.5 之间这些结构没动。IOSurface 布局同属 iOS 16 世代，也一致。
+     *
+     * 四份 16.4.1 表（A14/A15/A16/M1）的 xnu 构建号都是 8796.102.5~1，只差
+     * RELEASE_ARM64_T8101/T8110/T8112/T8120 这个 SoC 后缀。而 info_init() 只比
+     * 前 29 字符，所以一条就覆盖全部芯片。
+     *
+     * kernelcache__* 按本表开头的约定留 0：本工程靠扫描找内核基址，不读 perf 的
+     * 静态地址表。
+     */
+    {
+        // iOS 16.4.1 - Darwin 22.4.0
+        .kern_version = "Darwin Kernel Version 22.4.0: Mon Mar  6 20:42:59 PST 2023; root:xnu-8796.102.5~1/RELEASE_ARM64_T8101",
+        .kread_kqueue_workloop_ctl_supported = false,
+        .perf_supported = true,
+        .proc__p_list__le_prev = 0x0008,
+        .proc__p_pid = 0x0060,
+        .proc__p_fd__fd_ofiles = 0x00f8,
+        .proc__object_size = 0x0730,
+        .task__map = 0x0028,
+        .thread__thread_id = 0,
+        .ios__IndexedTimestampPtr = 0x360,
+        .ios__AllocSize = 0xac,
+        .ios__PixelFormat = 0xa4,
+        .ios__UseCountPtr = 0xc0,
+        .ios__ReadDisplacement = 0x14,
+        .kernelcache__cdevsw = 0,
+        .kernelcache__gPhysBase = 0,
+        .kernelcache__gPhysSize = 0,
+        .kernelcache__gVirtBase = 0,
+        .kernelcache__perfmon_dev_open = 0,
+        .kernelcache__perfmon_devices = 0,
+        .kernelcache__ptov_table = 0,
+        .kernelcache__vn_kqfilter = 0,
+    },
     // iOS 16.5 - iPhone 14 Pro Max
     {
         .kern_version = "Darwin Kernel Version 22.5.0: Mon Apr 24 21:09:28 PDT 2023; root:xnu-8796.122.4~1/RELEASE_ARM64_T8120",
