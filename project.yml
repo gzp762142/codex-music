@@ -21,6 +21,12 @@ targets:
       - path: AppIcons
         type: folder
         buildPhase: resources
+    # IOKit is required by the kfd IOSurface backend: IOSurface_shared.h calls
+    # IOServiceOpen / IOServiceMatching / IOServiceGetMatchingService /
+    # IOConnectCallMethod and reads kIOMasterPortDefault. Without this the
+    # objects compile but the link fails on those five symbols.
+    dependencies:
+      - sdk: IOKit.framework
     settings:
       base:
         PRODUCT_NAME: Music
