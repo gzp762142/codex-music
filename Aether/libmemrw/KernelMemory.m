@@ -153,10 +153,36 @@ bool km_init(const char **err)
     NSLog(@"[KernelMemory] kern.version = %@", kernVersion ?: @"(unreadable)");
 
     if (!km_version_is_listed(kernVersion)) {
-        NSLog(@"[KernelMemory] no version table entry for this kernel");
+        // 把 Darwin 主次号单独提出来放前面 —— 面板一行装不下整个 kern.version，
+        // 尾部会被截断，而「哪个版本没覆盖」正是这一步唯一有用的信息。
+        NSString *shortVer = @"(unreadable)";
+        if (kernVersion != nil) {
+            NSRange m = [kernVersion rangeOfString:@"Darwin Kernel Version "];
+            if (m.location != NSNotFound) {
+                NSString *rest = [kernVersion substringFromIndex:NSMaxRange(m)];
+                NSMutableString *num = [NSMutableString string];
+                for (NSUInteger i = 0; i < rest.length; i++) {
+                    unichar ch = [rest characterAtIndex:i];
+                    if ((ch >= '0' && ch <= '9') || ch == '.') {
+                        [num appendFormat:@"%C", ch];
+                    } else {
+                        break;
+                    }
+                }
+                if (num.length > 0) {
+                    shortVer = [num copy];
+                }
+            } else {
+                shortVer = [kernVersion substringToIndex:MIN((NSUInteger)29, kernVersion.length)];
+            }
+        }
+        NSLog(@"[KernelMemory] version not listed: %@", shortVer);
         if (err) {
-            *err = "this kernel version is not in kern_versions[] "
-                   "(libkfd/info/dynamic_info.h)";
+            static char errBuf[192];
+            snprintf(errBuf, sizeof(errBuf),
+                     "Darwin %s 不在 kern_versions[] 里（见 libkfd/info/dynamic_info.h）",
+                     shortVer.UTF8String);
+            *err = errBuf;
         }
         return false;
     }
