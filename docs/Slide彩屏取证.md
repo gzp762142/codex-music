@@ -286,7 +286,68 @@ genuine 内核映像范围内（该范围可从 panic 日志取得；上机时�
 
 ---
 
-## 七、这份报告的证据在哪
+## 七、样本未确证三题的结果（2026-09-22 补，独立取证 + 复核）
+
+来源：`D:\工作区\_Aether_rev\_rev\样本未确证\`（`报告_未确证三题.md` +
+`verify_all.py`，一键复现 `python verify_all.py` → 32 ok / 0 bad）。
+A/B 两条我另做了独立取证（读原始指令字与 `bl` 目标），结论与它一致。
+
+### 1. 数据面（原先"未解"）—— 已确证
+
+`0x100f76da4` 是 kread/kwrite 的**分段搬运器**。那组没接上的偏移属于
+`[x19+0x3e0]` 指向的 0x80 字节描述符，里面是**两张 5 条目的「窗口内 16KB 页地址 +
+长度」表**（读路径 `0x08/0x18/0x28/0x38/0x48`，写路径 `0x10/0x20/0x30/0x40/0x50`）。
+两个消费端就是那两次 `vm_copy`（`0x100f770f0` 读、`0x100f77154` 写）。
+
+### 2. `hw.memsize` 的角色 —— 已确证，且**推翻了此前的一个判断**
+
+`hw.memsize >> 14`（`0x100f84c50`，我独立核对：`0xd34efd15` 的 imms=0x2e → 移 14）
+**既不是 PUAFF 占页压力上界，也不是物理内存遍历边界**。我独立扫了循环体
+（`0x100f84bc0..0x100f84d90`）的全部 `bl`，只有两个目标：
+
+```
+0x100f84c44  bl 0x1010b15fc   ← sysctlbyname（hw.memsize 取值）
+0x100f84d00  bl 0x1010b16d4   ← vm_copy
+```
+
+**没有 `mach_memory_object_memory_entry_64`、没有 `vm_map`、没有 `mlock`** ——
+所以它不是占页压力；循环体唯一的内存动作是一次 `vm_copy`，紧接着对
+`[x19+0x3d8]` 做**哨兵字符串比较**（游标 `0x100f84d6c add x26,x26,x21` 推进）。
+即：**这是一个探页循环，按 16KB 页粒度找带内部哨兵的那一页。**
+
+顺带一条值得记的取证经验：那句哨兵 `p0up0u was here` 在这个位置**以立即数折在指令里**
+（我逐条解过 `movz/movk`，`0x100f86cd0..` 拼出 `p0up0u w` / `as here\0`），
+所以**明文 grep 永远搜不到它**。
+
+`[x19+0x3d0]` 页数的唯一写入点是 `0x100f79f1c str x1,[x0,#0x3d0]`（函数第 2 参数），
+紧跟 `calloc(页数×8)` 落到 `[x19+0x3d8]` —— 数据来源是**上层参数**，非常量、
+也非由 `hw.memsize` 推出。
+
+### 3. 跨进程访问权 —— 已确证，且边界明确
+
+样本**只对自己有访问权**：`task_for_pid` / `task_name_for_pid` / `proc_listpids` /
+`proc_pidinfo` / `pid_for_task` / `mach_vm_read` / `mach_vm_write` 等既不在具名导入里，
+字面量也不在 `__LINKEDIT` 符号串与 `__TEXT,__text` 全段（lazy bind 必须留符号名，
+所以「缺字符串」比「搜不到」强）；唯一任务端口全局 `0x101b68468` 全 `__text`
+**54 处 load、0 处 store**。
+
+**能确证的**：这份二进制里读/写原语的被操作对象**必然是本进程地址空间**；
+对某个外部 App 的数据的访问权，**不可能由它自己取得**——必须由把代码放进那个进程的
+宿主提供。**不能确证的**是目标数据具体属于谁：二进制里没有任何读开机时间、进程列表、
+目标 bundle id 的痕迹，它是库形态。
+
+> 对 Aether 的意义：这条与"样本是注入式/由宿主送进去"互为印证。Aether 是独立进程的
+> 悬浮窗，拿不到这一层，所以它只能走自己那条路——定位（页表遍历/`km_pte_for`）
+> 加 physrw 写 PTE，而不能照抄样本"直接读自己地址空间"的形态。
+
+### 该路明确未证实的（不等于证否）
+
+循环内 `vm_copy` 的 `x1/x2/x3` 相对增量未全解出；`0x100f76da4` 再上层的业务调用方未追；
+`0x101b68468` 的初始化写入点未定位；`0x101cbd478` 处 0x60 字节 `__data` 密文未解出；
+`[x21+0x38..0x50]` 里 `x8` 的绝对数值依赖运行期 `vm_region_64` 输出，`region` 是哪一段解不了。
+
+
+## 八、这份报告的证据在哪
 
 - panic 全文：`C:\Users\34698\.dsh\attachments\v1\files\6f\…\panic-full-2026-09-22-033638.000(1).ips`
   - `panicString` 字段：PC/LR/`esr`/`far`、四个基址与两个 slide、Zone 图、Panicked task/thread、完整 backtrace；
@@ -294,4 +355,6 @@ genuine 内核映像范围内（该范围可从 panic 日志取得；上机时�
   - `processByPid["371"]["threadById"]["6570"]`：崩溃线程，`dispatch_queue_label` 在这里。
 - 被验证的代码：`Aether/libmemrw/KernelSlide.m`（`519-544` 自检、`546-598` 求 slide、`51` 常量）、
   `Aether/FangUI/UI/DebugProcView.swift:1024-1047`（Slide 按钮走 AutoTracker）。
+- 链接基址的旁证：`Aether/libxpf/xpf/common.c:187`（上游自己拿 `0xfffffe0007004000` 判机型）。
+- 样本未确证三题：`D:\工作区\_Aether_rev\_rev\样本未确证\`（`报告_未确证三题.md` + `verify_all.py`）。
 - 既有交接：`docs/physrw改造交接.md`、`docs/当前任务.md`。
