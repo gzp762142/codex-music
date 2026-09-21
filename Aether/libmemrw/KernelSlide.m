@@ -1115,21 +1115,22 @@ static bool slide_read_ptov_table(uint64_t slide, km_slide_ptov_entry *out,
         }
 
         /*
-         * 逐字节段：每项 24 字节，按 b0..b23 摆开。字段边界与端序一眼可判。
-         * 末项之后再多读一项的位置，用来看"表结束"落在哪里（len==0 的边界）。
+         * 逐字节段：**每行只放 8 字节**，并在行首标出它在表内的绝对偏移。
+         *
+         * 为什么改排版：上一版把 24 字节的项按 16 字节排了行，字段边界被排版本身
+         * 切错，从面板抄下来的数字就对不上号 —— 观测格式不能让观察者做错题。
+         * 8 字节一行既不会在字段中间断开，也对着 64 位机器字的自然边界。
          */
-        uint8_t bytes[KM_SLIDE_PTOV_COUNT * 24 + 24] = {};
+        uint8_t bytes[KM_SLIDE_PTOV_COUNT * 24] = {};
         const size_t byteCount = sizeof(bytes);
         if (slide_read_bulk(tableAddr, bytes, byteCount)) {
-            const size_t itemBytes = 24;
-            text_append(t, "  [hex] 按 %zu 字节/项逐字节（共 %zu 字节）：\n",
-                        itemBytes, byteCount);
-            for (size_t i = 0; i + itemBytes <= byteCount; i += itemBytes) {
-                text_append(t, "    item%zu:", i / itemBytes);
-                for (size_t k = 0; k < itemBytes; k++) {
-                    text_append(t, " %02x", bytes[i + k]);
-                }
-                text_append(t, "\n");
+            text_append(t, "  [hex] 表内偏移 + 每行 8 字节（共 %zu 字节 = %llu 项）：\n",
+                        byteCount, (unsigned long long)(byteCount / 24));
+            for (size_t i = 0; i + 8 <= byteCount; i += 8) {
+                text_append(t, "    +%#05zx: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                            i,
+                            bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3],
+                            bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]);
             }
         } else {
             text_append(t, "  [hex] 逐字节段读取失败\n");
