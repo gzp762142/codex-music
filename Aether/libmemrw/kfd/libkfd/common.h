@@ -9,6 +9,7 @@
 #include <mach/mach.h>
 #include <pthread.h>
 #include <semaphore.h>
+#include <setjmp.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -18,6 +19,27 @@
 #include <sys/syscall.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
+
+/*
+ * 失败回退钩子。
+ *
+ * 上游 kfd 的 assert 在失败时 sleep(30) 后 exit(1)，对长驻 app 是致命的：
+ * 一次 PUAFF 没落地就把整个进程带走，而且 next launch 还会撞上残留的
+ * posix semaphore。宿主（App）可以注册一个 longjmp 处理器，把「进程猝死」
+ * 降级成「kopen 返回 0、应用自己决定怎么办」。
+ *
+ * 记录失败现场的字段由注册方读取，用于诊断具体是哪一步断言崩的。
+ */
+typedef void (*kfd_assert_handler_t)(void);
+
+struct kfd_assert_site {
+    const char *file;
+    int line;
+    const char *cond;
+};
+
+extern kfd_assert_handler_t kfd_assert_handler;
+extern struct kfd_assert_site kfd_assert_last;
 
 #define pages(number_of_pages) ((number_of_pages) * (ARM_PGBYTES))
 
@@ -119,6 +141,14 @@ typedef uintptr_t usize;
         if (!(condition)) {                                             \
             print_failure("assertion failed: (%s)", #condition);        \
             print_failure("file: %s, line: %d", __FILE__, __LINE__);    \
+            kfd_assert_last.file = __FILE__;                            \
+            kfd_assert_last.line = __LINE__;                            \
+            kfd_assert_last.cond = #condition;                          \
+            if (kfd_assert_handler) {                                   \
+                /* 宿主接管：通常 longjmp 回 kopen 的调用点 */          \
+                kfd_assert_handler();                                   \
+            }                                                           \
+            /* 未注册处理器时保持上游行为 */                            \
             print_failure("... sleep(30) before exit(1) ...");          \
             sleep(30);                                                  \
             exit(1);                                                    \

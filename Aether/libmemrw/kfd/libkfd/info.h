@@ -104,7 +104,16 @@ void info_init(struct kfd* kfd)
     const u64 number_of_kern_versions = sizeof(kern_versions) / sizeof(kern_versions[0]);
     for (u64 i = 0; i < number_of_kern_versions; i++) {
         const char* current_kern_version = kern_versions[i].kern_version;
-        if (!memcmp(kern_version, current_kern_version, kfd_version_prefix_length)) {
+
+        /*
+         * 用 strncmp 而不是 memcmp。
+         *
+         * 表里存在比 prefix 短的占位项（macOS 那几条的 kern_version 字面量只有
+         * 5 字节："todo"），memcmp 会无条件读满 29 字节 —— 越过字面量末尾去读
+         * 相邻常量。strncmp 遇 NUL 即停，对「表项短于 prefix」和「表项长于
+         * prefix、前缀相同」两种情形给出与原实现一致的匹配结果，只是不再越界。
+         */
+        if (!strncmp(kern_version, current_kern_version, kfd_version_prefix_length)) {
             kfd->info.env.vid = i;
             print_u64(kfd->info.env.vid);
             print_message("matched version table entry: %s", current_kern_version);

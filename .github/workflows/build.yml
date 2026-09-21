@@ -3,11 +3,30 @@ name: Build tipa
 on:
   push:
     branches: [main, master]
+    # 只在会真正影响产物的文件变动时触发。
+    # 这是省钱手段：macOS runner 按 10 倍计费（私有库 2000 分钟/月 ≈ 200 分钟
+    # macOS 时间 ≈ 40 次编译），改文档/分析记录不该吃掉额度。
+    paths:
+      - 'Aether/**'
+      - 'AppIcons/**'
+      - 'Assets.xcassets/**'
+      - 'project.yml'
+      - 'Info.plist'
+      - 'Music.entitlements'
+      - 'MusicIdentity.xcconfig'
+      - '.github/workflows/build.yml'
   workflow_dispatch:
+
+# 连续 push 时取消上一个还没跑完的流程 —— 避免为同一份代码排队烧两次额度。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: macos-14
+    # 卡死的流程会一直占额度，给个上限。
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
