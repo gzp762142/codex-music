@@ -60,13 +60,35 @@ final class MemoryProbe {
     private static let procPidPathFn = symbol("proc_pidpath", as: ProcPidPathFn.self)
     private static let vmDeallocateFn = symbol("mach_vm_deallocate", as: VmDeallocateFn.self)
 
+    /// `mach_vm_allocate` —— 建窗的第一步。
+    ///
+    /// 样本 @0x100f75738 走的是内联 trap thunk（`bl 0x100fa2c54`，x16 = -0xa，
+    /// 见 `_rev/d_A.txt` 的注释），这里用 libSystem 导出的同名函数 ——
+    /// 两者落到同一条 trap，没必要自己拼 trap 号。
+    ///
+    /// flags 是**值语义**：样本传的是 9，那个 9 是什么意思见 buildWindow 里的说明
+    /// （不是注释里常见的那句"ANYWHERE|OVERWRITE"）。
+    private typealias MachVmAllocateFn = @convention(c) (
+        MachPort,                            // target_task
+        UnsafeMutablePointer<UInt64>,        // *address（出参，也是入参）
+        UInt64,                              // size（必须是页的整数倍）
+        Int32                                // flags
+    ) -> KernReturn
+
+    private static let machVmAllocateFn = symbol("mach_vm_allocate", as: MachVmAllocateFn.self)
+
 
     /// 符号自检。读取路径已切到内核，这里只关心仍在用的 Mach 符号。
+    ///
+    /// `vm_alloc` / `mlock` 两项是为**窗口层**加的：窗口建不起来时第一件事就是看这四个
+    /// 符号里缺了哪个 —— 缺符号和调用失败是两种完全不同的病，报告里必须能分开。
     static var symbolSummary: String {
         let a = vmRegionRecurseFn != nil ? "vm_region=OK" : "vm_region=nil"
         let b = procRegionFileNameFn != nil ? "regionfile=OK" : "regionfile=nil"
         let c = vmDeallocateFn != nil ? "vm_dealloc=OK" : "vm_dealloc=nil"
-        return "\(a) \(b) \(c)"
+        let d = machVmAllocateFn != nil ? "vm_alloc=OK" : "vm_alloc=nil"
+        let e = mlockFn != nil ? "mlock=OK" : "mlock=nil"
+        return "\(a) \(b) \(c) \(d) \(e)"
     }
 
     /// 把 kern_return_t 翻成人和自己能读懂的话。
@@ -250,12 +272,18 @@ final class MemoryProbe {
 
     /// 把一块刚建立的共享映射压到只读，**失败清理收在函数内部**。
     ///
+    /// **第一步没有调用者**（跨进程映射已停用，见 mapRange 的注释）—— 这不是漏了，
+    /// 是它服务的那个场景（把游戏页映射进本进程）要等第二步接回目标 task port。
+    /// 留着是因为它把"失败即丢弃、绝不放行"这条约束收在了一处，
+    /// 第二步接回来时直接用，不要再写第二份。
+    ///
     /// `copy = FALSE` 的共享映射默认带写权限，不降权就等于握着一个能改游戏内存的窗口。
     /// 清理必须和 protect 写在同一处 —— 分成两份迟早漂移，而那条约束
     /// （失败即丢弃、绝不放行）只允许有一个实现。
     ///
     /// `set_maximum = 1` 是刻意的：只降 current 的话「上限」还留着写权限，
     /// 之后一句 `mach_vm_protect` 就能把 W 提回来。把上限本身压掉，写权限才真拿不回来。
+    /// （窗口层收尾压只读用的是同一条取舍，见 buildWindowLocked 的 ⑧。）
     ///
     /// 符号缺失时可选链给出 nil，`nil == KERN_SUCCESS` 为 false，走同一条失败路径。
     private static func downgradeToReadOnly(_ target: UInt64, total: UInt64,
@@ -320,66 +348,39 @@ final class MemoryProbe {
         }
         mappedRanges.removeAll()
         rangesSorted = true
+        // 窗口也在这里释放。**释放落点只能有一个** —— 分散到各处迟早漏掉一条入口
+        // （游戏退出 / pid 变化 / 服务停止），而漏掉的就是一块再也找不回来的本进程映射。
+        //
+        // 代价是：`bind(pid:)` 在 pid 变化时也会把窗口拆掉（窗口本来与 pid 无关）。
+        // 收益是永远不会漏释放。第一步的窗口是**按需重建**的（点一次建一次），
+        // 所以这个取舍选"可能多拆一次"的反面 —— 见窗口层 teardownWindow 的注释。
+        _ = teardownWindow()
     }
 
     private static let vmFlagsAnywhere: Int32 = 0x0001
 
-    /// 把游戏的一段内存**映射进我们自己的地址空间**。
+    /// 把游戏的一段内存**映射进我们自己的地址空间**（`vm_remap`, copy = FALSE）——
+    /// **第一步不启用，只留接入点。**
     ///
-    /// 这是样本（Music）用的原语，也是我们必须换过去的那一步：
+    /// 这一段原来是对本进程做 remap：`src_task` 与 `target_task` 都传 `mach_task_self_`，
+    /// 而 `srcAddress` 传的是**游戏地址**。那个组合只有两种结局，两种都不该留着：
     ///
-    ///   `mach_vm_read`  每次都要进内核、抢游戏 vm_map 的**读锁**、再拷一份出来。
-    ///   `vm_remap` 只在**建立映射**时进一次内核，之后读数据就是普通内存访问
-    ///                   —— 零内核调用、零锁、零拷贝。
+    ///   · 游戏地址在本进程没有映射 → `KERN_INVALID_ADDRESS`：恒失败，白跑一次内核往返；
+    ///   · 游戏地址**恰好**落在本进程某个映射里 → 成功，并且把**我们自己的内存**
+    ///     登记成「游戏地址 → 本地地址」。之后 `readSmart` 命中它，拿我们自己的数据
+    ///     当游戏数据用 —— 不崩、不报错，只是全是错的。静默的错数据比崩溃贵得多。
     ///
-    /// 游戏的 vm_map 锁是读写互斥的：它主线程每帧写坐标拿写锁，我们每读一次拿一次读锁，
-    /// 两者不能同时进行。映射建立之后我们不再碰它的 map，读的是自己的页表。
+    /// 真正的跨进程映射缺一个我们没有的东西：**目标进程的 task port**。
+    /// 样本里它是 `__DATA_CONST,__got+0x468`（54 个函数共用，包括全部窗口函数），
+    /// 由外挂自己拿到后一直持有。本工程在内核路径下不产生 port（见 attachPort 的注释），
+    /// 所以这条路要等**第二步**和「窗口页指向目标物理页」一起接回来 —— 接的时候
+    /// `downgradeToReadOnly` 是现成的（它还在，只是第一步暂时没有调用者）。
     ///
-    /// `copy = FALSE` 是**共享**映射：架子上放的是原书，游戏之后写的每个字都看得见。
-    /// 反过来 `copy = TRUE` 拿到的只是映射那一瞬间的**复印件** —— 冷启动时游戏还没建好
-    /// UWorld，槽里是 0，复印件上就永远是 0，之后不会跟着更新。那正是「连续 18 次读到
-    /// 0x0」的完整成因：不是有 18 次错误，是**只有一次**错误，被读成了 18 遍。
-    ///
-    /// 代价是共享映射默认带写权限，所以建立之后立刻要走 `downgradeToReadOnly`。
+    /// 现在唯一成立的路径是「本地窗口 + 本地读」：见下面的窗口层
+    /// （buildWindow / stepWindowProbe）。这不是两套并行实现 —— 跨进程这条路
+    /// **现在没有实现**，只留了接入点；把错的版本留着才是真的会有两套。
     static func mapRange(pid: Int32, srcAddress: UInt64, size: UInt64) -> (local: UInt64, note: String) {
-        guard let fn = vmRemapFn else { return (0, "vm_remap 符号缺失") }
-
-        // iOS 上物理页是 16KB，映射必须页对齐
-        let pageSize: UInt64 = 0x4000
-        let alignedStart = srcAddress & ~(pageSize - 1)
-        let head = srcAddress - alignedStart
-        let total = (head + size + pageSize - 1) & ~(pageSize - 1)
-
-        var target: UInt64 = 0
-        var curProt: Int32 = 0
-        var maxProt: Int32 = 0
-        // 端口机制已移除：目标进程的共享映射需要它的 task port，而内核路径不产生 port。
-        // 这里退化为对本进程做 remap —— 结构保留，读取由 km_read_process 承担。
-        let rk = fn(mach_task_self_, &target, total, 0, vmFlagsAnywhere,
-                    mach_task_self_, alignedStart, 0, &curProt, &maxProt, 0)
-        guard rk == KERN_SUCCESS, target != 0 else {
-            return (0, "vm_remap 失败 \(describe(rk))")
-        }
-        // 降权与失败清理都在函数里，这里只判结果
-        guard downgradeToReadOnly(target, total: total, src: alignedStart,
-                                  maxProt: maxProt, gamePort: mach_task_self_) else {
-            return (0, "降权失败，已丢弃该映射（拒绝以可写状态持有游戏内存）")
-        }
-
-        /*
-         * 锁定物理页 —— 样本建窗后的固定动作（见 mlockFn 的说明）。
-         * 失败只计数，不丢弃映射：没锁上只是有被换出的风险，比没有映射强。
-         */
-        if let lock = mlockFn {
-            if lock(target, total) != 0 {
-                withLock { _mlockFailures += 1 }
-            }
-        }
-
-        mappedRanges.append((alignedStart, total, target))
-        rangesSorted = false
-        return (target + head,
-                "映射 0x\(String(alignedStart, radix: 16)) +0x\(String(total, radix: 16)) → 本地 0x\(String(target, radix: 16))")
+        (0, "跨进程映射未启用：需要目标 task port（第一步只有本地窗口，点「窗口」验证）")
     }
 
     /// 查一块映射：命中时**同时**给出本地基址和这块还剩多少字节。
@@ -438,99 +439,575 @@ final class MemoryProbe {
         basePid = 0
     }
 
-    /// 把**包含 address 的那个 region** 整个映射进来。
+    /// 把**包含 address 的那个 region** 整个映射进来 —— 跨进程路径，第一步不启用。
     ///
-    /// vm_region_64 从 address 起枚举时会直接返回包含它的那个 region（地址会被写回
-    /// region 起始），所以这里一次枚举 + 一次映射就够 —— 不需要从头扫地址空间。
+    /// 原来这里枚举的是**本进程**的 region（`nextRegion(task: mach_task_self_)`），
+    /// 而传进来的 `address` 是游戏地址 —— 枚举到的 region 与 `address` 根本不是同一件事，
+    /// 所以下面那个 `address >= addr && address < addr + size` 的校验经常直接把它否掉，
+    /// 偶尔通过也只是巧合（地址区间撞上了）。现在明确拒绝。
+    ///
+    /// 这是按需映射那条路的入口（`readSmart` 里被 `kernelReady` 门控着的那段）。
+    /// 第二步接回目标 task port 时从这里开始改。
     @discardableResult
     static func mapRegionContaining(pid: Int32, address: UInt64) -> String {
-
-        var addr: UInt64 = address
-        let (ok, size, _, _) = nextRegion(task: mach_task_self_, addr: &addr)
-        guard ok else { return "枚举失败 @0x\(String(address, radix: 16))" }
-        guard address >= addr, address < addr &+ size else {
-            return "0x\(String(address, radix: 16)) 不在返回的 region(0x\(String(addr, radix: 16)) +0x\(String(size, radix: 16))) 里"
-        }
-        let (local, note) = mapRange(pid: pid, srcAddress: addr, size: size)
-        return local != 0 ? note : note
+        "按需映射未启用：需要目标 task port（要枚举的是游戏的 region，不是本进程的）"
     }
 
-    /// 把游戏进程里**所有值得映射的大 region** 一次性映射进来。
+    /// 把游戏进程里**所有值得映射的大 region** 一次性映射进来 —— 第一步不启用。
     ///
-    /// 为什么必须批量：`readSmart` 的按需映射每次要花 1 次 `vm_region_64` + 1 次
-    /// `vm_remap` —— 两次都是内核调用，都要在游戏的 vm_map 上取锁。遍历整张 actor 表
-    /// （几千个对象，散落在几百个 region 里）时块数很快撞上上限，**剩下的读全部退化成
-    /// `mach_vm_read`**，而那正是实测会把游戏读崩的那条路（阈值 128 次）。
-    /// 上一版就是这么崩的 —— 不是「读得多」崩，是「没映射上的读」崩。
+    /// 这个函数的设计意图（批量吃下游戏的几百个 region，把后续读取全变成本地访问）
+    /// 本身是对的，也正是样本的路子。但它需要目标 task port：没有 port 的话，
+    /// `nextRegion` 只能枚举**本进程**的 region，然后把这些 region **自映射**一遍 ——
+    /// 那既不产出任何一个字节的游戏数据，又要白占几百块映射额度和几百 MB 地址空间
+    /// （`mappedRanges` 的上限是 2048 块，`readSmart` 的按需映射撞到它就会整条退化成内核读）。
     ///
-    /// 批量映射的代价只有「region 数量」次 vm_remap，之后每次读都是我们自己的页表访问。
-    /// 虚拟地址不心疼（64 位有 128TB），物理页按需 fault —— 只在我们真正碰到的页上分配。
+    /// 所以第一步把它停掉，并把原因写在返回值里 —— 面板每次点「世界」都会看到这行字，
+    /// 而不是一个"预映射: 0 块"的假结论。
     ///
-    /// 三条自我约束：只映射 ≥ minSize 的块（避开碎片）、硬性时间预算、每若干轮确认目标还活着。
+    /// 第二步接回来时，这里要动的是两处：`nextRegion` 换成游戏的 task、
+    /// `vm_remap` 的 src_task 换成游戏的 task（target 仍是我们自己）。
     @discardableResult
     static func mapAllRegions(pid: Int32, minSize: UInt64 = 256 << 10,
                               budget: TimeInterval = 2.5, maxBlocks: Int = 600) -> String {
-        guard let fn = vmRemapFn else { return "预映射: vm_remap 符号缺失" }
+        // 这句话会进 AutoTracker 的状态行（首次挂载时会调这个函数），
+        // 所以刻意压短 —— 面板那行放不下长句，尾巴被截掉就等于没说。
+        "预映射: 未启用（跨进程映射需要目标 task port）"
+    }
 
-        let deadline = Date().addingTimeInterval(budget)
-        let pageSize: UInt64 = 0x4000
-        var probe: UInt64 = 0x100000000
-        var mapped = 0
-        var skipped = 0
-        var failed = 0
-        var bytes: UInt64 = 0
-        var rounds = 0
+    // MARK: - 本地虚拟地址窗口（样本建窗形态 · 第一步：只建窗）
 
-        while rounds < 800, mapped < maxBlocks {
-            if Date() > deadline { break }
-            if rounds % 64 == 0, !targetAlive(pid) { break }
-            rounds += 1
+    /*
+     * 为什么先做这一步，以及这一步**不做什么**。
+     *
+     * 样本（Music）读游戏内存走的是「窗口 + 本地读」：先建一块属于自己的虚拟地址窗口，
+     * 让窗口的页指向目标物理页，然后**本地 `ldr` 读，零内核调用**。
+     *
+     * 本工程现在走的是另一条：页表翻译 → 拿到 PA → `pa + delta` 转内核 VA → kread。
+     * 上一次装机时那个 delta 算错，踢到未映射地址，**直接彩屏重启**。
+     * 所以方向改到样本这条路：不再用 kread 读任意地址，改用「窗口 + 本地读」。
+     *
+     * 第一步只做「把窗口建起来并自验证」，理由：
+     *   · 建窗这一段，样本的每一步都有二进制证据（下面逐个标了地址）；
+     *   · **让窗口的页指向目标物理页**那一步（PTE 改写）是整个方案里唯一没有样本直接
+     *     证据的环节，也是唯一能把机器打成彩屏的环节。窗口本身在设备上被证明可用之前，
+     *     不该去碰它 —— 所以本文件里没有任何一处写 PTE。
+     *
+     * 整段是**纯用户态 Mach API**：不读内核内存、不碰页表、不依赖 km_init / PUAFF。
+     * 两个好处：不会彩屏；内核层挂掉的时候它照样能独立验证 —— 第一步要的正是后者。
+     *
+     * 样本建窗链（`sub_100f756c4`，全部动作的 task 都是 `_mach_task_self_`）：
+     *   ① mach_vm_allocate        flags = 9，大小 = 页数 << 14      @0x100f75738
+     *   ② 三次 mach_vm_allocate   flags = 0x4002（OVERWRITE|PURGABLE）  @0x100f75890/758bc/758ec
+     *   ③ 浇灌 memset 'A' → 'B'                                       @0x100f7592c / 0x100f75ae8
+     *   ④ vm_remap(copy = FALSE)  src_task = target_task = self       @0x100f75a34
+     *   ⑤ mach_vm_protect                                             @0x100f75aa8
+     *   ⑥ mlock 循环 65534 次（0xFFFE）+ 收尾一次                      @0x100f75af8 / 0x100f75b3c
+     *   ⑦ pthread_create → 线程 0x100f75d30 再对整个窗口 mlock         @0x100f75b70
+     *   拆窗：mach_vm_deallocate                                       @0x100f75c34
+     */
 
-            let ask = probe
-            let (ok, size, prot, _) = nextRegion(task: mach_task_self_, addr: &probe)
-            guard ok, size > 0 else { break }
-            let start = probe                      // nextRegion 会把 probe 写成 region 起始
-            let next = start &+ size
-            guard next > ask else { break }        // 防死循环
-            probe = next
+    /// 窗口的页大小。**刻意写死 0x4000，不取 `vm_page_size`。**
+    ///
+    /// 样本用的是全局 `0x101cba070` / `0x101cba078` 这对常量，内容由
+    /// `file[0x1bb2070] = 00 40 00 00 …` 证实为 `0x4000`；`mach_vm_allocate` 的大小
+    /// （页数 `<< 14`）、`vm_remap` 的 size、`mlock` 的长度全都用它。
+    ///
+    /// iOS 上物理页就是 16 KB，正好等于 0x4000 —— 两者一致，所以跟着样本写死。
+    /// 不取 `vm_page_size` 的原因：第二步的 PTE 改写是按**物理页**做的；如果窗口按 4 KB
+    /// 对齐而物理页是 16 KB，窗口的"第 i 页"会和物理页错位，改 PTE 就改到相邻页上了。
+    /// 对齐条件宁可在代码里写死并显式检查，也不要让它在不同设备上悄悄变。
+    private static let windowPageSize: UInt64 = 0x4000
 
-            guard (prot & 0x1) != 0, size >= minSize else { skipped += 1; continue }
-            if localAddress(for: start) != nil { continue }
+    /// 样本 ① 用的 flags：`w3 = #9`。
+    ///
+    /// **9 = 0x1 | 0x8 = ANYWHERE | RANDOM_ADDR** —— 不是「ANYWHERE|OVERWRITE」
+    /// （OVERWRITE 是 0x4000，出现在样本 ② 那三次里）。这一笔要记准：把 9 当成
+    /// 「ANYWHERE|OVERWRITE」之后，照着写就会得到 `0x1 | 0x4000`，
+    /// 而那带 **OVERWRITE 语义：先把目标地址上已有的映射删掉再建** ——
+    /// 在窗口地址还没算干净的阶段，那等于拿刀往自己的地址空间里划。
+    private static let vmFlagsRandomAddr: Int32 = 0x0008
 
-            // 映射内联在这里，复用同一个 task port —— mapRange 每次都重新 task_for_pid，
-            // 那本身也是一次内核往返，批量做几百次不该这么花。
-            let aligned = start & ~(pageSize - 1)
-            let total = (start - aligned + size + pageSize - 1) & ~(pageSize - 1)
-            var target: UInt64 = 0
-            var curProt: Int32 = 0
-            var maxProt: Int32 = 0
-            let rk = fn(mach_task_self_, &target, total, 0, vmFlagsAnywhere,
-                        mach_task_self_, aligned, 0, &curProt, &maxProt, 0)
-            // 降权（含失败清理）已收在 downgradeToReadOnly 里
-            let downgraded = (rk == KERN_SUCCESS && target != 0)
-                ? downgradeToReadOnly(target, total: total, src: aligned,
-                                      maxProt: maxProt, gamePort: mach_task_self_)
-                : false
-            if rk == KERN_SUCCESS, target != 0, downgraded {
-                mappedRanges.append((aligned, total, target))
-                rangesSorted = false
-                mapped += 1
-                bytes += total
+    /// 样本 ② 三次调用用的 flags：`0x4002 = OVERWRITE | PURGABLE`。
+    ///
+    /// **第一步不用它**，但它必须在代码里留个名字，这样"这一步少了什么"是看得见的：
+    /// PURGABLE 的页是内核**可以随时回收**的，样本要的正是"这些页能被回收"
+    /// —— 那是 PUAFF 的燃料。窗口本体不该是 purgable，它要被 wire 住常驻。
+    private static let vmFlagsPurgableOverwrite: Int32 = 0x4002
+
+    /// 一步建窗的全部现场。字段只在 `buildWindowLocked` 里被整块写入，
+    /// 读的地方一律走 `withLock`（面板会并发读，见 stateLock 的说明）。
+    private struct LocalWindow {
+        var base: UInt64 = 0             // 窗口本体起始（0x4000 对齐）
+        var size: UInt64 = 0             // = 页数 << 14
+        var pages: Int = 0
+        var alias: UInt64 = 0            // vm_remap(copy = FALSE) 得到的第二个视图
+        var aliasNote = ""               // 那次 remap 的一句话结论（失败也要带返回码）
+        var sprayNote = ""               // 浇灌（memset 'A' → 'B'）
+        var protAfterBuild: Int32 = -1   // 建窗时设的权限（期望 0x3 = 读写）
+        var protNote = ""                // 建窗时 protect 的结论
+        var protNow: Int32 = -1          // 压只读之后**复查到的**实际权限（期望 0x1）
+        var sealNote = ""                // 压只读的结论
+        var mlockOK = 0                  // wire 成功的页数
+        var mlockFail = 0
+        var rlimitNote = ""              // RLIMIT_MEMLOCK —— mlock 失败时的第一解释
+        var verifyOK = false             // **唯一的成功判据**
+        var verifyNote = ""
+        var teardownNote = ""            // 上一次窗口的拆除结果（建窗前会先拆一次）
+    }
+
+    private static var localWindow: LocalWindow?
+
+    /// 窗口是否已建立**且**自验证通过 —— 第二步（改 PTE）的前置条件。
+    /// 第二步动手之前必须先看这个数；它是 false 就没有窗口可指。
+    static var windowReady: Bool { withLock { localWindow?.verifyOK ?? false } }
+
+    /// 窗口的一句话摘要（面板常驻显示用）。
+    static var windowLine: String {
+        withLock {
+            guard let w = localWindow else { return "窗口: 未建立" }
+            var s = "窗口: " + (w.verifyOK ? "✓" : "✗")
+            s += " 0x\(String(w.base, radix: 16)) · \(w.pages) 页 · \(w.size / 1024) KB"
+            s += " · mlock \(w.mlockOK)/\(w.pages)"
+            s += " · prot=0x\(String(w.protNow, radix: 16))"
+            return s
+        }
+    }
+
+    /// 建窗。**顺序照样本 ①③④⑤⑥ 来**；省掉的两步（② 与 ⑥ 的 65534 次循环）
+    /// 在各自的位置就地说明理由。
+    ///
+    /// 返回值 `ok` 只看**自验证**（本地写读 + alias 交叉读都通过）——
+    /// 那是上机时唯一能一眼看懂的判据；其余每一步的结论都在 `report` 里逐行列出。
+    @discardableResult
+    static func buildWindow(pages: Int = defaultWindowPages) -> (ok: Bool, report: String) {
+        // 整个建窗过程持同一把锁：它会碰 localWindow、也会碰 _mlockFailures，
+        // 而面板线程随时可能读（windowLine / mlockFailures）。
+        // 建窗全部是几次 Mach 调用 + 两遍 memset，毫秒级 —— 不值得为它做更细的锁。
+        withLock { buildWindowLocked(pages: pages) }
+    }
+
+    /// 默认页数：32 页 = 512 KB。
+    ///
+    /// 定这个数的理由：第二步要拿窗口装"目标的物理页"，页数不能太少；
+    /// 而它同时要被 mlock 常驻（吃 wired 内存），32 页（512 KB）在 iOS 上很轻 ——
+    /// 真上机时如果 mlock 大面积失败，报告里的 RLIMIT_MEMLOCK 那一行会直接指出是配额问题，
+    /// 而不是让这个数去猜。
+    static let defaultWindowPages = 32
+
+    /// 建窗的实现体。**调用前必须已经持有 stateLock**（NSLock 非递归，这里再取一次会死锁）。
+    private static func buildWindowLocked(pages: Int) -> (ok: Bool, report: String) {
+        guard let allocFn = machVmAllocateFn else {
+            return (false, "窗口: ✗ mach_vm_allocate 符号缺失 —— 第一步做不了（看「符号」按钮）")
+        }
+        guard let remapFn = vmRemapFn else {
+            return (false, "窗口: ✗ vm_remap 符号缺失 —— 建窗也不成立（看「符号」按钮）")
+        }
+
+        // 页数先夹紧。上限不是审美：mlock 的配额是 RLIMIT_MEMLOCK，页数一大必然大面积失败；
+        // 下限 1 是因为 0 页会让后面每个 `<<14`、每次逐页循环都变成空操作，报告出来像成功。
+        let n = max(1, min(pages, 4096))
+        let total = UInt64(n) * windowPageSize
+
+        // 先把上一次拆掉 —— 幂等。这一句同时是"拆除能力"的运行时证据：
+        // 它每次都会把上一次的 deallocate 返回码带进报告。
+        let teardownNote = teardownWindowLocked()
+
+        var lines: [String] = []
+        var w = LocalWindow()
+        w.pages = n
+        w.size = total
+        w.teardownNote = teardownNote
+
+        /*
+         * ① mach_vm_allocate(self, &base, 页数 << 14, flags = 9)
+         *
+         * 样本 @0x100f75738：`bl mach_vm_allocate`，`w3 = 9`，大小 = `[x19,#0x3d0] << 14`。
+         * 先在自己进程里申请**一整块连续窗口** —— 之后所有页操作都在这块地址里做，
+         * 不再有"每次重新挑地址"的随机性。
+         */
+        var base: UInt64 = 0
+        let ak = allocFn(mach_task_self_, &base, total, vmFlagsAnywhere | vmFlagsRandomAddr)
+        guard ak == KERN_SUCCESS, base != 0 else {
+            lines.append("窗口: ✗ ① mach_vm_allocate 失败 \(describe(ak))")
+            lines.append("  " + teardownNote)
+            return (false, lines.joined(separator: "\n"))
+        }
+        w.base = base
+
+        /*
+         * 边界自检 —— **这一步最该防的就是这里**。
+         *
+         * 这一步全是用户态 Mach API，不会彩屏；但 `vm_remap` / 对齐算错会破坏
+         * **本进程**的地址空间（重则自己 SIGSEGV，轻则后面所有页号全错一位）。
+         * 所以宁可在这里拒绝，也不带着一个可疑的基址往下走。三条，缺一不可：
+         *   1. 基址必须 0x4000 对齐 —— PTE 改写按物理页 16 KB 做，错位就改到邻居的 PTE 上；
+         *   2. base + size 不能回绕 —— 回绕之后 deallocate 的长度会变成天文数字；
+         *   3. 基址必须落在用户态地址范围内 —— 高 16 位是内核段的地址不可能是合法返回值。
+         */
+        guard base & (windowPageSize - 1) == 0,
+              base &+ total > base,
+              base < 0x0000_FFFF_FFFF_FFFF else {
+            _ = vmDeallocateFn?(mach_task_self_, UInt(base), total)
+            lines.append("窗口: ✗ ① 地址自检不过（base=0x\(String(base, radix: 16)) "
+                         + "size=0x\(String(total, radix: 16))），已释放")
+            lines.append("  " + teardownNote)
+            return (false, lines.joined(separator: "\n"))
+        }
+
+        /*
+         * ③ 浇灌：先写 'A' 再写 'B'（样本 @0x100f7592c / @0x100f75ae8 的两次 memset）。
+         *
+         * 为什么必须写这一遍：`mach_vm_allocate` 只**保留虚拟地址**，物理页要到第一次
+         * 访问才 fault 出来。而第二步改 PTE 的前提是"每一页都有真实 PTE"——
+         * 没浇灌过的页 PTE 是空的，改它等于往空槽里写字。
+         *
+         * 写两遍（A 再 B）也不是折腾：只写一次的话，"本来就该是 0、写完还是 0"这种错位
+         * 看不出来；写两个不同的值，一旦读到 A 或 B 就能立刻判断"这一页停在哪一步"。
+         *
+         * 写的是**我们自己刚申请的内存**：不可能写到游戏或内核去（基址刚刚过了上面三条自检）。
+         */
+        if let p = UnsafeMutableRawPointer(bitPattern: UInt(base)) {
+            memset(p, 0x41, Int(total))         // 'A'
+            memset(p, 0x42, Int(total))         // 'B'
+            w.sprayNote = "A→B 已写满 \(n) 页（0x\(String(total, radix: 16)) 字节）"
+        } else {
+            w.sprayNote = "基址转指针失败（0x\(String(base, radix: 16))）"
+        }
+
+        /*
+         * ④ vm_remap(..., copy = FALSE, src_task = target_task = self)
+         *
+         * 样本 @0x100f75a34 是全样本**唯一**的 `_vm_remap` 调用点，现场是
+         * `x0 = 目标 task`、`x5 = 源 task`（两者同一个值）、`w7 = 0`（copy = FALSE）。
+         * copy = FALSE 是**共享**映射：两个地址看的是同一批物理页；
+         * copy = TRUE 拿到的只是映射那一瞬间的复印件 —— 写进去的变化在另一头看不到。
+         *
+         * 这里把"自己映射自己"用在同一块窗口上，得到一个 **alias**。
+         * 它只有一个用途，但很硬：**它是唯一能证明 copy = FALSE 语义成立的手段** ——
+         * 往窗口写、从 alias 读，两边一致才说明内核给的是共享映射而不是复印件。
+         * 第二步整个方案的前提就压在这一条上，所以它被算进"建窗成功"的判据里。
+         *
+         * 与样本的差别（写清楚，免得后来人以为漏了一步）：
+         * 样本在 flags 上加了 OVERWRITE（0x4000）并指定 target_address，那是它
+         * "先预留地址、再把映射覆盖上去"的两段式。我们这里没有预留，用 ANYWHERE
+         * 让内核挑一个空地址 —— 少一次"覆盖已有映射"的机会，在这个阶段宁可保守。
+         */
+        var alias: UInt64 = 0
+        var curProt: Int32 = 0
+        var maxProt: Int32 = 0
+        let rk = remapFn(mach_task_self_, &alias, total, 0, vmFlagsAnywhere,
+                         mach_task_self_, base, 0, &curProt, &maxProt, 0)
+        if rk == KERN_SUCCESS, alias != 0 {
+            w.alias = alias
+            w.aliasNote = "alias=0x\(String(alias, radix: 16))（copy=FALSE 共享映射）"
+        } else {
+            // 失败也要把返回码留下：KERN_INVALID_ADDRESS / KERN_PROTECTION_FAILURE
+            // 指向完全不同的方向（源地址问题 vs 权限问题）。
+            w.aliasNote = "vm_remap 失败 \(describe(rk))"
+        }
+
+        /*
+         * ⑤ mach_vm_protect(prot = 3 = READ|WRITE)
+         *
+         * 样本里能看到 prot = 3 被写进出参（@0x100f759a8 的 `stp w8/w9 = 7/3`），
+         * 而它自己在 @0x100f75aa8 那次 mach_vm_protect 传的是 w4 = 1（只读）——
+         * 那是它**映射游戏页**之后把窗口压到只读：共享映射默认带写权限，
+         * 一个能写游戏内存的窗口只有风险没有收益。
+         *
+         * 我们这一步反着来：自验证要写 pattern，所以先**显式**设成读写。
+         * 显式设一次而不是"allocate 出来本来就是 RW"，是为了让后面的"压只读"有个已知起点：
+         * 出问题时能一眼分清是"没设上"还是"设完又被改回来了"。
+         */
+        if let protectFn = machVmProtectFn {
+            let pk = protectFn(mach_task_self_, base, total, 0, vmProtRead | vmProtWrite)
+            if pk == KERN_SUCCESS {
+                w.protAfterBuild = vmProtRead | vmProtWrite
+                w.protNote = "prot=0x3（读写）✓"
             } else {
-                failed += 1
+                w.protNote = "失败 \(describe(pk))"
+            }
+        } else {
+            w.protNote = "mach_vm_protect 符号缺失"
+        }
+
+        /*
+         * ⑥ mlock：把窗口 wire 住（样本 @0x100f75af8 / @0x100f75b3c）。
+         *
+         * 样本这一段是一个 **65534（0xFFFE）次**的循环，每次都对**同一页**
+         * （`x0 = [x22,#0xf8]`）调一次 `mlock(addr, 0x4000)`，循环之后再对另一处收尾调一次。
+         *
+         * **这里不照抄那个循环**，因为它对"wire 住"没有贡献：
+         *   · `mlock` 是幂等的 —— 同一页锁第二次不会多锁一层，物理页还是那一页；
+         *   · 65534 这个数量级是 PUAFF 手法的一部分（反复 mlock 同一页会把 vm_map 的
+         *     in-map entry 撑到溢出阈值，让内核误判这些页可以回收，从而留下
+         *     **dangling PTE** —— 那正是 PUAFF 要的燃料）；
+         *   · 而本工程的 PUAFF 已经由 `libmemrw/kfd` 承担（`kopen` 在设备上验过，
+         *     puaf_pages 也是调好的 2048）。窗口层再复刻一遍，只会把"验窗口"和
+         *     "制造 UAF"两件事搅在一起 —— 出问题时分不清是谁的责任。
+         *
+         * 所以这里做的是**逐页各一次**：那才是"整个窗口都被 wire 住"的正确做法
+         * （样本 ⑦ 那个后台线程做的也是"再对整个窗口 mlock 一遍"这件事，
+         * 只是它借了另一个线程的上下文去做竞态；本步不需要竞态）。
+         * 逐页调用还有一个好处：哪一页没锁上会落在计数里 —— 65534 次循环里看不出来。
+         *
+         * 失败只计数、不丢弃窗口：没锁上只是有被换出的风险，比没有窗口强。
+         * 但报告里必须看得见，而且要把 RLIMIT_MEMLOCK 一起打出来 ——
+         * mlock 失败的头号原因就是配额，不打出这个数，"失败 N 页"只能靠猜。
+         */
+        if let lock = mlockFn {
+            for i in 0..<n {
+                if lock(base &+ UInt64(i) * windowPageSize, windowPageSize) == 0 {
+                    w.mlockOK += 1
+                } else {
+                    w.mlockFail += 1
+                }
+            }
+        } else {
+            w.mlockFail = n
+        }
+        // 累进全局计数：面板的「mlock 失败」那一格必须把窗口这一路也算进去，
+        // 否则窗口大面积锁不上而那个数还是 0 —— 那是最会骗人的一种"零"。
+        // 注意这里在锁内，**不能**再调 withLock（NSLock 非递归，会死锁）。
+        _mlockFailures += w.mlockFail
+
+        var rl = rlimit()
+        if getrlimit(RLIMIT_MEMLOCK, &rl) == 0 {
+            // RLIM_INFINITY 是个带类型转换的宏，Swift 不保证导入；用数值比较代替。
+            let cur = rl.rlim_cur >= 0x7FFF_FFFF_FFFF_FFFF
+                ? "无限"
+                : "\(Double(rl.rlim_cur) / 1048576.0) MB"
+            w.rlimitNote = "RLIMIT_MEMLOCK 当前=\(cur)"
+        } else {
+            w.rlimitNote = "RLIMIT_MEMLOCK 读取失败"
+        }
+
+        // ⑦ 自验证（**上机唯一的判据**）—— 实现与判据见 verifyWindowLocked。
+        let vr = verifyWindowLocked(w)
+        w.verifyOK = vr.ok
+        w.verifyNote = vr.note
+        let ok = vr.ok
+
+        /*
+         * ⑧ 收尾：把窗口压到只读。
+         *
+         * 这一步**不是样本里的动作**，是我们自己加的一道保险，理由很直接：
+         * 第二步一旦把窗口的页指向目标物理页，"往窗口写"就等于"往游戏内存写"。
+         * 而第二步里唯一没有样本证据的环节正是 PTE 改写 —— 出错概率不低。
+         * 压到只读之后，就算后续代码误写了窗口，SIGSEGV 的是**我们自己**，
+         * 而不是游戏内存被改坏（那才是彩屏、封号那一类后果）。
+         *
+         * `set_maximum = 1` 是刻意的：只降 current 的话"上限"里还留着写权限，
+         * 之后一句 mach_vm_protect 就能把 W 提回来。把上限本身压掉，写权限才真拿不回来
+         * —— 与 downgradeToReadOnly 里的取舍一致。
+         *
+         * 压完之后**复查**一次实际权限：返回成功不等于区域里每一页都成了只读，
+         * 报告里那个 0x1 必须是查出来的，不能是"调用返回 0 所以应该是"。
+         */
+        if let protectFn = machVmProtectFn {
+            let sk = protectFn(mach_task_self_, base, total, 1, vmProtRead)
+            if sk == KERN_SUCCESS {
+                var probe = base
+                let (rok, _, prot, _) = nextRegion(task: mach_task_self_, addr: &probe)
+                w.protNow = rok ? prot : 0
+                if !rok {
+                    w.sealNote = "已压只读，但复查失败（vm_region_64）"
+                } else if prot == vmProtRead {
+                    w.sealNote = "复查 prot=0x1（只读）✓"
+                } else {
+                    w.sealNote = "复查 prot=0x\(String(prot, radix: 16)) —— 不是只读 ✗"
+                }
+            } else {
+                w.sealNote = "压只读失败 \(describe(sk)) ✗（窗口仍可写，第二步之前必须解决）"
+            }
+        } else {
+            w.sealNote = "mach_vm_protect 符号缺失，未压只读 ✗"
+        }
+
+        localWindow = w
+
+        // ── 报告：结论放在最前面。面板会截断长行，截掉尾巴无所谓，截掉结论就白跑一轮。
+        lines.append("窗口: " + (ok ? "✓ 建窗成功" : "✗ 建窗未通过") + " · " + w.verifyNote)
+        lines.append("  基址 0x\(String(base, radix: 16)) · 大小 0x\(String(total, radix: 16))"
+                     + " · 页数 \(n) · 页宽 0x\(String(windowPageSize, radix: 16))")
+        lines.append("  ① allocate flags=0x\(String(vmFlagsAnywhere | vmFlagsRandomAddr, radix: 16))"
+                     + "（ANYWHERE|RANDOM_ADDR，样本值 9）✓")
+        // 把没用到的那个 flags 打出来：它就是"这一步和样本差在哪"的答案，
+        // 比在注释里写一句更有用 —— 上机时在面板上就能看到这一步省了什么。
+        lines.append("  ② purgable 三连 flags=0x\(String(vmFlagsPurgableOverwrite, radix: 16)) 跳过"
+                     + "（PUAFF 的燃料，本工程由 kfd 承担）")
+        lines.append("  ③ 浇灌 \(w.sprayNote)")
+        lines.append("  ④ " + w.aliasNote)
+        lines.append("  ⑤ " + w.protNote)
+        lines.append("  ⑥ mlock \(w.mlockOK)/\(n) 页 wire"
+                     + (w.mlockFail == 0 ? " ✓" : "（失败 \(w.mlockFail)）")
+                     + " · " + w.rlimitNote)
+        lines.append("  ⑦ 自验证 —— " + w.verifyNote)
+        lines.append("  ⑧ " + w.sealNote)
+        /*
+         * 汇总警示。
+         *
+         * `ok` 只看**自验证**（窗口能不能用），而 mlock / 只读是另外两项独立的性质。
+         * 不点名的话，面板上会出现"✓ 建窗成功"和"⑥ 有失败"同时挂着 ——
+         * 看的人不知道该信哪个，下一步（PTE 改写）就会在一个没 wire 住、
+         * 或者还能写的窗口上动手。那是这个报告最该防的误读。
+         */
+        if ok {
+            var warn: [String] = []
+            if w.mlockFail > 0 { warn.append("有 \(w.mlockFail) 页没 wire 住") }
+            if w.protNow != vmProtRead { warn.append("只读没生效 —— 第二步之前必须解决") }
+            if !warn.isEmpty {
+                lines.append("  ⚠ " + warn.joined(separator: " · "))
             }
         }
-        if !rangesSorted {
-            mappedRanges.sort { $0.gameBase < $1.gameBase }
-            rangesSorted = true
+        lines.append("  " + teardownNote)
+        return (ok, lines.joined(separator: "\n"))
+    }
+
+    /// 写进每一页页头的 magic：低 16 位是页号，高 48 位是固定前缀。
+    ///
+    /// 前缀取 0xAF37 是为了在面板上一眼认出"这是我的窗口页"——
+    /// 如果某页读到的是别的值，那说明那块地址被别的映射盖了（或者根本不是我们的窗口）。
+    private static func pageMarker(_ i: Int) -> UInt64 {
+        0xAF37_0000_0000_0000 | UInt64(i)
+    }
+
+    /// 窗口自验证。**这是上机时唯一的判据。**
+    ///
+    /// 三件事，缺一不可：
+    ///   ① 逐页写入编码了页号的 pattern（整页填 `0x40 | (i & 0x3F)`，页头 8 字节放 magic）
+    ///   ② 从**窗口本体**逐页读回，整页比对
+    ///   ③ 从 **alias** 逐页读回页头 magic，与窗口本体看到的一致
+    ///
+    /// 为什么②要整页比对而不是抽查几个点：`mach_vm_allocate` 出来的页是按需 fault 的，
+    /// "只有第一页真的落到物理内存上"这种情况抽查很容易漏过去 —— 而第二步是按页改 PTE，
+    /// 漏一页就是改到一个没有物理页的 PTE 上。
+    ///
+    /// 为什么③必须做：它是**唯一**能证明 `vm_remap(copy = FALSE)` 给的是共享映射
+    /// （而不是复印件）的手段。第二步整个方案的前提压在这一条上。
+    ///
+    /// 失败时给出**页号 + 期望值 + 实际值**：面板上一眼看得出是"整页没写进去"、
+    /// "只有页头错"还是"alias 是另一份拷贝"—— 三种病对应三个完全不同的排查方向。
+    ///
+    /// 全部是本地内存访问：**零内核调用**（除了后面那次复查用的 vm_region_64）。
+    private static func verifyWindowLocked(_ w: LocalWindow) -> (ok: Bool, note: String) {
+        guard let p = UnsafeMutableRawPointer(bitPattern: UInt(w.base)) else {
+            return (false, "窗口基址 0x\(String(w.base, radix: 16)) 转不成指针")
+        }
+        let pageSize = Int(windowPageSize)
+
+        // ① 写入
+        for i in 0..<w.pages {
+            let page = p.advanced(by: i * pageSize)
+            memset(page, Int32(0x40 | (i & 0x3F)), pageSize)
+            page.storeBytes(of: pageMarker(i), as: UInt64.self)
         }
 
-        let mb = String(format: "%.0f", Double(bytes) / 1048576.0)
-        // 降权失败是本批唯一「不能妥协」的那一项，报告里必须看得见
-        let protNote = protectFailures == 0
-            ? ""
-            : "，降权失败累计 \(protectFailures) 块已丢弃"
-        return "预映射: \(mapped) 块 / \(mb) MB（扫 \(rounds) 个 region，跳过小块 \(skipped)，失败 \(failed)\(protNote)）"
+        // ② 从窗口本体读回：整页字节 + 页头 magic
+        for i in 0..<w.pages {
+            let page = UnsafeRawPointer(p).advanced(by: i * pageSize)
+            // 用 UnsafeRawBufferPointer 下标逐字节读，而不用 `load(fromByteOffset:as:)`：
+            // 后者会被 tools/swift_guard.py 的"跨文件核对 static 成员调用方式"规则
+            // 误报（项目里正好有个 static func load()）—— 那条规则是给真问题用的，
+            // 不该被这种写法淹没。下标读法语义一样，也不涉及对齐问题。
+            let buf = UnsafeRawBufferPointer(start: page, count: pageSize)
+            let want = UInt8(0x40 | (i & 0x3F))
+            var off = 8                              // 前 8 字节是 magic，单独比对
+            var diff = -1
+            while off < pageSize {
+                if buf[off] != want {
+                    diff = off
+                    break
+                }
+                off += 1
+            }
+            if diff >= 0 {
+                let got = buf[diff]
+                return (false, "本地写读 ✗ 第 \(i) 页 +0x\(String(diff, radix: 16)) 读回 "
+                        + "0x\(String(got, radix: 16))，期望 0x\(String(want, radix: 16))")
+            }
+            let head = UnsafeRawBufferPointer(start: page, count: 8)
+            let got = u64le(Array(head), 0)
+            if got != pageMarker(i) {
+                return (false, "本地写读 ✗ 第 \(i) 页页头 magic=0x\(String(got, radix: 16))，"
+                        + "期望 0x\(String(pageMarker(i), radix: 16))")
+            }
+        }
+
+        // ③ alias 交叉读 —— copy = FALSE 的成立证据
+        if w.alias == 0 {
+            return (false, "本地写读 \(w.pages)/\(w.pages) 页通过，但 alias 不存在"
+                    + "（vm_remap 失败）→ copy=FALSE 语义没验，不算通过")
+        }
+        guard let ap = UnsafeRawPointer(bitPattern: UInt(w.alias)) else {
+            return (false, "alias 地址 0x\(String(w.alias, radix: 16)) 转不成指针")
+        }
+        for i in 0..<w.pages {
+            let head = UnsafeRawBufferPointer(start: ap.advanced(by: i * pageSize), count: 8)
+            let got = u64le(Array(head), 0)
+            if got != pageMarker(i) {
+                return (false, "alias 交叉读 ✗ 第 \(i) 页读到 0x\(String(got, radix: 16))，"
+                        + "窗口本体是 0x\(String(pageMarker(i), radix: 16)) "
+                        + "→ 两边不是同一批物理页（copy=FALSE 没成立）")
+            }
+        }
+        return (true, "本地写读 \(w.pages)/\(w.pages) 页一致 · alias 交叉读 \(w.pages)/\(w.pages) 页一致")
+    }
+
+    /// 拆窗：把 alias 与窗口本体都还给内核，并把记录清干净。
+    ///
+    /// **释放顺序与建窗相反**：先 alias 再本体。两块是各自独立的 vm_map entry，
+    /// 谁先谁后都不影响正确性，但先拆"派生出来的那个"更好读 —— 报告里那行
+    /// "alias ✓ / 本体 ✓" 的顺序就是这么来的。
+    ///
+    /// 返回一句话（建窗报告会把它贴进"上次窗口"那一行），**不在这里写 localWindow 的状态机**：
+    /// 唯一的写入口是 `buildWindowLocked`，两个地方都写迟早不一致。
+    ///
+    /// 一个取舍：deallocate 失败时仍然清掉记录（不保留"待重试"状态）。
+    /// 理由是失败的返回码本身会写进报告，而留着一个拆不掉的记录只会让下一次建窗
+    /// 带着它一起失败 —— 第一步要的是"每次点都是干净的起点"，不是自愈。
+    @discardableResult
+    static func teardownWindow() -> String {
+        withLock { teardownWindowLocked() }
+    }
+
+    /// 拆窗的实现体。**调用前必须已经持有 stateLock。**
+    private static func teardownWindowLocked() -> String {
+        guard let w = localWindow else { return "上次窗口: 无（还没建过）" }
+        var parts: [String] = []
+        if let fn = vmDeallocateFn {
+            if w.alias != 0 {
+                let k = fn(mach_task_self_, UInt(w.alias), w.size)
+                parts.append("alias " + (k == KERN_SUCCESS ? "✓" : describe(k)))
+            }
+            let k2 = fn(mach_task_self_, UInt(w.base), w.size)
+            parts.append("本体 " + (k2 == KERN_SUCCESS ? "✓" : describe(k2)))
+        } else {
+            parts.append("vm_deallocate 符号缺失 —— 映射留在地址空间里了")
+        }
+        localWindow = nil
+        return "上次窗口: 已释放（\(parts.joined(separator: " / "))）"
+    }
+
+    /// 面板「窗口」按钮：建窗 → 自验证 → 报告。
+    ///
+    /// **不需要 pid，也不依赖内核层** —— 这一段全是本进程的 Mach 调用，
+    /// 所以它是第一步唯一一个"内核挂掉也能跑"的判据。
+    /// 也正因为不需要 pid，它在面板上不能被"先刷新拿到 pid"那道门挡住。
+    ///
+    /// 每次调用都是**重建**（先拆上一次、再建新的）。原因在 ⑧：收尾会把窗口压成只读，
+    /// 而自验证要写 pattern —— 压完只读就写不进去了。所以"再验一次"只能是"重建一次"，
+    /// 不能是"在同一块上再写一遍"。
+    static func stepWindowProbe(pages: Int = defaultWindowPages) -> String {
+        resetCounters()
+        stageMark("窗口 · 建窗")
+        let t0 = Date()
+        let r = buildWindow(pages: pages)
+        let ms = Int(Date().timeIntervalSince(t0) * 1000)
+        var lines = r.report.split(separator: "\n").map(String.init)
+        lines.append("  用时 \(ms) ms · " + (r.ok
+            ? "→ 窗口可用：第二步（让窗口页指向目标物理页）的前置条件已满足"
+            : "→ 窗口不可用：先修上面标 ✗ 的那一步，再谈第二步"))
+        return lines.joined(separator: "\n")
     }
 
     /// 已建立的映射块数 —— 调用方用它判断"要不要先预映射一轮"。
@@ -555,7 +1032,13 @@ final class MemoryProbe {
     /// **每轮只查一块**：`vm_region_64` 本身也是一次内核调用，几百块一次全查会变成
     /// 新的开销源。轮询的代价恒定（每轮一次），几百块映射几百轮就能全覆盖。
     static func spotCheckProtection() -> String {
-        guard !mappedRanges.isEmpty else { return "保护位: 无映射" }
+        // 没有映射块时改查**窗口**。
+        //
+        // 为什么：第一步里 `mappedRanges` 恒为空（跨进程映射没启用），
+        // 而面板那一行"保护位"恰恰是最该一直挂着看的数 —— 窗口是不是真的只读，
+        // 决定第二步出问题时吃亏的是我们自己，还是游戏内存被写坏。
+        // 返回"无映射"等于把这一格浪费掉。
+        guard !mappedRanges.isEmpty else { return windowProtectionLine() }
         if protectionCursor >= mappedRanges.count { protectionCursor = 0 }
         let idx = protectionCursor
         protectionCursor = (idx + 1) % mappedRanges.count
@@ -567,6 +1050,26 @@ final class MemoryProbe {
         // VM_PROT_WRITE = 0x2 —— 只读就是这一位必须为 0
         let writable = (prot & 0x2) != 0
         return "保护位 块\(idx)/\(mappedRanges.count)=\(writable ? "有写✗" : "只读✓")"
+    }
+
+    /// 窗口当前的实际保护位（第一步的常驻抽查）。
+    ///
+    /// `vm_region_64` 是内核调用，但每轮只查一次、只查一块，代价恒定 ——
+    /// 与原来"每轮抽查一块映射"的成本完全一样。
+    ///
+    /// 判据只看 `VM_PROT_WRITE`(0x2) 这一位：窗口必须**不可写**。
+    /// 可写就意味着第二步一旦把页指到游戏物理页，任何一次误写都会直接落到游戏内存上。
+    private static func windowProtectionLine() -> String {
+        let win = withLock { localWindow }
+        guard let w = win else { return "保护位: 无映射 · 窗口未建立（点「窗口」）" }
+        var probe = w.base
+        let (ok, _, prot, _) = nextRegion(task: mach_task_self_, addr: &probe)
+        guard ok else {
+            return "保护位: 窗口 0x\(String(w.base, radix: 16)) 查询失败"
+        }
+        let writable = (prot & 0x2) != 0
+        return "保护位: 窗口 \(writable ? "有写✗" : "只读✓")"
+            + " · \(w.pages) 页 · mlock \(w.mlockOK)/\(w.pages)"
     }
 
 
@@ -584,14 +1087,20 @@ final class MemoryProbe {
         guard n <= 0x10000 else { return (KERN_FAILURE, []) }
 
         /*
-         * ── 映射快路径：暂时关闭 ──
+         * ── 映射快路径：关闭，而且现在**没有生产者** ──
          *
-         * 为什么关：这条路的映射是**自映射**（mapRange 里 src_task 和 target_task
-         * 都是 mach_task_self_，而 srcAddress 传的却是游戏地址）。游戏那块内存在
-         * 自己的 vm_map 里并不存在，所以它既不产出游戏数据，又白占 mappedRanges
-         * 的额度（上限 2048 块）。样本的自映射之所以成立，是因为它前面有
-         * physrw / PTE 改写，已经先把游戏的物理页挂进了自己的地址空间 —— 那一步
-         * 我们只做完了「定位 PTE」（km_pte_for + 自检），真实改写和 TLB 刷新还没做。
+         * 两层原因：
+         *
+         * 1）这条路的映射原本是**自映射**（mapRange 里 src_task / target_task 都是
+         *    mach_task_self_，srcAddress 却传游戏地址）。游戏那块内存在本进程的
+         *    vm_map 里并不存在，所以它既不产出游戏数据，又白占 mappedRanges
+         *    的额度（上限 2048 块）。`mapRange` / `mapAllRegions` 现在都改成明确拒绝了，
+         *    于是 `mappedRanges` 在第一步**恒为空** —— 这段代码即使打开也命中不了任何一块。
+         *
+         * 2）样本的自映射之所以成立，是因为它前面有 physrw / PTE 改写，已经先把
+         *    游戏的物理页挂进了自己的地址空间。我们这一步只做到「本地窗口」：
+         *    窗口建好、被 wire 住、能读写（点「窗口」按钮看自验证），但**还没有任何
+         *    一页指向目标物理页** —— 那是第二步，也是唯一没有样本证据的环节。
          *
          * 用 `kernelReady` 当开关而不是写死 false：内核层验通之后直接放开这里
          * 就能恢复映射优先，不需要改回来。
@@ -654,12 +1163,18 @@ final class MemoryProbe {
         readSmart(pid: pid, address: address, count: count)
     }
 
+    /// 已建立映射的摘要 —— 第一步**没有调用者**：跨进程映射停用后 `mappedRanges` 恒为空，
+    /// 面板上现在显示窗口状态（见 windowLine / windowProtectionLine）。
+    /// 留着是因为第二步接回映射后，所有报告行又要用它。
     static var mappedSummary: String {
         mappedRanges.isEmpty ? "无映射" : "\(mappedRanges.count) 块"
     }
 
     /// 从已映射的本地内存读，**零内核调用**。
     /// 只有确认过地址落在映射区间内才允许调用 —— 传错地址会直接让我们自己 SIGSEGV。
+    ///
+    /// 第一步也没有调用者：窗口层的读走 verifyWindowLocked（它要按页整页比对，
+    /// 这里这种"读一小段"的形状对不上）。第二步从窗口读任意字段时，用的就是它。
     private static func readMapped(_ localAddr: UInt64, _ count: Int) -> [UInt8] {
         guard count > 0, count <= 4096 else { return [] }
         guard let base = UnsafeRawPointer(bitPattern: UInt(localAddr)) else { return [] }
@@ -2166,73 +2681,27 @@ final class MemoryProbe {
         return lines.joined(separator: "\n")
     }
 
-    /// 映射读取的原型验证：把游戏内存映射进我们自己的地址空间，然后**从本地内存直接读**。
+    /// 映射原语验证 —— 第一步验证的是**本地窗口**。
     ///
-    /// 验收：本地读到的 Mach-O 头（magic + filetype）与 `mach_vm_read` 的结果一致，
-    /// 且 GObjects 的 NumElements 是同一个六位数 —— 那就证明"共享书架"这条路通。
-    /// 之后所有读取都可以走这里，调用次数从"每次读一次调用"降到"每块映射一次"。
+    /// 这个按钮原来点的是"跨进程映射"：把游戏的映像头 / `__DATA` 段 remap 进本进程，
+    /// 然后从本地内存直接读 Mach-O 头与 GObjects。那条路现在走不通 ——
+    /// 它需要**目标进程的 task port**，而本工程在内核路径下不产生 port（见 mapRange 的注释）。
+    /// 原来那个"退化版"会返回一个看着像成功的映射，实际指向的是我们自己的内存：
+    /// 那比失败危险得多（读出来全是"合理的垃圾"，没有任何一处会报错）。
+    ///
+    /// 所以这里改接**窗口**：样本建窗那一套（allocate → 浇灌 → vm_remap(copy=FALSE)
+    /// → protect → mlock），并且当场自验证 —— 写 pattern、读回、再从 alias 交叉读一遍。
+    /// 那是第一步唯一能"一眼看懂成没成"的判据，也是第二步（让窗口页指向目标物理页）
+    /// 的前置条件。
+    ///
+    /// 函数名与签名保持不变：面板「映射」按钮接的还是它，调用点不用动。
+    /// `pid` 现在没用了（窗口与目标进程无关）—— 留着是为了不动调用点，
+    /// 也顺便说明一件事：这一步**不需要**先「找村口」。
     static func stepRemapProbe(pid: Int32) -> String {
-        resetCounters()
-        stageMark("映射 · 开始")
-        guard baseReady(for: pid) else {
-            return "映射: 没有当前进程的基址 —— 先点「跑一次」（它会自动完成找基址）"
-        }
-        releaseAllMappings()
-        let s = imageSlide
-        let base = imageBase
-        var lines: [String] = []
-
-        // ① 映射映像头 1MB
-        stageMark("映射 · 映像头")
-        let (localHead, noteHead) = mapRange(pid: pid, srcAddress: base, size: 0x100000)
-        guard localHead != 0 else { return "映射: \(noteHead)" }
-        lines.append("① \(noteHead)")
-
-        // ② 直接从本地内存读 Mach-O 头 —— 这一步零内核调用
-        let header = readMapped(localHead, 16)
-        guard header.count >= 16 else {
-            lines.append("② 本地读失败")
-            return lines.joined(separator: "\n")
-        }
-        let magic = UInt32(header[0]) | (UInt32(header[1]) << 8) | (UInt32(header[2]) << 16) | (UInt32(header[3]) << 24)
-        let filetype = UInt32(header[12]) | (UInt32(header[13]) << 8) | (UInt32(header[14]) << 16) | (UInt32(header[15]) << 24)
-        let headOK = (magic == 0xFEEDFACF && filetype == 2)
-        lines.append("② 本地读头: magic=0x\(String(magic, radix: 16)) filetype=\(filetype) "
-            + (headOK ? "✓ 映射读取成立" : "✗ 不对"))
-
-        // ③ 映射 __DATA 那段窗口（GObjects / GNames / GWorld 都住在里面）
-        //    只映射一个 32MB 窗口，物理页按需 fault —— 我们只碰其中几个地址。
-        let off = Offsets.load()
-        let gob = runtime(off.gObjects, slide: s)
-        let mapStart = gob & ~0x1FFFFFF             // 32MB 向下对齐
-        let mapSize: UInt64 = 0x2000000
-        stageMark("映射 · __DATA 窗口")
-        let (localData, noteData) = mapRange(pid: pid, srcAddress: mapStart, size: mapSize)
-        guard localData != 0 else {
-            lines.append("③ \(noteData)")
-            return lines.joined(separator: "\n")
-        }
-        lines.append("③ \(noteData)")
-
-        // ④ 从映射里读 GObjects 头 —— 零内核调用
-        if gob >= mapStart, gob + 0x120 <= mapStart + mapSize {
-            let buf = readMapped(localData + (gob - mapStart), 0x120)
-            if buf.count >= 0x120 {
-                let num = UInt32(buf[0x118]) | (UInt32(buf[0x119]) << 8)
-                    | (UInt32(buf[0x11A]) << 16) | (UInt32(buf[0x11B]) << 24)
-                let items = u64le(buf, 0xE0)
-                let sane = (num > 100_000 && num < 2_000_000)
-                lines.append("④ 映射读 GObjects: NumElements=\(num) items=0x\(String(items, radix: 16)) "
-                    + (sane ? "✓ 应当与「定点读」的数字一致" : "✗ 数量异常"))
-            } else {
-                lines.append("④ 映射窗口读取不足（拿到 \(buf.count) 字节）")
-            }
-        } else {
-            lines.append("④ GObjects 不在窗口内")
-        }
-
-        lines.append("已建立 \(mappedSummary) · " + costLine())
-        lines.append("→ 映射建好之后，读这块内存不再产生任何 mach_vm_read 调用")
+        var lines = [stepWindowProbe()]
+        lines.append("")
+        lines.append("跨进程映射（把游戏页直接 remap 进来）：未启用 —— 需要目标 task port。")
+        lines.append("  第一步能做的只有「本地窗口」；让窗口页指向目标物理页是第二步。")
         return lines.joined(separator: "\n")
     }
 

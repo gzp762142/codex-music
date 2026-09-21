@@ -51,6 +51,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     private let btnTracker = UIButton(type: .system)
     /// 映射：把游戏内存 remap 进我们自己进程，之后本地读（样本的读取方式）
     private let btnMap = UIButton(type: .system)
+    /// 窗口：样本的建窗体（本地虚拟地址窗口）—— 第一步就是把它建起来并当场自验证
+    private let btnWindow = UIButton(type: .system)
     /// 枚举：只枚举几个 region 打原始字段，验证 vm_region_64 这个调用本身
     private let btnEnum = UIButton(type: .system)
     /// 读模块头：dump 基址处读 Mach-O，判断 ASLR 是否搬过基址
@@ -89,6 +91,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
             (btnPlayers, "玩家", #selector(onPlayers)),
             (btnAuto, "跑一次", #selector(onAutoRun)),
             (btnMap, "映射", #selector(onMapProbe)),
+            (btnWindow, "窗口", #selector(onWindowProbe)),
             (btnEnum, "枚举", #selector(onEnumProbe)),
             (btnRefresh, "刷新", #selector(onRefresh)),
             (btnObjects, "对象", #selector(onObjects)),
@@ -141,8 +144,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         crashLabel.frame = CGRect(x: w * 0.6, y: 15, width: w * 0.4, height: 14)
         probeLabel.frame = CGRect(x: 0, y: 30, width: w, height: 14)
 
-        // 11 个按钮排成 6 列 × 2 行
-        let all = [btnWorld, btnSelf, btnPlayers, btnAuto, btnMap,
+        // 12 个按钮排成 6 列 × 2 行（正好排满，不留空位）
+        let all = [btnWorld, btnSelf, btnPlayers, btnAuto, btnMap, btnWindow,
                    btnEnum, btnRefresh, btnObjects, btnCrashFile, btnMemory, btnTracker]
         let gap: CGFloat = 4
         let perRow = 6
@@ -286,14 +289,25 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
          * kernelNote 摊开给他看；那一行本身已经区分了成功（报告）和失败（原因）。
          */
         guard AppDelegate.kernelInitDone else {
-            return ["［内核层］ 初始化中…（PUAFF 需要几十秒）"]
+            return ["［内核层］ 初始化中…（PUAFF 需要几十秒）",
+                    "［窗口］ " + MemoryProbe.windowLine]
         }
         var out = AppDelegate.kernelNote
             .split(separator: "\n", omittingEmptySubsequences: false)
             .map(String.init)
         // 空的话给个占位，否则表格里那一段会整块消失
         if out.allSatisfy({ $0.isEmpty }) { out = ["［内核层］ （无报告）"] }
-        return out.map { "［内核］ " + $0 }
+        /*
+         * 窗口状态**常驻最后一行**（自带前缀，不跟着上面那批走）。
+         *
+         * 为什么不塞进 extraRows：那个数组在每次手动操作、Jetsam 报告、状态机回调时
+         * 都会被整个覆盖 —— 窗口建过一次之后一直有效，它最该挂在那儿被人看见。
+         * 而且窗口是第一步唯一"内核层挂掉也能跑"的东西（纯用户态 Mach 调用），
+         * 内核那一段报错时它照样有话说 —— 两者放在一起对比才有意义。
+         */
+        var rows = out.map { "［内核］ " + $0 }
+        rows.append("［窗口］ " + MemoryProbe.windowLine)
+        return rows
     }
 
     /// 内核就绪后自动刷一次面板 —— 自检是异步的，面板可能先于它建好。
@@ -684,33 +698,54 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         runProbe("内存: 读取中…") { MemoryProbe.stepMemory(pid: $0) }
     }
 
-    /// 映射：把游戏内存 remap 进我们自己进程，之后从本地内存读（样本的读取方式）。
+    /// 映射：样本的读取方式（窗口 + 本地读）—— 第一步验证的是**窗口本身**。
     ///
-    /// **自包含**：先自己刷新拿 pid，缺基址就自己找一次（找基址本身几乎不读游戏内存，
-    /// 只有 Mach-O 头校验那两次调用）。所以这一步不需要你先点别的按钮 ——
-    /// 前面手动串联的步骤，凡是能自动的都自动掉。
+    /// 这个按钮原来要求"先刷新拿 pid、缺基址就自己找一次"，因为它当时做的是把游戏的
+    /// 映像头 / `__DATA` 段 remap 进本进程。那条路现在停了（需要目标 task port），
+    /// 而窗口与目标进程无关 —— 所以这里不再要求 pid，也不再「找村口」：
+    /// 那是白碰一次游戏内存，换不来任何东西。
+    ///
+    /// 与「窗口」按钮走**同一条路**，差别只有一行说明文字（跨进程那半边为什么没开）。
     @objc private func onMapProbe() {
-        refreshProcess()
-        guard gpid != 0 else {
-            probeLabel.text = "映射: 没找到游戏进程"
-            probeLabel.textColor = warnText
-            return
-        }
-        runProbe("映射: 建立中…") { pid -> String in
-            MemoryProbe.stageMark("检查基址")
-            var out: [String] = []
-            if !MemoryProbe.baseReady(for: pid) {
-                MemoryProbe.stageMark("准备找基址")
-                let base = MemoryProbe.stepFindBase(pid: pid)
-                out.append(base)
-                guard base.contains("✓ base=") else {
-                    out.append("→ 没拿到基址，映射没得做")
-                    return out.joined(separator: "\n")
-                }
-                out.append("")
+        let pid = gpid
+        runWindowProbe("映射: 建窗中…") { MemoryProbe.stepRemapProbe(pid: pid) }
+    }
+
+    /// 窗口：样本的建窗体跑一遍，并**当场自验证**（写 pattern → 读回 → alias 交叉读）。
+    @objc private func onWindowProbe() {
+        runWindowProbe("窗口: 建窗中…") { MemoryProbe.stepWindowProbe() }
+    }
+
+    /// 「窗口」与「映射」共用的执行体。
+    ///
+    /// **不要求 pid**：窗口这一段全是本进程的 Mach 调用，跟游戏进程、跟内核层都没关系。
+    /// 它是第一步唯一一个"内核挂掉也能跑"的判据，所以不能被"先刷新拿到 pid"那道门挡住
+    /// —— 别的按钮的前置条件对它不成立。
+    ///
+    /// 仍然走 `AutoTracker` 那条**串行队列**：窗口会碰 `MemoryProbe` 的静态状态
+    /// （localWindow / mlockFailures / 计数器），跟状态机的读取并发跑会互相踩。
+    ///
+    /// 不复用 `runProbe` 的唯一原因：那个函数第一行就是 `guard gpid != 0`
+    /// —— 对窗口来说这是一道不该存在的门。
+    private func runWindowProbe(_ pending: String, _ work: @escaping () -> String) {
+        if probeBusy {
+            // 与 runProbe 同一套防重入：被堵死的那次不会自己回来，30 秒后放行。
+            if Date().timeIntervalSince(probeStarted) <= 30 {
+                probeLabel.text = "上一个读取还没回来，等它"
+                return
             }
-            out.append(MemoryProbe.stepRemapProbe(pid: pid))
-            return out.joined(separator: "\n")
+        }
+        probeBusy = true
+        probeStarted = Date()
+        probeLabel.text = pending
+        probeLabel.textColor = idleText
+        DispatchQueue.global(qos: .userInitiated).async {
+            let text = AutoTracker.shared.syncExternal { work() }
+            DispatchQueue.main.async { [weak self] in
+                guard let s = self else { return }
+                s.probeBusy = false
+                s.showReport(text)
+            }
         }
     }
 
