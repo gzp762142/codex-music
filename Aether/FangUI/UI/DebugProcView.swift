@@ -17,13 +17,20 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     /// 非空时表格显示这些文本行（Jetsam 报告等），否则显示进程列表
     private var extraRows: [String] = []
     private var gpid: Int32 = 0
-    private let headerH: CGFloat = 50
+    /// 顶部信息区的高度：三行读数 + 一行 XPF 常驻状态。
+    private let headerH: CGFloat = 64
     private let btnRowH: CGFloat = 26
 
     private let countLabel = UILabel()
     private let hitLabel = UILabel()
     private let probeLabel = UILabel()
     private let crashLabel = UILabel()
+    /// XPF 常驻状态行（「［XPF］未初始化 / 已就绪…」）。
+    ///
+    /// 为什么不复用 probeLabel：那一行会被每次手动操作覆盖（「读取中…」）、
+    /// 面板每次收放还会整个重建。而 XPF 一旦初始化成功就一直是就绪的，
+    /// 它的结论最该像「［窗口］」那样常驻 —— 重建后靠 xpfNote 恢复。
+    private let xpfLabel = UILabel()
     private let table = UITableView(frame: .zero, style: .plain)
 
     /// 跑一次：刷新 → 找村口 → 世界 → 名字池，一条链自动走完
@@ -64,6 +71,34 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     private let btnSilent = UIButton(type: .system)
     /// Jetsam 日志：文件名不带进程名，必须按 JetsamEvent 前缀扫
     private let btnJetsam = UIButton(type: .system)
+    /// XPF：读设备的 kernelcache 并解析 physrw 要用的那批内核符号。
+    /// 与「窗口」同类 —— 不要求 pid、不依赖内核读写层，可单独跑。
+    private let btnXpf = UIButton(type: .system)
+
+    /// 面板上的按钮与其 action。**唯一数据源**：init 按它接线，layoutSubviews 按它排版。
+    /// 原先这两处各写一份列表，加一个按钮就得改两个地方、还必须顺序一致 —— 迟早会错位。
+    /// 顺序即排列顺序（从左到右、从上到下）。按钮数不再是 12 的倍数时，
+    /// 排版会自动多出一行，表格起点跟着往下让（见 layoutSubviews）。
+    ///
+    /// 为什么是 `lazy var` 而不是 `static let`：表里装的是**实例按钮**，而静态存储属性的
+    /// 初始化器跑在 `self` 构造出来之前 —— 引用实例成员会被编译器直接拒掉
+    /// （instance member cannot be used on type）。`lazy` 首次被访问时才初始化，
+    /// 那时 self 已完全构造，所以能引用任何实例属性，也与声明先后顺序无关。
+    private lazy var actionButtons: [(button: UIButton, title: String, action: Selector)] = [
+        (btnWorld, "世界", #selector(onWorld)),
+        (btnSelf, "自己", #selector(onSelf)),
+        (btnPlayers, "玩家", #selector(onPlayers)),
+        (btnAuto, "跑一次", #selector(onAutoRun)),
+        (btnMap, "映射", #selector(onMapProbe)),
+        (btnWindow, "窗口", #selector(onWindowProbe)),
+        (btnEnum, "枚举", #selector(onEnumProbe)),
+        (btnRefresh, "刷新", #selector(onRefresh)),
+        (btnObjects, "对象", #selector(onObjects)),
+        (btnCrashFile, "崩溃文件", #selector(onCrashFile)),
+        (btnMemory, "内存", #selector(onMemory)),
+        (btnTracker, "自动", #selector(onTracker)),
+        (btnXpf, "XPF", #selector(onXpfProbe))
+    ]
 
     private let accent = UIColor.hex(0x185EE0)
     private let idleText = UIColor.hex(0x5A6A82)
@@ -73,7 +108,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         super.init(frame: frame)
         backgroundColor = .clear
 
-        for l in [countLabel, hitLabel, probeLabel, crashLabel] {
+        for l in [countLabel, hitLabel, probeLabel, crashLabel, xpfLabel] {
             l.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
             l.textColor = idleText
             l.adjustsFontSizeToFitWidth = true
@@ -83,23 +118,9 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         }
         hitLabel.font = .monospacedSystemFont(ofSize: 11, weight: .medium)
 
-        // 面板只留 5 个。主链已经验证过了，不需要再一步步点 ——
-        // 其余按钮的声明和 action 都还留在文件里（只是不接线），要单独排查时接回来即可。
-        let buttons: [(UIButton, String, Selector)] = [
-            (btnWorld, "世界", #selector(onWorld)),
-            (btnSelf, "自己", #selector(onSelf)),
-            (btnPlayers, "玩家", #selector(onPlayers)),
-            (btnAuto, "跑一次", #selector(onAutoRun)),
-            (btnMap, "映射", #selector(onMapProbe)),
-            (btnWindow, "窗口", #selector(onWindowProbe)),
-            (btnEnum, "枚举", #selector(onEnumProbe)),
-            (btnRefresh, "刷新", #selector(onRefresh)),
-            (btnObjects, "对象", #selector(onObjects)),
-            (btnCrashFile, "崩溃文件", #selector(onCrashFile)),
-            (btnMemory, "内存", #selector(onMemory)),
-            (btnTracker, "自动", #selector(onTracker))
-        ]
-        for (b, title, sel) in buttons {
+        // 全部单步按钮都接线。主链已经验证过了，不必再一步步点，但每一个都留着 ——
+        // 出了岔子时要靠它单独复现某一段（例如「窗口」「XPF」是内核层挂掉时仅有的判据）。
+        for (b, title, sel) in actionButtons {
             b.setTitle(title, for: .normal)
             b.titleLabel?.font = .systemFont(ofSize: 11, weight: .semibold)
             // 6 列比 5 列窄，长标题（崩溃文件）允许自动缩一点，避免被截断
@@ -112,6 +133,10 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
             b.addTarget(self, action: sel, for: .touchUpInside)
             addSubview(b)
         }
+
+        // XPF 状态跨面板重建保留（面板收放会新建整个视图）：XPF 只初始化一次，
+        // 那几十秒不该因为收起再弹出就白等第二遍。
+        xpfLabel.text = DebugProcView.xpfNote
 
         table.dataSource = self
         table.delegate = self
@@ -143,10 +168,11 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         hitLabel.frame = CGRect(x: 0, y: 15, width: w * 0.6, height: 14)
         crashLabel.frame = CGRect(x: w * 0.6, y: 15, width: w * 0.4, height: 14)
         probeLabel.frame = CGRect(x: 0, y: 30, width: w, height: 14)
+        xpfLabel.frame = CGRect(x: 0, y: 45, width: w, height: 14)
 
-        // 12 个按钮排成 6 列 × 2 行（正好排满，不留空位）
-        let all = [btnWorld, btnSelf, btnPlayers, btnAuto, btnMap, btnWindow,
-                   btnEnum, btnRefresh, btnObjects, btnCrashFile, btnMemory, btnTracker]
+        // 6 列一行。按钮数由 actionButtons 决定，不再假定正好 12 个（6×2）——
+        // 多出来的按钮会自动排到下一行，表格起点跟着让，不会被压住。
+        let all = actionButtons.map { $0.button }
         let gap: CGFloat = 4
         let perRow = 6
         let bw = (w - gap * CGFloat(perRow - 1)) / CGFloat(perRow)
@@ -158,8 +184,11 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
                              width: bw, height: bh)
         }
 
-        table.frame = CGRect(x: 0, y: headerH + btnRowH * 3, width: w,
-                             height: max(0, bounds.height - headerH - btnRowH * 3))
+        // 用实际上用掉的行数算表格起点：写死行数会和按钮排版悄悄错开
+        let usedRows = CGFloat((all.count + perRow - 1) / perRow)
+        let tableTop = headerH + btnRowH * usedRows
+        table.frame = CGRect(x: 0, y: tableTop, width: w,
+                             height: max(0, bounds.height - tableTop))
     }
 
     func reload() { onRefresh() }
@@ -259,6 +288,9 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     /// 把多行报告同时放进状态行（第一行）和可滚动列表（全部行）。
     /// 「找村口」「定点读」的结论是多行的（base/slide/三个落点/链上的值），
     /// 单行状态栏放不下，必须给列表看。
+    ///
+    /// 注意：这里会丢掉空行（split 的默认行为）。所以报告里的分区只能靠标题行
+    /// （「== xxx ==」）划开，别指望空行 —— 见 xpfReport。
     private func showReport(_ text: String) {
         let lines = text.split(separator: "\n").map(String.init)
         probeLabel.text = lines.first ?? text
@@ -309,6 +341,14 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         rows.append("［窗口］ " + MemoryProbe.windowLine)
         return rows
     }
+
+    // MARK: - XPF 状态（面板常驻显示）
+
+    /// XPF 常驻状态行。**静态**，因为面板每次收放都会新建本视图：
+    /// XPF 只初始化一次、不会因为面板重建而失效，状态就不该随之丢掉。
+    ///
+    /// 与 `AppDelegate.kernelNote` 同理 —— 只在主线程读写，一个字符串，用不着加锁。
+    private static var xpfNote = "［XPF］ 未初始化（点「XPF」按钮）"
 
     /// 内核就绪后自动刷一次面板 —— 自检是异步的，面板可能先于它建好。
     private var kernelWasReady = false
@@ -749,6 +789,181 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         }
     }
 
+    // MARK: - XPF：kernelcache 与内核符号
+
+    /*
+     * 这一步要回答三个问题，且都要能**一眼看到**：
+     *   ① 设备上的 kernelcache 到底读到没有（三条候选路径各自什么下场）；
+     *   ② XPF 初始化成功没有（耗时多久）；
+     *   ③ physrw 要用的那批内核符号解析出来没有（每个键的名字与值）。
+     *
+     * 为什么值得单独一个按钮：XPF 走的是「读文件 → mmap 内核 Mach-O → 按内核源码字符串
+     * 定位符号」，全程只有 POSIX 文件与内存映射，跟 km_init 那条内核读写通路**毫无关系**。
+     * 所以它和「窗口」一样，属于内核层挂掉时还能给出判据的那类探针 ——
+     * 因此它不设前置条件：不要求 pid，也不要求内核层就绪。
+     */
+
+    /// XPF 探测在跑。
+    ///
+    /// 为什么不复用 `probeBusy`：`km_xpf_init` 要 mmap 并解析几十 MB 的内核映像，
+    /// 实测可能几十秒；共用那个标志的话，每次点内存按钮都会看到「上一个读取还没回来」，
+    /// 把等待错记到读取头上。两者本来也不冲突 —— XPF 只碰自己的 C 侧全局状态与一把
+    /// 内部互斥锁，和 MemoryProbe / AutoTracker 的串行队列没有交集，可以并行。
+    private var xpfBusy = false
+    private var xpfStarted = Date.distantPast
+
+    /// XPF 探测要解析的键，顺序即显示顺序。
+    ///
+    /// 键名一字不改：它们必须与 libxpf 里 `xpf_item_register()` 注册的名字逐字相同，
+    /// 写错一个字母就会得到「key is not registered」，而那是**诊断结论本身**，
+    /// 不该由这里的排版去猜。备注写的是这个值在 physrw 里干什么用。
+    private static let xpfSymbolKeys: [(key: String, purpose: String)] = [
+        ("kernelSymbol.ptov_table", "物理转虚拟页表（physrw 的换算基准）"),
+        ("kernelSymbol.gVirtBase", "内核虚拟基址"),
+        ("kernelSymbol.gPhysBase", "内核物理基址"),
+        ("kernelSymbol.gPhysSize", "内核物理内存大小"),
+        ("kernelSymbol.phystokv", "物理→虚拟偏移换算函数"),
+        ("kernelSymbol.cpu_ttep", "CPU 转换表基址（TTBR1）"),
+        ("kernelSymbol.allproc", "进程链表头"),
+        ("kernelConstant.T1SZ_BOOT", "启动期地址空间尺寸（位数，不是指针）")
+    ]
+
+    /// 「XPF」按钮。**不要求 pid，也不要求内核层就绪**：它只读设备上的 kernelcache。
+    @objc private func onXpfProbe() {
+        runXpfProbe()
+    }
+
+    /// XPF 探测：初始化 → 诊断快照 → 逐键取符号。
+    ///
+    /// 全程在后台线程跑，理由与 `runProbe` 里那段完全一样，但更硬：
+    /// `km_xpf_init` 要解压并解析几十 MB 的内核映像，同步放在主线程上，
+    /// 面板会冻住几十秒（看起来就像死机）。用 `Date()` 量的是**墙钟**耗时 ——
+    /// 用户等的是这个数，不是 C 侧单调时钟给出的"内部净耗时"。
+    private func runXpfProbe() {
+        if xpfBusy {
+            // 与 runProbe 同一套防重入：被卡住的那次不会自己回来，90 秒后放行。
+            // 这个门槛比读取那边（30s）宽，因为 XPF 初始化本来就慢，不能拿它当卡死。
+            if Date().timeIntervalSince(xpfStarted) <= 90 {
+                showReport("XPF: 初始化还在跑（要解析内核映像），完成后自动出结果")
+                return
+            }
+        }
+        xpfBusy = true
+        xpfStarted = Date()
+        xpfLabel.text = "［XPF］ 初始化中…（要解析内核映像，可能几十秒）"
+        xpfLabel.textColor = idleText
+        probeLabel.text = "XPF: 读 kernelcache 中…"
+        probeLabel.textColor = idleText
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let began = Date()
+            let report = DebugProcView.xpfReport(elapsedSeconds: Date().timeIntervalSince(began))
+
+            DispatchQueue.main.async {
+                guard let s = self else { return }
+                s.xpfBusy = false
+                s.showReport(report.text)
+                s.xpfLabel.text = report.statusLine
+                s.xpfLabel.textColor = report.ready ? s.accent : s.warnText
+                DebugProcView.xpfNote = report.statusLine
+            }
+        }
+    }
+
+    /// 真正碰 C 接口的那些调用。**必须在主线程之外执行**（见 runXpfProbe）。
+    private static func xpfReport(elapsedSeconds: Double) -> (text: String, statusLine: String, ready: Bool) {
+        var lines: [String] = []
+
+        /*
+         * 每个键解析之前先抓一份错误快照。
+         *
+         * 为什么必须这样：`km_xpf_resolve_symbol` 成功时**不会**清掉上一次失败留下的
+         * 错误（XpfBridge 刻意保留，好让人事后追失败原因），而 `km_xpf_last_error()`
+         * 会把"上游 xpf 错误缓冲 + 最近一次失败"拼起来。于是一次失败之后，
+         * 后面每个取值成功的键都会看到同一段旧文本 —— 直接拿它当"这个键的失败原因"
+         * 就会张冠李戴。判据用「返回值 + 错误文本是否较上一个键发生变化」两条一起看：
+         * 只有文本变了才说明是**这个键**新报的错。唯一的例外是本批第一个键 ——
+         * 它前面没有任何键可以比，那就照实报，并在文末把残留错误另列一段供对照。
+         */
+        var errorCarriedOver = km_xpf_last_error()
+        let alreadyReady = km_xpf_ready()
+        let ok = alreadyReady ? true : km_xpf_init()
+
+        lines.append("== XPF 诊断 ==")
+        if let diagnostic = km_xpf_diagnostic() {
+            lines.append(contentsOf: diagnostic.split(separator: "\n").map(String.init))
+        }
+        // 耗时用墙钟再报一次：诊断里那个是 C 侧自己量的，面板正在等的是墙钟
+        lines.append(String(format: "init wall time: %.2f s", elapsedSeconds))
+        if alreadyReady { lines.append("(本次点击前就已就绪，上面是之前那次的结果)") }
+
+        if !ok {
+            /*
+             * 失败时**两条来源都要摊开**：`km_xpf_last_error()` 把二者拼成多行 ——
+             * 一条是 C 侧记录的"哪条候选路径 + 什么原因"，另一条是上游 xpf 自己的
+             * 错误缓冲。只显示其中一条时，最常见的那种失败（三条路径全不可读）
+             * 会只剩一句笼统的话，看不出到底卡在文件、解压还是 Mach-O 解析。
+             */
+            lines.append("== 失败原因 ==")
+            lines.append(contentsOf: errorLines(km_xpf_last_error()))
+            return (lines.joined(separator: "\n"),
+                    "［XPF］ 不可用（耗时 " + String(format: "%.1f", elapsedSeconds) + " s）—— 失败原因见列表",
+                    false)
+        }
+
+        if let loadedPath = km_xpf_kernelcache_path() {
+            lines.append("loaded: " + loadedPath)
+        }
+        if errorCarriedOver != nil {
+            lines.append("(注意：本次解析之前就存在一段残留错误，见文末「残留错误」)")
+        }
+
+        // 分区只靠标题行：showReport 会丢掉空行（见那个函数的注释）
+        lines.append("== 符号解析 ==")
+        var lastError = errorCarriedOver
+        var isFirstKey = true
+        var failedKeys = 0
+        for symbol in DebugProcView.xpfSymbolKeys {
+            let value = km_xpf_resolve_symbol(symbol.key)
+            let errorNow = km_xpf_last_error()
+            let isNewFailure = isFirstKey || errorNow != lastError
+            isFirstKey = false
+            lastError = errorNow
+
+            if value != 0 {
+                lines.append("✓ \(symbol.key) = 0x" + String(value, radix: 16) + "  — " + symbol.purpose)
+                continue
+            }
+            failedKeys += 1
+            lines.append("✗ \(symbol.key) = 取不到值（" + symbol.purpose + "）")
+            /* 错误文本没变 ⟹ 这段错误在这一个键解析之前就已经存在，不是它报的。
+             * 那种情况下真正的原因只能是「键名没在 XPF 里注册」或「finder 静默失败」，
+             * 照实说；把快照里的旧文本挂到它头上就是伪造证据。 */
+            if isNewFailure {
+                errorLines(errorNow).forEach { lines.append("    " + $0) }
+            } else {
+                lines.append("    该键没有新报错：键名可能没在 XPF 里注册，或 finder 静默失败")
+            }
+        }
+
+        if let leftover = lastError {
+            lines.append("== 残留错误（不是本批键新报的，供对照） ==")
+            errorLines(leftover).forEach { lines.append("  " + $0) }
+        }
+
+        let symbolStatus = failedKeys == 0
+            ? "8/8 符号就绪"
+            : "\(xpfSymbolKeys.count - failedKeys)/\(xpfSymbolKeys.count) 符号就绪，\(failedKeys) 个失败"
+        return (lines.joined(separator: "\n"),
+                "［XPF］ 已就绪（耗时 " + String(format: "%.1f", elapsedSeconds) + " s）· " + symbolStatus,
+                true)
+    }
+
+    private static func errorLines(_ error: String?) -> [String] {
+        guard let error else { return ["（没有错误文本）"] }
+        return error.split(separator: "\n").map(String.init)
+    }
+
     @objc private func onCrashFile() {
         if !extraRows.isEmpty {
             extraRows = []
@@ -801,7 +1016,11 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
             cell.textLabel?.lineBreakMode = .byTruncatingTail
             if line.contains("不可用") {
                 cell.textLabel?.textColor = warnText
-            } else if line.contains("就绪") || line.contains("OK") || line.contains("MATCH") {
+            } else if line.contains("✗") {
+                // 失败标记优先于下面那些"成功"关键词：XPF 的失败行里会带上候选路径全文，
+                // 而内核路径本身就含 "OK" 之类的片段，按顺序判会把它染成成功色。
+                cell.textLabel?.textColor = warnText
+            } else if line.contains("就绪") || line.contains("✓") || line.contains("OK") || line.contains("MATCH") {
                 cell.textLabel?.textColor = accent
             } else {
                 cell.textLabel?.textColor = idleText

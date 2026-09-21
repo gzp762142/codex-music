@@ -1,6 +1,11 @@
 #import "FangUISystemWindow.h"
 #import "FangUISBSHosting.h"
 #import "FangUIOrientationBridge.h"
+// XPF 符号解析层（libmemrw/xpf）：读设备上的 kernelcache、按内核源码字符串定符号。
+// 与 KernelMemory.h 那条内核读写通路无关 —— 它只碰文件与 mmap，不需要 kopen 成功，
+// 所以内核层挂掉时它照样能给出判据。
+// 头文件目录已由 HEADER_SEARCH_PATHS 的 $(SRCROOT)/Aether/libmemrw/xpf 覆盖。
+#import "XpfBridge.h"
 // 内核内存读写层（libmemrw）：C 接口，实现在 KernelMemory.m ——
 // 那是全工程唯一 include libkfd.h 的地方，其余文件只能走这个头。
 #include "KernelMemory.h"
