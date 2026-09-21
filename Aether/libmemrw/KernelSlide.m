@@ -1055,11 +1055,15 @@ static bool slide_run_find_slide(km_slide_run *run, km_slide_text *t)
  * 一个落点在别处的地址，而那正是"段外换算"的形态（KernelMemory.m 里记着的
  * bug_type 210 就是这一路）。
  */
+/*
+ * 前向声明（必须在文件作用域，不能放进函数体内）：表判成不合法时也要把独立锚点的
+ * 校验结论写进诊断，而那个函数的定义在本文件靠后的位置。
+ */
+static void slide_check_ptov_against_anchor(const km_slide_run *run, km_slide_text *t);
+
 static bool slide_read_ptov_table(uint64_t slide, km_slide_ptov_entry *out,
                                   km_slide_run *run, km_slide_text *t)
 {
-    /* 定义在本函数之后：表判不合法时也要把独立锚点的校验结论写进诊断。 */
-    static void slide_check_ptov_against_anchor(const km_slide_run *run, km_slide_text *t);
     const uint64_t symbol = km_xpf_resolve_symbol(@"kernelSymbol.ptov_table");
     if (symbol == 0) {
         text_append(t, "  XPF 取不到 kernelSymbol.ptov_table\n");
