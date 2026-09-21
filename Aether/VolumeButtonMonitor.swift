@@ -25,6 +25,15 @@ final class VolumeButtonMonitor {
         try? session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
         try? session.setActive(true, options: .notifyOthersOnDeactivation)
 
+        // 上面两句动的是**进程级共享**的音频会话，也就是 BackgroundKeepAlive
+        // 那段静音循环赖以存活的同一个会话：在已激活的会话上调 setCategory，系统会先
+        // deactivate 再按新分类 reactivate 一次，保活的 AVAudioPlayer 有可能被那一下
+        // 打断 —— 这一点我离线验证不了，所以这里不做任何断言，只叫保活来实测核对一次：
+        // 它真在跑就是零代价的 no-op，被停掉了就重建。
+        // 注意方向 —— 这里**不**调 resumeAfterSessionDeactivated()：本方法结束时会话
+        // 是 active 的，不存在"确凿失效"，立旗只会让保活被无谓地重建一遍。
+        BackgroundKeepAlive.shared.revalidateSession()
+
         playSilentLoopIfNeeded()
         attachHiddenVolumeView()
 
@@ -43,7 +52,30 @@ final class VolumeButtonMonitor {
         silentPlayer = nil
         volumeView?.removeFromSuperview()
         volumeView = nil
+
+        // 这一句停的是**进程级共享**的音频会话，不是本类私有的：BackgroundKeepAlive
+        // 那段静音循环正靠它维持后台执行权。会话一停，系统几秒内就会挂起整个进程，
+        // 而挂起可能落在外挂内核操作的中途 —— 那是最不该被打断的地方。
+        //
+        // 而且它**一定**会把会话停掉，跟返回值无关。AVAudioSession.h 的原话是：
+        //     "Starting in iOS 8, if the session has running I/Os at the time that
+        //      deactivation is requested, the session will be deactivated, but the
+        //      method will return NO and populate the NSError with the code property
+        //      set to AVAudioSessionErrorCodeIsBusy to indicate the misuse of the API."
+        // 保活的 AVAudioPlayer 还在播，正好就是"有 running I/O"的情形；那个 NO 会被
+        // 上面的 try? 吞掉，所以**不能**靠返回值判断有没有出事。
         try? session.setActive(false, options: .notifyOthersOnDeactivation)
+
+        // 本类是**唯一确切知道**共享会话刚刚被停用的地方（会话状态在 iOS 13 的公开 API
+        // 里查不到，interruptionNotification 也不保证回送本进程，理由详见
+        // BackgroundKeepAlive 里的说明），所以由这里显式把保活拉回来，不依赖任何
+        // 通知语义猜测。恢复链路：
+        //   resumeAfterSessionDeactivated(reason:)
+        //     → activate() → setActive(true)
+        //     → 重建并 play() 静音循环 → lastNote 记下"曾恢复"
+        // 保活从未被请求过时（wanted == false）这一步是空操作，不会凭空拉起静音循环。
+        BackgroundKeepAlive.shared.resumeAfterSessionDeactivated(
+            reason: "VolumeButtonMonitor.stop() 停用了共享会话")
     }
 
     private func handle(change: NSKeyValueObservedChange<Float>) {
