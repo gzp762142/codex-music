@@ -42,7 +42,8 @@ bool km_is_kernel_address(uint64_t addr);
 /*
  * 从「内核读写原语」走到「读目标进程用户态地址」。
  *
- *   procForPid   在 p_list 环上按 pid 找 struct proc
+ *   procForPid   按 pid 找 struct proc（现在只有 self pid 走短路命中，
+ *                其余 pid 的 p_list 遍历已按 KM_ENABLE_PLIST_WALK = 0 停用）
  *   translate    走该进程 pmap 的页表，把 VA 翻成 PA
  *   readProcess  对外：读目标进程 VA
  *
@@ -60,10 +61,47 @@ bool km_is_kernel_address(uint64_t addr);
  * 基准没验通时 km_linear_map_ready() 返回 false，三处读路径入口
  * （km_translate / km_read_process / km_write_process）一律直接失败，不下探到
  * kread / kwrite —— 读不出数据是预期状态，把无效地址送进内核解引用会彩屏。
+ *
+ * 止损补上的四件事（1-3 条是第二轮，第 4 条是紧接着的第三轮；只补闸门是不够的，
+ * 闸门挡被检查的那一处、挡不住数据流；细节与两次 panic 的第一手证据见 KernelMemory.m）：
+ *   1. 污染源封死：km_bootstrap_linear_delta 算出的 tte − ttep **不再写进**
+ *      g_linear_delta，只留在诊断字符串里。它曾经把"安全的 0"换成
+ *      "看似合法的错值"，反而让 km_is_kernel_address 从"必拒"变成"放行"。
+ *   2. 闸门下沉到**使用点**：km_page_table_walk / km_pte_for 在下钻
+ *      （拼 `PA + g_linear_delta`）之前自己检查 g_linear_map_valid。
+ *      由此全局不变式成立：!g_linear_map_valid ⟹ g_linear_delta == 0。
+ *   3. 内核 base 反向扫描停用（KM_ENABLE_KBASE_SCAN = 0）：它是唯一一处
+ *      "在未验证地址上**连续盲扫**"的内核访问，且不使用 delta —— delta 闸门拦不住它。
+ *      代价是 g_kernel_base 恒为 0（只有诊断消费者）。
+ *   4. p_list 链表遍历停用（KM_ENABLE_PLIST_WALK = 0）：它同样**不使用 delta**
+ *      （首跳 kernel_proc，之后每跳 `link + 偏移`），所以 delta 闸门也拦不住它。
+ *      它拦不住的是"落在内核空洞里的 link"—— 形态检查只回答"像不像内核地址"，
+ *      不回答"已映射吗"，而 kread 对未映射页就是内核态 data abort。
+ *      短路命中（self pid → current_proc，零 kread）**保留**，km_init 自证仍走它。
+ *
+ * 由此带来的**预期**状态：四条 km_compute_linear_delta 路径互为前提，
+ * 会稳定落到 linear=unresolved，读路径整体不可用；且按 pid 定位 proc
+ * 现在只剩 self pid 这一条路（其余 pid 一律失败，原因见 km_proc_lookup_blocker）。
+ * 这是刻意的安全态 —— 恢复它们需要 ptov_table 的等价物，
+ * 而不是给这条闭环打洞。
  */
 
-/// 按 pid 找 struct proc 的内核地址。找不到返回 0。
+/// 按 pid 找 struct proc 的内核地址。找不到 / 定位不了均返回 0。
+///
+/// **返回 0 的契约**：含义是「无法定位」，**不等于「该进程不存在」**。
+/// 区分办法：km_proc_lookup_blocker() 非 NULL 时，除 self pid 外的一切查询
+/// 都必然返回 0，与目标进程的状态无关；它为 NULL 时，0 才是"真的没找到"。
+///
+/// 注意上层现状（本轮不动 MemoryProbe.swift / SilentProbe.swift）：
+/// 它们把 0 一律渲染成「内核里找不到 pid 的 proc」，在当前配置下那是误报。
+/// 面板还有一条独立的出口 —— km_self_test 报告里的 procForPid 行常驻首行，
+/// 那里写的是真实原因。
 uint64_t km_proc_for_pid(int32_t pid);
+
+/// 按 pid 定位 proc 的能力当前是否被编译期开关整体停用。
+/// 返回 NULL 表示未被停用；非 NULL 即可直接显示的原因文本，也是 km_proc_for_pid
+/// 返回 0 时唯一合法的解释来源（静态字符串，不需要释放）。
+const char *km_proc_lookup_blocker(void);
 
 /// 读目标进程一个用户态虚拟地址。成功返回 true。
 /// out 直接传缓冲指针 —— Swift 侧用 withUnsafeMutableBytes 传入 [UInt8] 即可。
