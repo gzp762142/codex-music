@@ -22,8 +22,10 @@
 //      0x10104ce34  bl   #0x10104f800   ; ★ physwrite64(magicPT, magicPT|PTE) 自映射
 //  与 Dopamine `BaseBin/libjailbreak/src/physrw_pte.c:13` 同源：
 //      #define MAGIC_PT_ADDRESS (L1_BLOCK_SIZE * (L1_BLOCK_COUNT - 1))
-//  只是两边的最后一个参数取值不同（Dopamine 的 L1_BLOCK_COUNT 取 511 → 0x7FF000000000，
-//  样本的 L1_BLOCK_COUNT 取 7 → 0x7000000000）。
+//  而且**两边的取值也相同**：16K 下 get_l1_block_count() 返回 8
+//  （Dopamine `info.c:355-365`），8 − 1 = 7 → 2^36 × 7 = 0x7000000000。
+//  此前这里写过"Dopamine 取 511"，那是笔误（511 对应 4K 那套几何的另一支），
+//  实际两边算出的窗口地址一模一样 —— 这是「样本走的就是这条路」的一条数值证据。
 //
 //  ── 本模块要回答的**唯一问题** ──
 //

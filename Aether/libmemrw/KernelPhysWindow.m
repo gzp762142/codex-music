@@ -17,22 +17,26 @@
  * 写成了常量是因为它只支持 16K 机型；本模块照样本的做法按页大小判定，
  * 所以这两个值只在下面 physwindow_geometry() 里成对出现，不散落到各处。
  *
- *   粒度    L1 块大小            块数   窗口地址 = SIZE × (COUNT − 1)   对应上界的含义
- *   16K     2^36 = 0x1000000000     8   7 × 2^36 = 0x7000000000      = 2^45 = MACH_VM_MAX_ADDRESS
- *   4K      2^30 = 0x40000000     256   255 × 2^30 = 0x3FC0000000    = 2^46 − 2^36（用户上界）
+ *   粒度    L1 块大小            块数   窗口地址 = SIZE × (COUNT − 1)   上界 = SIZE × COUNT
+ *   16K     2^36 = 0x1000000000     8   7 × 2^36 = 0x7000000000       8 × 2^36 = 2^39 = 0x8000000000
+ *   4K      2^30 = 0x40000000     256   255 × 2^30 = 0x3FC0000000     256 × 2^30 = 2^38 = 0x4000000000
+ *
+ * 窗口地址 = 上界 − 一个 L1 块 = **最末一个 L1 块的起点**，它本身不是上界
+ * （早先这里写成"= 2^45 = MACH_VM_MAX_ADDRESS"，两处都错：既算错了量级，
+ * 也把块首当成了上界）。16K 那一列的上界恰与 MACH_VM_MAX_ADDRESS 相等。
  *
  * 16K 那一列与样本反汇编逐位一致（docs/当前任务.md §0.4「地址推导」：
  * 0x101093820 出口读 [0x101cfff78] = _vm_kernel_page_size → 16K 返 0x1000000000，
  * 0x1010939d0 同源 → 16K 返 8；4K 返 0x40000000 与 0x100）。
  *
- * 「窗口地址 = 用户地址空间上界」这条正是**必须建页表**的理由：它是
- * MACH_VM_MAX_ADDRESS，vm_allocate / vm_map 在这个地址上一律 KERN_INVALID_ADDRESS，
+ * 「窗口地址落在用户地址空间最末一个 L1 块内」这条正是**必须建页表**的理由：
+ * 它紧邻上界 MACH_VM_MAX_ADDRESS（0x8000000000），正常分配不会覆盖到它，
  * 所以它现在必然是未映射的（样本 §0.4 (II) 已把"它是不是别人建好的"排除掉了）。
  */
 #define KM_PW_16K_BLOCK_SIZE 0x1000000000ULL /* 2^36 */
-#define KM_PW_16K_BLOCK_COUNT 7ULL           /* 样本取 7（Dopamine 取 511） */
+#define KM_PW_16K_BLOCK_COUNT 7ULL           /* = L1_BLOCK_COUNT(8) − 1，见下面几何 */
 #define KM_PW_4K_BLOCK_SIZE 0x40000000ULL    /* 2^30 */
-#define KM_PW_4K_BLOCK_COUNT 255ULL
+#define KM_PW_4K_BLOCK_COUNT 255ULL          /* = L1_BLOCK_COUNT(256) − 1 */
 
 /*
  * arm64 页表几何。
@@ -40,6 +44,20 @@
  * 16K 粒度：L1 shift 36 / L2 shift 25 / L3 shift 14 —— 与
  * Aether/libmemrw/kfd/libkfd/info/static_info.h:62-75 的 ARM_16K_TT_L*_* 同值，
  * 也与 KernelMemory.m 里 KM_L*_SHIFT / KM_L*_MASK 同值。
+ *
+ * **L1 是 3 位（bits 38:36，掩码 0x7000000000=2^36×7），不是 11 位。** 两条独立出处：
+ *   · ARM_16K_TT_L1_SIZE = 2^36 —— 一个 L1 表项覆盖 2^36；T1SZ_BOOT = 25 时用户
+ *     地址空间上界 = 2^39（0x8000000000），2^39 / 2^36 = 8 个表项 → 3 位；
+ *   · Dopamine `BaseBin/libjailbreak/src/info.c:355-365` 的 get_l1_block_count()
+ *     在 16K 下返回 **8**（4K 返回 256），而 `translation.c:125` 里 16K 的 L1 索引
+ *     掩码是运行期常量 ARM_TT_L1_INDEX_MASK = `libxpf/xpf/common.c:120` 在
+ *     T1SZ_BOOT = 25 时给出的 `0x7000000000`。
+ * 于是窗口地址 = 2^36 × (8 − 1) = 0x7000000000，即 **L1 索引 7、L2 索引 0、L3 索引 0**
+ * —— Dopamine 的 MAGIC_PT_ADDRESS 与样本的取值完全相同（physrw_pte.c:13）。
+ *
+ * 本模块早先把这个掩码写成 11 位（0x7ff000000000），叠加 walk 里"用已被掩过的 base
+ * 取各级索引"，L1 索引必然算成 0 —— 于是探的成了**地址 0 的祖先链**，而报告里写的
+ * 是窗口地址。这正是本文件最该避免的那类错：结论看着有据，问题问的是另一个。
  *
  * 4K 粒度：**是四级表**（多一级 L0，shift 39）。上游 perf.h:252 把 ROOT_LEVEL 写死成
  * PMAP_TT_L1_LEVEL，只在 16K 上成立；本模块照样本按页大小分派，所以 4K 机型
@@ -50,7 +68,7 @@
 #define KM_PW_SHIFT_L1 36ULL
 #define KM_PW_SHIFT_L2 25ULL
 #define KM_PW_SHIFT_L3 14ULL
-#define KM_PW_INDEX_L1 0x00007ff000000000ULL /* 11 bits at 36 */
+#define KM_PW_INDEX_L1 0x0000007000000000ULL /* 3 bits at 36（为什么是 3 位见上） */
 #define KM_PW_INDEX_L2 0x0000000ffe000000ULL /* 11 bits at 25 */
 #define KM_PW_INDEX_L3 0x0000000001ffc000ULL /* 11 bits at 14 */
 
@@ -285,15 +303,16 @@ typedef enum {
 } km_pw_walk_result;
 
 /*
- * 只读页表遍历。起点是**窗口地址所属 L1 块的基址**，不是窗口地址本身。
+ * 只读页表遍历。**祖先链是 L1表[7] → L2表[0] → L3表[0]**：窗口地址
+ * 0x7000000000 = 2^36 × 7，落在 L1 表的第 7 项，而它在那个 2^36 块内的
+ * 偏移为 0，所以 L2/L3 两级索引都是 0。
  *
- * 这么切是为了让"有 / 没有"这个判据干净：窗口地址落在它自己那个 L1 块的
- * **L2 索引 0、L3 索引 0** 上（见下面 base 的算法），于是窗口地址的页表项
- * 就是「那条 L3 表的第 0 项」。而"窗口地址上有没有页表"这个问题，
- * 只该由**窗口那一条**回答 —— 从块基址走，走的每一级都是窗口自己的祖先。
+ * base = window & ~L1 索引掩码 = 0，是"窗口所在 L1 块的基址"，只用来算 L2/L3
+ * 两级的索引。**L1 那一级的索引必须取自 window** —— base 的 L1 索引位是按定义
+ * 被掩掉的，用它取索引会得到「地址 0 的祖先链」，而报告里写的却是窗口地址。
  *
  * 从块基址走到 L2 时索引同样是 0（块基址的 L2 索引必为 0），所以
- * base → L2表 → 第0项 → L3表 → 第0项 这条链就是窗口地址的完整祖先链。
+ * base → L2表 → 第0项 → L3表 → 第0项 这条链接在 L1表[7] 下面，就是窗口的完整祖先链。
  */
 static km_pw_walk_result physwindow_walk(km_pw_text *t, uint64_t pmapTtep, uint64_t window,
                                          uint64_t *outEntry, uint64_t *outEntryKva)
@@ -386,8 +405,19 @@ static km_pw_walk_result physwindow_walk(km_pw_text *t, uint64_t pmapTtep, uint6
               (unsigned long long)pmapTtep, (unsigned long long)tableKva);
 
     for (int level = 0; level < 3; level++) {
-        /* 级内索引。base 在 L1/L2 两级上都是 0，只有 L3 可能非 0（见函数头）。 */
-        const uint64_t index = (base & masks[level]) >> shifts[level];
+        /*
+         * 级内索引。
+         *
+         * **L1 那一级必须取自 window，不能取自 base**：base 的定义就是"把 L1 索引位
+         * 掩掉"，它的 L1 索引恒为 0，拿它取索引等于去走**地址 0 的祖先链**。
+         * 窗口在 L1 表里的索引是 7（(0x7000000000 >> 36) & 0x7）。
+         *
+         * L2/L3 两级取自 base 是对的：窗口就是那个 L1 块的块首，这两级索引都是 0，
+         * 而 base 的 L2/L3 索引位本来就不在 KM_PW_INDEX_L1 里，没有被掩掉。
+         */
+        const uint64_t index = (level == 0)
+                                   ? ((window & masks[0]) >> shifts[0])
+                                   : ((base & masks[level]) >> shifts[level]);
 
         uint64_t off = 0;
         if (!physwindow_mul(index, sizeof(uint64_t), &off)) {
@@ -520,9 +550,11 @@ km_physwindow_status km_physwindow_probe(void)
             summary = @"[建窗] 前置不成立：页大小取不到";
             goto done;
         }
-        pw_append(&t, "  公式：L1_BLOCK_SIZE × (L1_BLOCK_COUNT − 1) —— 后者取样本的 7\n");
-        pw_append(&t, "  （Dopamine physrw_pte.c:13 取 511）。此地址 = 用户地址空间上界，\n");
-        pw_append(&t, "  所以它必然是未映射的：这正是「必须建页表」的理由。\n");
+        pw_append(&t, "  公式：L1_BLOCK_SIZE × (L1_BLOCK_COUNT − 1)；16K 下 L1 表共 8 项\n");
+        pw_append(&t, "  （Dopamine info.c:355-365），取最后一块 = 2^36 × 7 = 0x7000000000 ——\n");
+        pw_append(&t, "  样本 physrw_pte.c:13 用的是同一公式、同一取值。该块紧邻用户地址空间\n");
+        pw_append(&t, "  上界 MACH_VM_MAX_ADDRESS(0x8000000000)，正常分配不会覆盖它：这正是\n");
+        pw_append(&t, "  「必须先建出页表」的理由。\n");
     }
 
     /* ── ③ proc → task → vm_map → pmap ── */
