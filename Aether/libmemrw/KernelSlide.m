@@ -1087,85 +1087,22 @@ static bool slide_read_ptov_table(uint64_t slide, km_slide_ptov_entry *out,
     memcpy(out, table, tableSize);
 
     /*
-     * ── 原始 dump 段（诊断优先）──────────────────────────────────────────
+     * ── 原始 dump 段已删（2026-09-22）──────────────────────────────────────
      *
-     * 为什么要把原始字直接打出来：面板与落盘都只能看到**按结构体解释后**的三元组，
-     * 而"这一项到底是不是 {pa, va, len}"正是待判定的问题本身。用错了假设去解释，
-     * 看到的就永远是"形态不合法"，无法区分下面两种成因：
-     *   · 符号地址偏移（XPF 给的引用点不等于表本身）；
-     *   · 表项布局与上游不一致（字段顺序或每项大小不是 24 字节）。
-     * 原始字一摆出来，这两者当场分开。
+     * 这一段原本打 96 字节机器字 + 逐字节 hex，本意是"让人一眼看出字段边界"。
+     * 实际结果是反的：**它害人抄错四次**（漏读一位、把定宽的 `%.18llx` 当成位宽异常、
+     * 两次看错位），而每一次抄错都改变结论、并烧掉一轮设备实验。
      *
-     * 96 字节 = 4 项 × 24 字节：够看出前四项的真实切分方式。
-     *
-     * 后来加了「逐字节」段：只看 8 字节一组的机器字，无法判断字段边界与端序，
-     * 也无法判断起点是否偏了；按字节摆开之后，这三件事当场分开。
-     * 另外把首项偏移分三档试读（-24 / 0 / +24）：表项若被整体错位解释，
-     * 那三档里必有一档能对上，而单看一档永远对不上。
+     * 现在字段边界由下面的 [ptov原始] 段按结构体解释后**定宽**打印，结论由代码给。
+     * 观测格式如果让观察者更容易犯错，那它就不是在帮忙。
      */
-    {
-        uint64_t raw[12] = {};
-        const size_t rawBytes = sizeof(raw);
-        if (slide_read_bulk(tableAddr, raw, rawBytes)) {
-            text_append(t, "  [raw] 符号=%#llx（运行时=%#llx）处 %zu 字节原始值：\n",
-                        (unsigned long long)symbol, (unsigned long long)tableAddr, rawBytes);
-            for (size_t i = 0; i < rawBytes / sizeof(uint64_t); i += 2) {
-                text_append(t, "    +%#04zx: %#018llx %#018llx\n",
-                            i * sizeof(uint64_t),
-                            (unsigned long long)raw[i],
-                            (unsigned long long)raw[i + 1]);
-            }
-        } else {
-            text_append(t, "  [raw] 符号=%#llx（运行时=%#llx）原始值读失败\n",
-                        (unsigned long long)symbol, (unsigned long long)tableAddr);
-        }
-
-        /*
-         * 逐字节段：**每行只放 8 字节**，并在行首标出它在表内的绝对偏移。
-         *
-         * 为什么改排版：上一版把 24 字节的项按 16 字节排了行，字段边界被排版本身
-         * 切错，从面板抄下来的数字就对不上号 —— 观测格式不能让观察者做错题。
-         * 8 字节一行既不会在字段中间断开，也对着 64 位机器字的自然边界。
-         */
-        uint8_t bytes[KM_SLIDE_PTOV_COUNT * 24] = {};
-        const size_t byteCount = sizeof(bytes);
-        if (slide_read_bulk(tableAddr, bytes, byteCount)) {
-            text_append(t, "  [hex] 表内偏移 + 每行 8 字节（共 %zu 字节 = %llu 项）：\n",
-                        byteCount, (unsigned long long)(byteCount / 24));
-            for (size_t i = 0; i + 8 <= byteCount; i += 8) {
-                text_append(t, "    +%#05zx: %02x %02x %02x %02x %02x %02x %02x %02x\n",
-                            i,
-                            bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3],
-                            bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]);
-            }
-        } else {
-            text_append(t, "  [hex] 逐字节段读取失败\n");
-        }
-    }
 
     /*
-     * 首项三档试读：符号地址可能不是表头。这三档各自按结构体解释并打印首项，
-     * 哪一档的 {pa, va, len} 三个域都合法，就是真正的一句话答案。
+     * 首项三档试读也已删。它原本想在"符号地址不是表头"时靠错位找到对的那一项，
+     * 但实际上符号地址若真偏了，偏多少完全未知，三档（-24/0/+24）覆盖不了；
+     * 而它的输出又要靠人从屏幕抄 —— 与上面删掉的那两段同样的毛病。
+     * 真要判"符号偏了"，靠的是 [符号运行时] 那组差值的互相印证，不是这一档。
      */
-    {
-        static const int64_t offsets[] = { -24, 0, 24 };
-        for (size_t o = 0; o < sizeof(offsets) / sizeof(offsets[0]); o++) {
-            const int64_t delta = offsets[o];
-            const uint64_t addr = tableAddr + (uint64_t)delta;
-            km_slide_ptov_entry one = {};
-            if (!slide_read_bulk(addr, &one, sizeof(one))) {
-                text_append(t, "  [偏移 %+lld] %#llx 读失败\n",
-                            (long long)delta, (unsigned long long)addr);
-                continue;
-            }
-            text_append(t, "  [偏移 %+lld] %#llx → pa=%#llx va=%#llx len=%#llx%s\n",
-                        (long long)delta, (unsigned long long)addr,
-                        (unsigned long long)one.pa,
-                        (unsigned long long)one.va,
-                        (unsigned long long)one.len,
-                        (one.pa < (1ULL << 48) && km_slide_kernel_ptr(one.va)) ? "  ← 三个域都合法" : "");
-        }
-    }
 
     /*
      * 逐项按结构体解释并**全部打印**，合法性判定留到循环之后。
@@ -1409,32 +1346,100 @@ static bool slide_read_bases(uint64_t slide, km_slide_run *run, km_slide_text *t
         { "kernelSymbol.gPhysSize", "gPhysSize", &run->physSize },
     };
 
+    /*
+     * ── 这一步的判据是本轮才理清的，写清楚，免得又被带偏 ──────────────────
+     *
+     * `slide_read64()` 的 `*ok` 只说明"两次读到同一个值"，**不说明那个值是对的**：
+     * kread 打在一个仍然映射、但已被重定位改写成别的东西的地址上时，会稳定地
+     * 读回一个稳定但错误的值。本轮就撞上了这个形态 ——
+     *
+     *     XPF 给的 gVirtBase 链接期值 + slide 算出的期望值  0xfffffe00293d2198
+     *     从内核里实读回来的值                            0xfffffe002457c000
+     *     两者相差                                        0x4E56198（非 16K 倍数）
+     *
+     * 而另外五个符号（cpu_ttep / phystokv / allproc / ptov_table / gPhysBase 的链接期值）
+     * 各自独立反推出的 slide 完全一致 —— 说明 slide 与符号定位都是对的，
+     * **只有 gVirtBase 这个"值"不对**。所以判据要落在"值本身是否可信"上：
+     * 代码读回实读值之后，自己检查它是否落在该有的域里、是否对齐，
+     * 并把它与"链接期 + slide"的期望值并排打出来对账。
+     *
+     * 另外：**任何一个基准失败都不再中止流程**。以前一失败就 return，于是
+     * "实读值到底能不能用"这个问题永远得不到回答 —— 而它才是真正决定
+     * 下一步走哪条路的那一个。
+     */
+    bool okVirt = false, okPhys = false, okSize = false;
+    uint64_t expectVirt = 0, expectPhys = 0, expectSize = 0;
+
     for (size_t i = 0; i < 3; i++) {
         NSString *key = [NSString stringWithUTF8String:fields[i].key];
         const uint64_t symbol = km_xpf_resolve_symbol(key);
         if (symbol == 0) {
             text_append(t, "  XPF 取不到 %s\n", fields[i].name);
-            return slide_refuse(run, t, "⑦ 全局基准", "XPF 没解析出 gVirtBase/gPhysBase/gPhysSize");
+            continue;
         }
 
-        bool ok = false;
-        *fields[i].slot = slide_read64(symbol + slide, &ok);
-        if (!ok) {
-            text_append(t, "  %s=%#llx（符号 %#llx + slide）读失败\n",
-                        fields[i].name, (unsigned long long)(symbol + slide),
-                        (unsigned long long)symbol);
-            return slide_refuse(run, t, "⑦ 全局基准", "三个全局里有一个读不出来");
+        const uint64_t addr = symbol + slide;
+        bool readOk = false;
+        const uint64_t value = slide_read64(addr, &readOk);
+
+        if (i == 0)      expectVirt = addr;
+        else if (i == 1) expectPhys = addr;
+        else             expectSize = addr;
+
+        if (!readOk) {
+            text_append(t, "  %s：地址 %#llx（符号 %#llx + slide）读失败\n",
+                        fields[i].name, (unsigned long long)addr, (unsigned long long)symbol);
+            continue;
+        }
+        *fields[i].slot = value;
+
+        /* 各自按自己的域判：虚拟地址走内核地址判据，物理/长度看是否落在 2^48 内。 */
+        bool valid = false;
+        if (i == 0) {
+            valid = km_slide_kernel_ptr(value);
+            okVirt = valid;
+        } else if (i == 1) {
+            valid = (value != 0) && (value < (1ULL << 48)) && ((value & 0x3fff) == 0);
+            okPhys = valid;
+        } else {
+            valid = (value != 0) && (value < (1ULL << 48));
+            okSize = valid;
+        }
+
+        text_append(t, "  %s：实读 %#llx  期望(链接期+slide) %#llx  %s%s\n",
+                    fields[i].name,
+                    (unsigned long long)value,
+                    (unsigned long long)addr,
+                    (value == addr) ? "一致" : "不一致",
+                    valid ? "" : "  【形态不合法】");
+        if (!valid) {
+            text_append(t, "      ↑ 读回来了，但这个值不满足 %s 该有的形态\n",
+                        (i == 0) ? "内核虚拟地址（域 + 对齐）"
+                                 : ((i == 1) ? "物理地址（非 0、< 2^48、16K 对齐）"
+                                             : "长度（非 0、< 2^48）"));
         }
     }
 
-    if (!km_slide_kernel_ptr(run->virtBase) ||
-        run->physBase == 0 || run->physBase >= (1ULL << 48) ||
-        run->physSize == 0 || run->physSize >= (1ULL << 48)) {
-        text_append(t, "  基准形态不合法：gVirtBase=%#llx gPhysBase=%#llx gPhysSize=%#llx\n",
-                    (unsigned long long)run->virtBase,
-                    (unsigned long long)run->physBase,
-                    (unsigned long long)run->physSize);
-        return slide_refuse(run, t, "⑦ 全局基准", "读到的值形态不合法");
+    /*
+     * 结论：三个基准里只要 **gVirtBase 与 gPhysBase 两项可用**，PA→KVA 的兜底支
+     * （`pa - gPhysBase + gVirtBase`）就能跑 —— 它覆盖内核线性映射段，够我们用。
+     * gPhysSize 只用于判 pa 是否落在该段内，缺它会让兜底支更保守，不致命。
+     *
+     * 所以这里按"够不够用"给结论，而不是"三个必须全对"：本轮已经证明
+     * gVirtBase 的**期望值**不可信（实读与期望差 0x4E56198、非 16K 倍数），
+     * 但实读值本身仍可能落在正确的内核域里 —— 那它就照样能用。
+     */
+    const bool usable = okVirt && okPhys;
+    text_append(t, "  ⑦ 判定：gVirtBase 可用=%s、gPhysBase 可用=%s、gPhysSize 可用=%s ⇒ "
+                   "兜底换算%s\n",
+                okVirt ? "是" : "否", okPhys ? "是" : "否", okSize ? "是" : "否",
+                usable ? "可用（pa - gPhysBase + gVirtBase）" : "不可用");
+
+    if (!usable) {
+        text_append(t, "  基准不够用：实读值与期望值并列在上，"
+                       "两者相差多少即为该符号（或其读取位置）的可疑量\n");
+        return slide_refuse(run, t, "⑦ 全局基准",
+                            okVirt ? "gPhysBase 不可用" : "gVirtBase 不可用");
     }
 
     text_append(t, "⑦ gVirtBase=%#llx gPhysBase=%#llx gPhysSize=%#llx\n",
