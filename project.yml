@@ -16,7 +16,38 @@ targets:
     type: application
     platform: iOS
     sources:
+      # 两个子目录单独列条，理由各不相同：
+      #   · Aether/libxpf      —— 第三方快照（XPF / ChOma / img4lib），需要一组只对它有
+      #                           意义的预处理宏；挂到 target 级会污染 KernelMemory.m / libkfd。
+      #   · Aether/libmemrw/xpf —— 我们自己写的 XPF 适配层，显式钉死 -fobjc-arc，
+      #                           这样它的对象语义不依赖工程全局的 ARC 开关。
       - path: Aether
+        excludes:
+          - "libxpf/**"
+          - "libmemrw/xpf/**"
+      - path: Aether/libmemrw/xpf
+        compilerFlags:
+          - "-fobjc-arc"
+      - path: Aether/libxpf
+        # 上游 Makefile 的 IMG4LIB_DEP 用 filter-out 明确排除它（它引用的
+        # LZVN/FastCompression.h 在本快照内不存在）。其余上游文件全部参与编译。
+        # README.md 只是为了别被当成资源塞进 App bundle —— 文件本身仍在磁盘上。
+        excludes:
+          - "img4lib/libvfs/vfs_lzvn.c"
+          - "README.md"
+        compilerFlags:
+          # 上游 iOS 目标就是用 15.0 起编的（Makefile: -miphoneos-version-min=15.0）。
+          # 这里单独抬起来只影响 libxpf 自己，App 的 deployment target 仍是 13.0。
+          - "-miphoneos-version-min=15.0"
+          - "-DUSE_COMMONCRYPTO"
+          - "-DUSE_LIBCOMPRESSION"
+          - "-DiOS10"
+          - "-DDER_MULTIBYTE_TAGS=1"
+          - "-DDER_TAG_SIZE=8"
+          - "-Wno-variadic-macros"
+          - "-Wno-multichar"
+          - "-Wno-four-char-constants"
+          - "-Wno-unused-parameter"
       - path: Assets.xcassets
       - path: AppIcons
         type: folder
@@ -25,8 +56,14 @@ targets:
     # IOServiceOpen / IOServiceMatching / IOServiceGetMatchingService /
     # IOConnectCallMethod and reads kIOMasterPortDefault. Without this the
     # objects compile but the link fails on those five symbols.
+    #
+    # Security/Foundation come from the XPF side: img4lib's vfs_img4.c uses
+    # SecKey / SecItem, and ChOma + libvfs pull in CoreFoundation and
+    # CommonCrypto (CommonCrypto itself ships inside libSystem, no extra flag).
     dependencies:
       - sdk: IOKit.framework
+      - sdk: Security.framework
+      - sdk: Foundation.framework
     settings:
       base:
         PRODUCT_NAME: Music
@@ -48,7 +85,21 @@ targets:
         # so one search root is enough. Only KernelMemory.m may include it:
         # kopen/kread/kwrite/kclose are non-static and would collide if a
         # second translation unit pulled the header in.
-        HEADER_SEARCH_PATHS: $(SRCROOT)/Aether/libmemrw
+        #
+        # The two libxpf roots exist because upstream XPF includes ChOma headers
+        # as <choma/...> while img4lib uses <libvfs/...> / <libDER/...>:
+        #   Aether/libxpf          -> choma/Fat.h（ChOma 的 .c 与 .h 同目录，照上游布局）
+        #   Aether/libxpf/img4lib  -> img4lib/libvfs/vfs.h、libDER/DER_Decode.h
+        HEADER_SEARCH_PATHS:
+          - $(SRCROOT)/Aether/libmemrw
+          - $(SRCROOT)/Aether/libmemrw/xpf
+          - $(SRCROOT)/Aether/libxpf
+          - $(SRCROOT)/Aether/libxpf/img4lib
+        # decompress.c 的 compression_decode_buffer / vfs_lzfse.c 需要它。
+        # xpc 符号不显式链接：libSystem 会 re-export libxpc，上游 iOS 构建也没加 -lxpc。
+        OTHER_LDFLAGS:
+          - $(inherited)
+          - "-lcompression"
         CLANG_ENABLE_MODULES: YES
         ALWAYS_SEARCH_USER_PATHS: NO
 schemes:
