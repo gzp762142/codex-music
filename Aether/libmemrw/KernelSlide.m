@@ -1195,6 +1195,41 @@ static bool slide_read_ptov_table(uint64_t slide, km_slide_ptov_entry *out,
         }
     }
 
+    /*
+     * ── 布局自判：把三种字段顺序都试一遍，看哪一种三项形态全过 ──────────────
+     *
+     * 为什么要把这件事交给代码：设备上的原始字节靠人从屏幕抄，抄错一位就得出
+     * 完全相反的结论（这件事已经发生过好几次）。而"哪一种字段顺序能让全部 8 项
+     * 同时通过形态检查"是纯算术、可穷举的判据 —— 代码做它比人可靠。
+     *
+     * 三种顺序对应三种真实可能：上游定义的 {pa,va,len}、按 {va,pa,len} 存的、
+     * 以及 {pa,len,va}。哪一组连续 8 项全过，就是它。
+     */
+    {
+        static const char *const names[3] = { "pa,va,len", "va,pa,len", "pa,len,va" };
+        for (int perm = 0; perm < 3; perm++) {
+            uint64_t okCount = 0;
+            bool ok = true;
+            for (uint64_t i = 0; i < KM_SLIDE_PTOV_COUNT; i++) {
+                const uint64_t w0 = table[i].pa, w1 = table[i].va, w2 = table[i].len;
+                uint64_t pa = 0, va = 0, len = 0;
+                if (perm == 0)      { pa = w0; va = w1; len = w2; }
+                else if (perm == 1) { va = w0; pa = w1; len = w2; }
+                else                { pa = w0; len = w1; va = w2; }
+
+                if (len == 0) break; /* 表结束 */
+                if (pa >= (1ULL << 48) || !km_slide_kernel_ptr(va) || len >= (1ULL << 48)) {
+                    ok = false;
+                    break;
+                }
+                okCount++;
+            }
+            text_append(t, "  [布局自判] {%s}：%s（通过 %llu 项）\n",
+                        names[perm], ok ? "全部通过" : "有不合法项",
+                        (unsigned long long)okCount);
+        }
+    }
+
     if (valid == 0) {
         text_append(t, "  上面 %llu 项没有一项通过形态检查（表是空的，或全部不合法）\n",
                     (unsigned long long)shown);
