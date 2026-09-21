@@ -295,8 +295,12 @@ final class AutoTracker {
                  * km_init 是异步的、PUAFF 要几十秒；在那之前 km_proc_for_pid 一律
                  * 返回 0，attachPort 会把失败原因写成「内核里找不到 pid 的 proc」——
                  * 那是假错误，会把人往"游戏进程有问题"的方向带。
+                 *
+                 * 用 kernelInitializing 而不是 `!kernelReady`：后者在初始化**失败**
+                 * 之后同样成立，于是"内核已经救不回来了"会被显示成"还在等初始化"，
+                 * 状态机就会一直卡在 attaching 上重试，永远不报错。
                  */
-                if !AppDelegate.kernelReady {
+                if AppDelegate.kernelInitializing {
                     setState(.attaching, "等待内核初始化（PUAFF 要几十秒）")
                 } else {
                     setState(.failed, note)

@@ -276,7 +276,16 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
      * 所以放在数据源里动态拼：每次都算一遍，永远在列表最前。
      */
     private func kernelStatusRows() -> [String] {
-        guard AppDelegate.kernelReady else {
+        /*
+         * 守卫用 kernelInitDone，不是 kernelReady。
+         *
+         * 这个函数要显示的是"内核层现在什么状态"。只看 kernelReady 的话，
+         * 初始化**失败**时这里会永远显示"初始化中…（PUAFF 需要几十秒）"，
+         * 而真正的失败原因（kernelNote 里那行"不可用：…"）永远没机会显示出来
+         * —— 用户会一直等一个不会来的结果。只要 km_init 返回过，就该把
+         * kernelNote 摊开给他看；那一行本身已经区分了成功（报告）和失败（原因）。
+         */
+        guard AppDelegate.kernelInitDone else {
             return ["［内核层］ 初始化中…（PUAFF 需要几十秒）"]
         }
         var out = AppDelegate.kernelNote

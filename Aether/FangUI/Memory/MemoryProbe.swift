@@ -596,6 +596,12 @@ final class MemoryProbe {
          * 用 `kernelReady` 当开关而不是写死 false：内核层验通之后直接放开这里
          * 就能恢复映射优先，不需要改回来。
          *
+         * 这个开关必须是"真的可用"而不是"初始化跑过了"。早先 AppDelegate 里
+         * 那个同名标志是在 km_init 返回后**无条件**置 true 的（失败也置），
+         * 于是内核层挂掉反而把这条没验通的快路径打开 —— 读的是自映射窗口里
+         * 并不存在的地址。现在 kernelReady 是 km_ready() 的直读，
+         * 失败就一定是 false，快路径保持关闭。
+         *
          * 关闭期间读取全部走 km_read_process —— 那条路是实的：走目标页表拿 PA，
          * 经线性映射用 kread 读。慢，但结论可信。
          */
@@ -910,12 +916,18 @@ final class MemoryProbe {
          *
          * 不查这一步的话，`km_proc_for_pid` 在 g_handle==0 时返回 0，
          * 这里会把「内核还没跑完 PUAFF」误报成「找不到该 pid 的 proc」。
+         *
+         * 但"没跑完"和"跑失败"必须分开报，否则用户看到的是同一句话：
+         * kernelInitializing 表示 km_init 还没返回（等着就行），另一个分支
+         * 才是真的没得救（要去看启动日志）。原先这里只查 `kernelReady`
+         * —— 那个标志在 km_init 失败时也是 true，于是失败被报成"仍在跑，
+         * 再等等"，用户会一直等一个永远不会来的结果。
          */
-        guard AppDelegate.kernelReady else {
+        guard !AppDelegate.kernelInitializing else {
             return (false, "内核尚未就绪（km_init 仍在跑，PUAFF 需要几十秒）")
         }
-        guard km_ready() else {
-            return (false, "内核层不可用（km_init 失败，见启动日志）")
+        guard AppDelegate.kernelReady else {
+            return (false, "内核层不可用（km_init 已失败，原因见启动日志 / 调试页首行）")
         }
 
         if activePid == pid, pid != 0 { return (true, "复用现有挂载") }
