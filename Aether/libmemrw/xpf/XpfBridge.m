@@ -191,6 +191,25 @@ uint64_t km_xpf_resolve_symbol(NSString *name)
     return value;
 }
 
+uint64_t km_xpf_kernel_base(void)
+{
+    pthread_mutex_lock(&g_xpfLock);
+
+    /*
+     * 两个"不可用"哨兵都要挡：0 是没填过，UINT64_MAX 是 xpf.c:587 判定的失败值
+     * （那里的检查在 xpf_start 内部，但字段本身在失败路径上会留成这个值）。
+     * 调用方拿它去拼 kernel_base 再 kread —— 让哨兵漏出去就是一次彩屏。
+     */
+    uint64_t base = 0;
+    if (g_xpfState.ready) {
+        const uint64_t value = gXPF.kernelBase;
+        if (value != 0 && value != UINT64_MAX) base = value;
+    }
+
+    pthread_mutex_unlock(&g_xpfLock);
+    return base;
+}
+
 NSString *km_xpf_last_error(void)
 {
     pthread_mutex_lock(&g_xpfLock);
@@ -222,6 +241,14 @@ NSString *km_xpf_diagnostic(void)
 
     if (g_xpfState.ready) {
         [lines addObject:[NSString stringWithFormat:@"kernelcache: %@", @(g_xpfState.kernelcachePath)]];
+        /*
+         * kernelBase 是这份镜像的**链接基址**（xpf.c:563 现读）。它单独打出来，
+         * 是因为拼运行时 kernel_base 的另一个输入（KernelSlide.m 的兜底常量）
+         * 曾经错到本机头上：两行数摆在一起，一眼就能看出常量该不该改。
+         * 上游自己也把这个值当成机型判别依据（common.c:187 拿它判 ARM_LARGE_MEMORY）。
+         */
+        [lines addObject:[NSString stringWithFormat:@"kernelBase: 0x%llx",
+                          (unsigned long long)gXPF.kernelBase]];
         [lines addObject:[NSString stringWithFormat:@"init took %.2f s", g_xpfState.initSeconds]];
         [lines addObject:[NSString stringWithFormat:@"darwin: %@  xnu: %@",
                           gXPF.darwinVersion ? @(gXPF.darwinVersion) : @"?",

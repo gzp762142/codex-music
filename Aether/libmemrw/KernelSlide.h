@@ -14,7 +14,8 @@
 //  依赖面只有三样，少一样都不成立：
 //    · KernelMemory.h —— kread 的 C 接口（km_read / km_read64 / km_is_kernel_address）
 //                        与两个只读访问器（km_current_proc / km_proc_fd_ofiles_offset）；
-//    · XpfBridge.h    —— 从设备上的 kernelcache 解出内核符号的链接期 vmaddr；
+//    · XpfBridge.h    —— 从设备上的 kernelcache 解出内核符号的链接期 vmaddr，
+//                        以及这份 kernelcache 自己的链接基址（km_xpf_kernel_base）；
 //    · libkfd/perf.h  —— **算法参照**（不是依赖）：求 slide 的链与 phystokv 的
 //                        8 段查表都逐行对照它实现，见 .m 里的行号引用。
 //
@@ -57,7 +58,13 @@ bool km_slide_resolve(void);
 /// 已算出的 kernel slide。未算出自检未通过时返回 0。
 uint64_t km_slide_value(void);
 
-/// kernel base = ARM64_LINK_ADDR + slide（即 kernelcache 的 MH_MAGIC_64 所在地址）。
+/// kernel base = 链接基址 + slide（即 kernelcache 的 MH_MAGIC_64 所在地址）。
+///
+/// 链接基址**不是**跨机型常量：优先取 XPF 现读的 gXPF.kernelBase
+/// （XpfBridge.h 的 km_xpf_kernel_base），取不到才退回 .m 里那个兜底常量 ——
+/// 两者在 ARM_LARGE_MEMORY 机型上相差整 2 TB，所以承诺里不能写死任何一侧的值。
+/// 来源会在诊断里标明（link_const / link_xpf 两行）。
+///
 /// 未算出时返回 0。
 uint64_t km_slide_kernel_base(void);
 

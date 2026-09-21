@@ -46,6 +46,21 @@ bool km_xpf_ready(void);
 /// 之后的调用命中 XPF 自己的缓存。必须在 km_xpf_init 成功之后调用。
 uint64_t km_xpf_resolve_symbol(NSString *name);
 
+/// XPF 从设备上那份 kernelcache 里**现读**出来的链接基址：kernelcache 的 Mach-O
+/// 头所在 vmaddr（libxpf/xpf/xpf.c:563 的 `gXPF.kernelBase = macho_get_base_address(...)`；
+/// 实现是扫 LC_SEGMENT_64 取最小 vmaddr、排除 __PRELINK / __PLK / __PAGEZERO，
+/// 见 libxpf/choma/MachO.c:517-537）。
+///
+/// 为什么需要它：链接基址**不是**跨机型常量 —— ARM_LARGE_MEMORY 内核（本项目目标机
+/// iPad14,3 / iPadOS 16.4.1 属于这一类）链接在 0xfffffe0007004000，而老配置链接在
+/// 0xfffffff007004000，两者差整 2 TB（0x1f000000000）。上游 libkfd 把后者抄成了
+/// static_info.h:12 的 ARM64_LINK_ADDR，那一份在本类机型上是错的。所以拼 kernel_base
+/// 必须以设备上这份为准，常量只能当兜底。
+///
+/// 返回 0 表示不可用：XPF 未就绪，或字段仍是失败哨兵（xpf.c:587 判的 UINT64_MAX）。
+/// 本函数只读内存里的解析结果，**不碰内核**。
+uint64_t km_xpf_kernel_base(void);
+
 /// 最近一次失败/异常的可读说明（可能多行）；没有失败时返回 nil。
 /// 初始化失败时，内容形如：
 ///     /System/Library/.../kernelcache: open failed (errno 2 (No such file or directory))

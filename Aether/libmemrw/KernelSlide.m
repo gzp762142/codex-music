@@ -4,9 +4,18 @@
 //
 //  职责与依赖面见 KernelSlide.h。本文件做三件事，顺序即数据流：
 //    ① 从「本进程的一条 vnode 描述符」反查出运行时 vn_kqfilter；
-//    ② 用 XPF 给的链接期 vn_kqfilter 相减得到 kernel slide，并用 kernel_base
-//       处的 Mach-O 头自检；
+//    ② 用 XPF 给的链接期 vn_kqfilter 相减得到 kernel slide，再用「链接基址 + slide」
+//       处的 Mach-O 头自检 —— 链接基址优先取 XPF 现读的 gXPF.kernelBase
+//       （km_xpf_kernel_base()），取不到才退回兜底常量。两者在 ARM_LARGE_MEMORY
+//       机型上相差整 2 TB，写死常量就等于把自检那次 kread 打到未映射地址上
+//       （见 KM_SLIDE_LINK_ADDR_FALLBACK 的注释）；
 //    ③ 读回 ptov_table 与 gVirtBase/gPhysBase/gPhysSize，提供 PA → KVA 换算。
+//
+//  ②里还有一条顺序纪律：**自检发出那次 kread 之前，先把当时的全部数值落盘**
+//  （Documents/kernelslide-diag.txt）。那一次读若地址不对，代价是内核态 data abort
+//  → 整机重启，而内存里的诊断是随重启一起没的（上一次彩屏就是这么丢掉全部现场
+//  数值的）。落盘是异步 + 有界等待，绝不无限拖住这条读链 —— 理由见
+//  slide_dump_diag_and_wait()。
 //
 //  算法原文在 Aether/libmemrw/kfd/libkfd/perf.h：slide（含自检）是 perf.h:90-118
 //  的前半段，换算表读取是 perf.h:150-163，phystokv 是 perf.h:232-248。
@@ -31,24 +40,63 @@
 #import "KernelMemory.h"
 #import "XpfBridge.h"
 
+#include <dispatch/dispatch.h>   /* 落盘必须走后台队列：观测不能长在被观测的路径上 */
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>              /* PATH_MAX：落盘路径缓冲 */
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>              /* malloc/free：异步落盘的内容要在堆上带过去 */
 #include <string.h>
+#include <sys/qos.h>             /* QOS_CLASS_USER_INITIATED：不指望 dispatch 头转引它 */
+#include <time.h>                /* clock_gettime：等落盘写完的那个上限 */
 #include <unistd.h>
 
-#pragma mark - 常量：值从哪来，为什么可以写死
+#pragma mark - 常量：值从哪来，为什么可以写死（以及哪些不能再写死）
 
 /*
- * kernelcache 在文件里的链接地址（内核 image 的 __TEXT 段起点）。
- * 与 libkfd/info/static_info.h:12 的 ARM64_LINK_ADDR 同值。
+ * 链接基址的**兜底常量**：kernelcache 里 Mach-O 头所在段的链接期 vmaddr
+ * （就是 XPF 的 macho_get_base_address() 会返回的那个数，实现见
+ * libxpf/choma/MachO.c:517-537：扫 LC_SEGMENT_64 取最小 vmaddr，
+ * 排除 __PRELINK / __PLK / __PAGEZERO）。
  *
- * 它不随设备变：每个版本的 kernelcache 都按这个 vmaddr 链接，运行时被 ASLR
- * 整体搬到 ARM64_LINK_ADDR + slide —— slide 就是本文件要算的那个数。
+ * 它为什么只是兜底、不能当真值 —— 链接基址由内核的构建配置决定，至少存在
+ * 两个域，二者相差整 2 TB：
+ *
+ *     本机（ARM_LARGE_MEMORY 内核）   0xfffffe0007004000
+ *     上游 libkfd 抄出来的那一个       0xfffffff007004000     ← 本文件原值
+ *                         差值        0x1f000000000（= 2 TB，不是手抄错，是换域）
+ *
+ * 本文件原来用的就是后者，出处是 libkfd/info/static_info.h:12 的 ARM64_LINK_ADDR；
+ * 而 static_info.h:8-12 自己标着那个值的来源是 xnu 的 makedefs/MakeInc.def ——
+ * 那是个**构建期派生**的数。kfd 把它抄成跨机型常量，于是错到本机头上。
+ *
+ * 本机取值的三份互相独立的证据：
+ *   ① 设备 panic 全文（docs/Slide彩屏取证.md §3.3）里三对 (base, slide) 反解出
+ *      同一个链接基址，三对都吻合：
+ *        KernelCache      0xfffffe001f560000 − 0x1855c000 = 0xfffffe0007004000
+ *        Kernel text      0xfffffe001f568000 − 0x18564000 = 0xfffffe0007004000
+ *        Kernel text exec 0xfffffe00204b8000 − 0x194b4000 = 0xfffffe0007004000
+ *      （KernelCache slide 与 Kernel slide 差 0x8000，与两个 base 差的 0x8000 同源，
+ *        所以配对相减后是同一个数 —— 这条自洽本身也是一份旁证。）
+ *   ② 上游 XPF 自己把这个值硬编码过一次：libxpf/xpf/common.c:187
+ *      `gXPF.kernelBase == 0xfffffe0007004000`，注释写明它是用来判
+ *      "ARM_LARGE_MEMORY kernels" 的 —— 即这一类机器上 gXPF.kernelBase 实测就是它。
+ *   ③ XPF 在本机解析成功的链接期符号全落在 0xfffffe0007xxxxxx
+ *      （kernelSymbol.ptov_table = 0xfffffe00079d3180），与本值同域，
+ *      与旧常量（0xfffffff0… 域）不同域。
+ *
+ * 错这个数的代价（彩屏的直接对症）：slide_verify_kernel_base 拿
+ * 「链接基址 + candidate」去 kread，而 kread 是让**内核**按内核语义解引用该地址 ——
+ * 偏 2 TB 就是打在一个未映射的地址上：内核态 data abort，整机重启。
+ * 更阴的一点：0xfffffff007004000 本身"看着像一个完全合法的内核地址"，
+ * km_slide_kernel_ptr 的三道形态检查一道也拦不住它。
+ *
+ * 采信顺序是「XPF 现读 > 本常量」（见 slide_link_base）。常量仍然留着，是因为
+ * 它是目标机口径的值：XPF 万一没跑起来，用它比用别人的域强。
  */
-#define KM_SLIDE_LINK_ADDR 0xfffffff007004000ULL
+#define KM_SLIDE_LINK_ADDR_FALLBACK 0xfffffe0007004000ULL
 
 /*
  * 下面三个结构体偏移由 libkfd/info/static_info.h 的字段布局推出来
@@ -108,6 +156,41 @@
  * XPF 值取错了，在拼 kernel_base 之前就该停下。
  */
 #define KM_SLIDE_MAX_VALUE 0x1000000000ULL
+
+/*
+ * 内核映像窗口的宽度（64 GB，与 KM_SLIDE_MAX_VALUE 数值相同、用途不同：那一个卡
+ * slide 自身，这一个卡「链接基址 + slide」，见 slide_candidate_fits_image）。
+ * 窗口 = [VM_MIN_KERNEL_ADDRESS, VM_MIN_KERNEL_ADDRESS + 本常量)。
+ *
+ * 依据（都是 panic 全文里的实测，docs/Slide彩屏取证.md §2）：
+ *   · 本次启动的内核映像落在窗口很靠下的位置（KernelCache base
+ *     0xfffffe001f560000，约窗口起点 + 0.5 GB）；
+ *   · zone 堆区 GEN0 起于 0xfffffe113bb18000，高于窗口上界 0xfffffe1000000000。
+ * 取 64 GB 是"宽松但够用"：真机 slide 在 GB 量级，映像永远够不到上界，
+ * 而任何跨域的错基址（例如差 2 TB 的那个）都必然落到窗口外。
+ */
+#define KM_SLIDE_IMAGE_SPAN 0x1000000000ULL
+
+/*
+ * 链接期符号相对链接基址的允许偏移上界（1 GB）。纯算术的自洽检查：基址必须
+ * **低于**它底下的每一个映像符号，且差距不能大到像是两块不同的映像。
+ * 本机实测 kernelSymbol.ptov_table = 0xfffffe00079d3180，距基址 0x9cf180（≈10 MB），
+ * 离 1 GB 很远；基址取错域时（差值 2 TB）符号会落到基址**之下**，这条立刻失败。
+ * 上界给得宽是刻意的：它要挡的是量级错误，不是几十 MB 的出入。
+ */
+#define KM_SLIDE_IMAGE_SYMBOL_MAX_OFFSET 0x40000000ULL
+
+/*
+ * 自检前落盘的文件名（App 沙盒 Documents 目录下）。固定名字、整份覆盖写：
+ * 要的是"崩之前那一刻"的快照，不是历史记录 —— 上一次彩屏丢掉的正是那一刻。
+ */
+#define KM_SLIDE_DIAG_FILE_NAME "kernelslide-diag.txt"
+
+/*
+ * 等落盘写完的上限（毫秒）。为什么会同时需要"先写后读"和"不许拖住读链"，
+ * 以及这个上限为什么是 2 秒，见 slide_dump_diag_and_wait() 的注释。
+ */
+#define KM_SLIDE_DUMP_TIMEOUT_MS 2000
 
 /*
  * 用来取 vnode 描述符的候选文件。
@@ -307,10 +390,18 @@ static bool slide_read_bulk(uint64_t addr, void *out, size_t len)
  *
  * 注意形态检查必须在还原**之后**做：带 PAC 的值高 17 位可能是签名而不是地址，
  * 直接用 KM_SLIDE_VM_MIN_KERNEL 去卡它会把合法指针误判成垃圾。
+ *
+ * rawOut 非空时回传**原始读数**（未还原 PAC），读失败则回传 0。它存在的唯一理由是
+ * 诊断：自检前落盘要把 fo_kqfilter 的原始读数与还原后的值一起写下来，否则崩了之后
+ * 无法判断错值是在读取那一步、还是在 PAC 还原那一步产生的。链条上其它四步不需要它，
+ * 传 NULL 即可 —— 不为诊断多读一次内核，那是白送一次彩屏窗口。
  */
 static uint64_t slide_read_kernel_ptr(uint64_t addr, const char *field,
-                                      uint64_t t1sz, km_slide_text *t)
+                                      uint64_t t1sz, km_slide_text *t,
+                                      uint64_t *rawOut)
 {
+    if (rawOut) *rawOut = 0;
+
     if (!km_slide_kernel_ptr(addr)) {
         text_append(t, "  读 %s 失败：待读地址 %#llx 形态不合法（未发出 kread）\n",
                     field, (unsigned long long)addr);
@@ -325,6 +416,8 @@ static uint64_t slide_read_kernel_ptr(uint64_t addr, const char *field,
         return 0;
     }
 
+    if (rawOut) *rawOut = raw;
+
     const uint64_t pointer = slide_unsign_ptr(raw, t1sz);
     if (!km_slide_kernel_ptr(pointer)) {
         text_append(t, "  读 %s 失败：%#llx 处读到 %#llx（还原 PAC 后 %#llx）不是内核指针\n",
@@ -338,6 +431,17 @@ static uint64_t slide_read_kernel_ptr(uint64_t addr, const char *field,
 #pragma mark - 一次 resolve 的上下文
 
 /*
+ * 链接基址：一个值 + 它的来源。两个字段必须一起走 —— 诊断（面板与落盘）要能
+ * 说清"这次用的是常量还是 XPF 现取"，因为这两份在 ARM_LARGE_MEMORY 机型上
+ * 差整 2 TB，只报一个数就等于把最关键的判据藏起来。
+ */
+typedef struct {
+    uint64_t addr;      /* 拿去拼 kernel_base 的那个值 */
+    uint64_t xpfValue;  /* XPF 现取的原始值，0 = 没取到（拼地址时不会用它） */
+    bool     fromXPF;   /* true = 采信 XPF；false = 退回兜底常量 */
+} km_slide_link_base;
+
+/*
  * 步骤之间传递的数据。只活在一个栈帧里，所以它自己不需要任何并发保护；
  * 全局状态只在最后一次性提交（见 slide_run_locked 的收尾）。
  */
@@ -347,6 +451,12 @@ typedef struct {
     uint64_t fdOfilesOffset;  /* struct proc 内 p_fd->fd_ofiles 的偏移 */
     uint64_t t1sz;            /* T1SZ_BOOT，PAC 掩码的来源 */
     uint64_t foKqfilter;      /* 运行时 vn_kqfilter（已还原 PAC） */
+    uint64_t foKqfilterRaw;   /* 它的**原始读数**（未还原 PAC）—— 只进诊断：
+                               * 崩了之后要能从这两个数看出 PAC 还原是否参与了错值 */
+    uint64_t linkedVnKqfilter;/* XPF 给的链接期 vn_kqfilter（求 slide 的减数） */
+    km_slide_link_base linkBase; /* 链接基址 + 来源（见上面那个结构体的注释） */
+    bool     dumpSettled;     /* 自检前那次落盘是否在窗口内写完（false 只是一条
+                               * 诊断事实，不改变流程 —— 落盘不许当门闸） */
     bool     slideVerified;   /* ⑤ 自检是否通过 —— 不能用 slide != 0 代替：
                                * 内核没开 ASLR 时 slide 合法地为 0，那时"0"是值不是标志 */
     uint64_t slide;
@@ -435,6 +545,290 @@ static bool slide_run_prepare(km_slide_run *run, km_slide_text *t)
     return slide_open_probe_file(run, t);
 }
 
+#pragma mark - 链接基址：XPF 现取优先，兜底常量垫底
+
+/*
+ * 链接基址的来源与采信顺序（两者在 ARM_LARGE_MEMORY 机型上差整 2 TB，
+ * 见 KM_SLIDE_LINK_ADDR_FALLBACK 的注释）。
+ *
+ * 为什么 XPF 优先：gXPF.kernelBase 是**设备上这份 kernelcache 现读**出来的
+ * （libxpf/xpf/xpf.c:563 → MachO.c:517-537），它跟着设备走；常量则是目标机口径的
+ * 一份一次性抄本（上游那份抄的还是另一种构建配置的值）。诊断里两个数都会原样打
+ * 出来（面板与落盘各两行），所以常量万一还是不对，下次上机一次点击就能看到该改
+ * 成什么 —— 这正是上一版彩屏最缺的那条读数。
+ *
+ * XPF 的值仍然要过 km_slide_kernel_ptr 那三道形态检查：它是拼 kernel_base 的输入，
+ * 错一个字节的后果就是内核态 data abort。0（没取到）与 UINT64_MAX（xpf.c:587 的
+ * 失败哨兵）都会被那三道挡下。注意检查通过只说明"像内核地址"，不说明"已映射"——
+ * 后者正是紧接着的自检要回答的问题。
+ */
+static km_slide_link_base slide_link_base(km_slide_text *t)
+{
+    km_slide_link_base base;
+    base.xpfValue = km_xpf_kernel_base();
+    base.fromXPF = (base.xpfValue != 0) && km_slide_kernel_ptr(base.xpfValue);
+    base.addr = base.fromXPF ? base.xpfValue : KM_SLIDE_LINK_ADDR_FALLBACK;
+
+    /*
+     * 这两行的键名（link_const / link_xpf）与落盘文件头部逐字相同，是刻意的固定
+     * 格式：面板与文件要能并排比，事后从文件里一眼读出"当时用的是哪个"，不必回头
+     * 去翻代码或猜版本。
+     */
+    text_append(t, "  link_const=%#llx（本文件兜底常量，目标机口径）\n",
+                (unsigned long long)KM_SLIDE_LINK_ADDR_FALLBACK);
+    text_append(t, "  link_xpf=%#llx%s\n",
+                (unsigned long long)base.xpfValue,
+                base.fromXPF ? "（XPF 现读）" : "（XPF 没给可用值）");
+    text_append(t, "  链接基址采用=%#llx（来源：%s）\n",
+                (unsigned long long)base.addr,
+                base.fromXPF ? "XPF 现取" : "兜底常量");
+    return base;
+}
+
+/*
+ * 候选值的独立约束（纯算术，一次 kread 都不发）。
+ *
+ * 为什么这道值得有：自检真正验证的事只有一件 ——「链接基址 + candidate」处是不是
+ * Mach-O 头。若链接基址取自错域（例如 XPF 拿不到、退回的常量又不是本机口径的），
+ * 那个待读地址会落到内核映像区之外，也就是未映射地址上；而 kread 是让**内核**去
+ * 解引用它 —— 彩屏。这道判据在发出读之前就能把这一类挡回"失败"，代价为零。
+ *
+ * 两条，第二条在符号取不到时**跳过而不是拒绝**：
+ *   ① 硬：链接基址 + candidate 必须落在内核映像窗口 [VM_MIN_KERNEL_ADDRESS,
+ *      +KM_SLIDE_IMAGE_SPAN) 内。零依赖、纯常量判据。
+ *   ② 软：XPF 的链接期符号必须都压在链接基址之上 KM_SLIDE_IMAGE_SYMBOL_MAX_OFFSET
+ *      以内 —— 它验证的是"这个基址确实压着这份映像的符号"。取不到符号就跳过：
+ *      那两个符号在第⑥⑦步另有用途，不该因为它此刻缺席而把主流程的成功路径改窄
+ *      （KernelSlide.h:46-49 写明：slide 单独有用，不该被后面的步骤拖累）。
+ */
+static bool slide_candidate_fits_image(const km_slide_run *run, uint64_t candidate,
+                                       km_slide_text *t)
+{
+    const uint64_t kernelBase = run->linkBase.addr + candidate;
+
+    if (kernelBase < KM_SLIDE_VM_MIN_KERNEL ||
+        (kernelBase - KM_SLIDE_VM_MIN_KERNEL) >= KM_SLIDE_IMAGE_SPAN) {
+        text_append(t, "  候选值越界：链接基址 %#llx + slide %#llx = %#llx，"
+                       "不在内核映像窗口 [%#llx, %#llx) 内\n",
+                    (unsigned long long)run->linkBase.addr,
+                    (unsigned long long)candidate,
+                    (unsigned long long)kernelBase,
+                    (unsigned long long)KM_SLIDE_VM_MIN_KERNEL,
+                    (unsigned long long)(KM_SLIDE_VM_MIN_KERNEL + KM_SLIDE_IMAGE_SPAN));
+        return false;
+    }
+
+    /*
+     * 刻意用 ObjC 字面量而不是 [NSString stringWithUTF8String:]：字面量是编译期常量
+     * 对象，MRC 下也不产生 autorelease 对象 —— 本文件没有钉 -fobjc-arc（project.yml
+     * 只给 libmemrw/xpf 钉了），而调用方那条串行队列上没有 runloop，
+     * 在它上面漏出去的 autorelease 对象就是真泄漏。
+     */
+    static NSString *const imageSymbols[] = {
+        @"kernelSymbol.ptov_table",
+        @"kernelSymbol.gVirtBase",
+    };
+    const size_t symbolCount = sizeof(imageSymbols) / sizeof(imageSymbols[0]);
+
+    for (size_t i = 0; i < symbolCount; i++) {
+        const uint64_t vmaddr = km_xpf_resolve_symbol(imageSymbols[i]);
+        if (vmaddr == 0) {
+            text_append(t, "  （%s 取不到，第②条自洽检查跳过）\n", imageSymbols[i].UTF8String);
+            continue;
+        }
+        if (vmaddr < run->linkBase.addr ||
+            (vmaddr - run->linkBase.addr) >= KM_SLIDE_IMAGE_SYMBOL_MAX_OFFSET) {
+            text_append(t, "  链接基址与 %s 不自洽：符号（链接期）=%#llx，"
+                           "距基址 %#llx 超出 [0, %#llx)\n",
+                        imageSymbols[i].UTF8String,
+                        (unsigned long long)vmaddr,
+                        (unsigned long long)(vmaddr >= run->linkBase.addr
+                                             ? vmaddr - run->linkBase.addr
+                                             : run->linkBase.addr - vmaddr),
+                        (unsigned long long)KM_SLIDE_IMAGE_SYMBOL_MAX_OFFSET);
+            return false;
+        }
+    }
+
+    text_append(t, "  候选值独立约束通过：kernel_base=%#llx 落在映像窗口内%s\n",
+                (unsigned long long)kernelBase,
+                run->linkBase.fromXPF ? "" : "（注意：基址用的是兜底常量）");
+    return true;
+}
+
+#pragma mark - 自检前落盘（先写文件，再发那次读）
+
+/*
+ * 这里正面撞上一次"必须"和一次"不许"，解法写在这两段之间：
+ *
+ *  · 必须：那次 kread 之前，文件里就得有内容（本文件头部 ② 的顺序纪律）。
+ *    纯 fire-and-forget 的异步落盘做不到 —— 崩溃就发生在下游那次 kread 里，
+ *    而后台线程那时可能还没被调度到，文件是空的。
+ *
+ *  · 不许：不能把文件 I/O 同步挂在读链上。MemoryProbe.swift:1242-1255 记着这条
+ *    实测教训（观测工具不能长在被观测的路径上，尤其带 I/O 的）：那次同步落盘
+ *    把整条读取链卡死，面板停在第一步再也不动 —— 每次要过 FileManager.urls →
+ *    fileExists → FileHandle 开/寻址/写/关，其中任何一步都可能阻塞。
+ *
+ * 解法：把 I/O 全部搬进后台队列（同步阶段只做一次 malloc + memcpy），然后**有界等待**
+ * 它写完（KM_SLIDE_DUMP_TIMEOUT_MS）。等待是必需的，不等待就等于放弃了"先写后读"；
+ * 上限保证最坏情况是把这条读链按住 2 秒，而不是无限期 —— 与 MemoryProbe 那次
+ * 卡死的区别就在这个上限上。
+ *
+ * 超时**不**阻断流程：落盘是观测手段，不许反过来变成门闸（否则"观测长在被观测的
+ * 路径上"换个形式又回来了）。超时这件事本身写进诊断，事后能看出这次快照可能没落地。
+ */
+static pthread_mutex_t g_dumpLock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_dumpCond = PTHREAD_COND_INITIALIZER;
+static bool            g_dumpDone = false;
+
+/*
+ * 真正落盘。**只在后台队列上执行** —— 这函数里每一步都可能阻塞。
+ * 失败一律静默返回：调用链那头只关心"写完没写完"，不关心为什么没写完
+ * （沙盒、磁盘、权限都不影响本次自检的正确性）。
+ */
+static void slide_write_diag_file(const char *text)
+{
+    /*
+     * 本文件没有单独钉 -fobjc-arc（project.yml 只给 libmemrw/xpf 钉了），所以这里
+     * 按 MRC 写：autorelease 对象不能漏在池外 —— 后台队列线程没有 runloop，
+     * 没有池就等于每次调用漏一个 NSArray + NSString。
+     */
+    @autoreleasepool {
+        NSArray<NSString *> *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                                       NSUserDomainMask, YES);
+        NSString *documents = dirs.count > 0 ? dirs.firstObject : nil;
+        if (documents.length == 0) return;
+
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s",
+                 documents.fileSystemRepresentation, KM_SLIDE_DIAG_FILE_NAME);
+
+        const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) return;
+
+        /*
+         * 单次 write，不追加、不重试、短写就短写：这条路径上的任何重试都是拿
+         * 读链的时间去换的，而它此刻正被有界等待按住。
+         */
+        const size_t len = strlen(text);
+        const ssize_t written = write(fd, text, len);
+        (void)written;
+        close(fd);
+    }
+}
+
+/// 异步写 + 有界等待。返回 true = 在窗口内写完；false = 超时或失败（都不算致命）。
+static bool slide_dump_diag_and_wait(const char *text)
+{
+    if (!text) return false;
+
+    /* 同步阶段只做内存拷贝：内容必须在堆上，异步块不能捕获栈上的缓冲。 */
+    const size_t len = strlen(text);
+    char *owned = malloc(len + 1);
+    if (!owned) return false;
+    memcpy(owned, text, len + 1);
+
+    pthread_mutex_lock(&g_dumpLock);
+    g_dumpDone = false;
+    pthread_mutex_unlock(&g_dumpLock);
+
+    /*
+     * 用 global 队列而不是 dispatch_queue_create：本文件是 MRC 编译单元，
+     * 自己 create 出来的队列对象还要管 release，而 global 队列不需要；
+     * 这里也**不需要**串行 —— 全局状态只有 g_slideLock 下的这一次调用，天然串行。
+     */
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        slide_write_diag_file(owned);
+        free(owned);
+
+        pthread_mutex_lock(&g_dumpLock);
+        g_dumpDone = true;
+        pthread_cond_signal(&g_dumpCond);
+        pthread_mutex_unlock(&g_dumpLock);
+    });
+
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += KM_SLIDE_DUMP_TIMEOUT_MS / 1000;
+    deadline.tv_nsec += (long)(KM_SLIDE_DUMP_TIMEOUT_MS % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    pthread_mutex_lock(&g_dumpLock);
+    while (!g_dumpDone) {
+        if (pthread_cond_timedwait(&g_dumpCond, &g_dumpLock, &deadline) == ETIMEDOUT) break;
+    }
+    const bool settled = g_dumpDone;
+    pthread_mutex_unlock(&g_dumpLock);
+    return settled;
+}
+
+/*
+ * 组装并落盘"崩之前那一刻"的全部数值。它是自检那次 kread 的**前一步**，
+ * 而且必须真的写完（见 slide_dump_diag_and_wait）。
+ *
+ * 头部键名是固定的：它们与面板诊断文本里的那几行同名，两处并排一看就知道
+ * 哪些数在这次事件里是对的、哪些是错的。
+ */
+static bool slide_dump_before_kread(const km_slide_run *run, uint64_t candidate,
+                                    const km_slide_text *t)
+{
+    @autoreleasepool {
+        NSString *kernelcache = km_xpf_kernelcache_path();
+
+        char head[1024];
+        snprintf(head, sizeof(head),
+                 "Aether KernelSlide diag — 自检前落盘"
+                 "（写下这一刻，之后才决定要不要发出那次 kread）\n"
+                 "candidate=%#llx\n"
+                 "link_const=%#llx\n"
+                 "link_xpf=%#llx\n"
+                 "link_used=%#llx  from=%s\n"
+                 "kernel_base_pending=%#llx\n"
+                 "fo_kqfilter_raw=%#llx\n"
+                 "fo_kqfilter_unsign=%#llx\n"
+                 "linked_vn_kqfilter=%#llx\n"
+                 "t1sz_boot=%llu\n"
+                 "current_proc=%#llx\n"
+                 "fd_ofiles_offset=%#llx\n"
+                 "kernelcache=%s\n"
+                 "=== 诊断正文（发读之前的快照）===\n",
+                 (unsigned long long)candidate,
+                 (unsigned long long)KM_SLIDE_LINK_ADDR_FALLBACK,
+                 (unsigned long long)run->linkBase.xpfValue,
+                 (unsigned long long)run->linkBase.addr,
+                 run->linkBase.fromXPF ? "xpf" : "const",
+                 (unsigned long long)(run->linkBase.addr + candidate),
+                 (unsigned long long)run->foKqfilterRaw,
+                 (unsigned long long)run->foKqfilter,
+                 (unsigned long long)run->linkedVnKqfilter,
+                 (unsigned long long)run->t1sz,
+                 (unsigned long long)run->proc,
+                 (unsigned long long)run->fdOfilesOffset,
+                 kernelcache ? kernelcache.fileSystemRepresentation : "(XPF 未就绪)");
+
+        /*
+         * 头部 + 诊断正文一次拼完再写：诊断正文此刻已经装好 ①②③④ 各步的读数，
+         * 分两次 write 只会多一个"只写了一半"的中间态。
+         */
+        const size_t headLen = strlen(head);
+        const size_t bodyLen = t ? strlen(t->buf) : 0;
+        char *text = malloc(headLen + bodyLen + 1);
+        if (!text) return false;
+
+        memcpy(text, head, headLen);
+        if (bodyLen) memcpy(text + headLen, t->buf, bodyLen);
+        text[headLen + bodyLen] = '\0';
+
+        const bool settled = slide_dump_diag_and_wait(text);
+        free(text);
+        return settled;
+    }
+}
+
 #pragma mark - 步骤③④⑤：fd → fo_kqfilter → slide → 自检
 
 /*
@@ -463,7 +857,7 @@ static bool slide_run_prepare(km_slide_run *run, km_slide_text *t)
  *
  * 整条链最终由「④ 的差值 + ⑤ 的 Mach-O 头自检」交叉验证：链条上任一步读错，
  * 得到的 fo_kqfilter 几乎不可能同时满足"与 XPF 的链接期值相差一个 16 KB 对齐的
- * 常数"和"该常数加在 ARM64_LINK_ADDR 上正对着 Mach-O 头"。
+ * 常数"和"该常数加在链接基址上正对着 Mach-O 头"。
  */
 static bool slide_resolve_fo_kqfilter(km_slide_run *run, km_slide_text *t)
 {
@@ -473,52 +867,93 @@ static bool slide_resolve_fo_kqfilter(km_slide_run *run, km_slide_text *t)
     }
 
     const uint64_t fdOfiles = slide_read_kernel_ptr(run->proc + run->fdOfilesOffset,
-                                                   "fd_ofiles", run->t1sz, t);
+                                                   "fd_ofiles", run->t1sz, t, NULL);
     if (!fdOfiles) return slide_refuse(run, t, "③ fd→fo_kqfilter", "读 fd_ofiles 失败");
 
     const uint64_t fileprocAddr = fdOfiles + (uint64_t)run->fd * sizeof(uint64_t);
-    const uint64_t fileproc = slide_read_kernel_ptr(fileprocAddr, "fileproc", run->t1sz, t);
+    const uint64_t fileproc = slide_read_kernel_ptr(fileprocAddr, "fileproc", run->t1sz, t, NULL);
     if (!fileproc) return slide_refuse(run, t, "③ fd→fo_kqfilter", "读 fileproc 失败");
 
     const uint64_t fpGlob = slide_read_kernel_ptr(fileproc + KM_OFF_FILEPROC_FP_GLOB,
-                                                 "fp_glob", run->t1sz, t);
+                                                 "fp_glob", run->t1sz, t, NULL);
     if (!fpGlob) return slide_refuse(run, t, "③ fd→fo_kqfilter", "读 fp_glob 失败");
 
     const uint64_t fgOps = slide_read_kernel_ptr(fpGlob + KM_OFF_FILEGLOB_FG_OPS,
-                                                "fg_ops", run->t1sz, t);
+                                                "fg_ops", run->t1sz, t, NULL);
     if (!fgOps) return slide_refuse(run, t, "③ fd→fo_kqfilter", "读 fg_ops 失败");
 
+    /* 链上唯一一步要留原始读数（rawOut），理由见 slide_read_kernel_ptr 的注释。 */
     const uint64_t foKqfilter = slide_read_kernel_ptr(fgOps + KM_OFF_FILEOPS_FO_KQFILTER,
-                                                     "fo_kqfilter", run->t1sz, t);
+                                                     "fo_kqfilter", run->t1sz, t,
+                                                     &run->foKqfilterRaw);
     if (!foKqfilter) return slide_refuse(run, t, "③ fd→fo_kqfilter", "读 fo_kqfilter 失败");
 
     run->foKqfilter = foKqfilter;
-    text_append(t, "③ 链：fd_ofiles=%#llx fileproc=%#llx fp_glob=%#llx fg_ops=%#llx fo_kqfilter=%#llx\n",
+    text_append(t, "③ 链：fd_ofiles=%#llx fileproc=%#llx fp_glob=%#llx fg_ops=%#llx "
+                   "fo_kqfilter=%#llx（原始读数 %#llx）\n",
                 (unsigned long long)fdOfiles, (unsigned long long)fileproc,
                 (unsigned long long)fpGlob, (unsigned long long)fgOps,
-                (unsigned long long)foKqfilter);
+                (unsigned long long)foKqfilter, (unsigned long long)run->foKqfilterRaw);
     return true;
 }
 
 /*
- * slide 自检 —— 与 perf.h:112-118 同一条判据：
- *     kernel_base = ARM64_LINK_ADDR + slide
+ * slide 自检 —— 判据与 perf.h:112-118 相同，只换掉了拼接用的那个基址：
+ *     kernel_base = 链接基址 + slide           （上游写的是 ARM64_LINK_ADDR + slide）
  *     kernel_base 处的两个 32 位字必须是 MH_MAGIC_64 与 cputype(=arm64|ABI64)
  *
  * 为什么这条能证明 slide 对：slide 是「运行时 vn_kqfilter − 链接期 vn_kqfilter」，
- * 两边任一处错，得到的都是一个随机数；随机 slide 加在 ARM64_LINK_ADDR 上，恰好
- * 落在一段以这两个字开头（且相邻两个字都对）的内核数据上的概率是 2^-64 量级。
+ * 两边任一处错，得到的都是一个随机数；随机 slide 加在链接基址上，恰好落在一段以
+ * 这两个字开头（且相邻两个字都对）的内核数据上的概率是 2^-64 量级。
+ *
+ * 但这条判据有它自己**挡不住**的一类错：基址本身错。上游那一行抄的是一个构建期
+ * 派生的常量（static_info.h:12），它在本类机型上偏了整 2 TB —— 那时无论 candidate
+ * 对不对，待读地址都落在未映射区，而 kread 是让内核去解引用它：内核态 data abort、
+ * 整机重启（设备上实测的彩屏）。所以本函数里读之前有两道额外纪律：
+ *   ① 先把此刻的全部数值落盘（那次读若出事，内存里的诊断会随重启一起没）；
+ *   ② 再过 slide_candidate_fits_image 的纯算术约束：不通过就一次读都不发
+ *      （基址取错域时它直接失败，而那正是最该留下现场的一类）。
  *
  * 顺带把一处容易读错的细节写下来：0x0100000c 是 **cputype**（CPU_TYPE_ARM64 |
  * CPU_ARCH_ABI64），不是 arm64e 的标识 —— arm64e 体现在紧随其后的 cpusubtype
  * 里（CPU_SUBTYPE_ARM64E）。所以这条判据对 arm64 与 arm64e 是同一套。
  *
  * 失败时把**算出来的 slide、kernel_base、实际读到的两个字**都写进诊断 ——
- * 那是唯一能反推"是 slide 错还是读错"的证据。
+ * 那是唯一能反推"是 slide 错还是读错"的证据（而基址来源会写在 ④ 与自检之间的
+ * link_const / link_xpf 两行里）。
  */
 static bool slide_verify_kernel_base(km_slide_run *run, uint64_t candidate, km_slide_text *t)
 {
-    run->kernelBase = KM_SLIDE_LINK_ADDR + candidate;
+    run->kernelBase = run->linkBase.addr + candidate;
+
+    text_append(t, "⑤ 待读地址=%#llx（链接基址 %#llx + slide %#llx）\n",
+                (unsigned long long)run->kernelBase,
+                (unsigned long long)run->linkBase.addr,
+                (unsigned long long)candidate);
+
+    /*
+     * 顺序纪律（本文件头部 ②）：**先把这一刻的全部数值落盘，再决定要不要读**。
+     * 这个读若地址不对，代价是内核态 data abort（整机重启），而内存里的诊断会跟着
+     * 一起消失 —— 上一次彩屏丢的就是这一刻的全部数值。
+     *
+     * 落盘刻意放在下面那道纯算术约束**之前**：约束不通过时同样留下现场。那种情形
+     * （链接基址取错域）恰恰是最需要事后能读到数值的一种，而它一次 kread 都不发 ——
+     * 换句话说，这一份文件是"我们会去读什么"的唯一记录，无论后来读没读。
+     *
+     * 落盘是有界等待，不是同步挂在读链上的 I/O，理由见 slide_dump_diag_and_wait()。
+     */
+    run->dumpSettled = slide_dump_before_kread(run, candidate, t);
+    text_append(t, "  自检前落盘：%s（Documents/%s）\n",
+                run->dumpSettled ? "已写完" : "超时或失败（不阻断本次自检）",
+                KM_SLIDE_DIAG_FILE_NAME);
+
+    /*
+     * 纯算术约束再看要不要读：不通过时这一轮一次 kread 都不发。
+     */
+    if (!slide_candidate_fits_image(run, candidate, t)) {
+        return slide_refuse(run, t, "⑤ 自检",
+                            "候选值与链接基址拼出的地址不在内核映像窗口内（未发出 kread）");
+    }
 
     uint32_t head[2] = { 0, 0 };
     if (!slide_read_bulk(run->kernelBase, head, sizeof(head))) {
@@ -536,8 +971,10 @@ static bool slide_verify_kernel_base(km_slide_run *run, uint64_t candidate, km_s
         return slide_refuse(run, t, "⑤ 自检", "kernel_base 头部不是 MH_MAGIC_64/arm64");
     }
 
+    /* 这里打印 candidate 而不是 run->slide：run->slide 要到本函数返回之后才赋值，
+     * 用它会把这行诊断打成 slide=0（值本身没错，显示错的诊断比没有更差）。 */
     text_append(t, "⑤ 自检通过：slide=%#llx kernel_base=%#llx 头部=%#x/%#x\n",
-                (unsigned long long)run->slide,
+                (unsigned long long)candidate,
                 (unsigned long long)run->kernelBase,
                 head[0], head[1]);
     return true;
@@ -589,6 +1026,14 @@ static bool slide_run_find_slide(km_slide_run *run, km_slide_text *t)
                 (unsigned long long)run->foKqfilter,
                 (unsigned long long)linkedVnKqfilter,
                 (unsigned long long)candidate);
+    run->linkedVnKqfilter = linkedVnKqfilter;
+
+    /*
+     * 链接基址：XPF 现取优先，取不到才退回兜底常量（两个值都会写进诊断，
+     * 见 slide_link_base）。取在这里而不是进函数时，是为了让诊断的顺序就是
+     * 数据流的顺序：④ 先有差值，⑤ 才有待读地址可拼。
+     */
+    run->linkBase = slide_link_base(t);
 
     if (!slide_verify_kernel_base(run, candidate, t)) return false;
 
@@ -851,8 +1296,11 @@ static bool slide_run_locked(km_slide_text *t)
     if (ok) {
         char summary[192];
         snprintf(summary, sizeof(summary),
-                 "slide=%#llx kernel_base=%#llx 换算表=ready（8 段查表 + 兜底支可用）",
-                 (unsigned long long)run.slide, (unsigned long long)run.kernelBase);
+                 "slide=%#llx kernel_base=%#llx（链接基址 %#llx，来源 %s）"
+                 "换算表=ready（8 段查表 + 兜底支可用）",
+                 (unsigned long long)run.slide, (unsigned long long)run.kernelBase,
+                 (unsigned long long)run.linkBase.addr,
+                 run.linkBase.fromXPF ? "XPF" : "常量");
         slide_diag_finalize(summary);
         g_slideSettled = true;
         return true;
