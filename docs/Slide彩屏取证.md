@@ -300,6 +300,11 @@ I/O 全在后台队列，同步段只做一次 malloc+memcpy，然后**有界等
 **第二步单独上机、单独验证**，且只改一页、立刻读回——
 写坏自己的 PTE 比读错地址更难恢复。
 
+> **这一层已经有可直接抄的开源实现**：`0x7ff/golb` 的 `golb_map()` / `golb_find_phys()`
+> / `golb_unmap()`，只需 `kbase + kread + kwrite` 三样输入（Aether 全有），
+> 还带了 PTE 地址的反查（`pv_head_table`）与 TLB 刷新做法。
+> 详见 §7.6 / §7.7。
+
 
 ---
 
@@ -406,7 +411,56 @@ A/B 两条我另做了独立取证（读原始指令字与 `bl` 目标），结�
 
 > Aether 的取舍：**A 优先**。它把已有的页表下钻能力直接变成产出，
 > 而 B/C 都需要先盲找、再验证，且都要先有 physrw 窗口层才谈得上。
-> 三者都建立在同一件事上：**physrw 窗口层必须先做出来**（见 §6.4）。
+> 三者都建立在同一件事上：**physrw 窗口层必须先做出来**（见 §6）。
+
+### 7.6 找到了参考实现（2026-09-22 补）
+
+前面说「公开资料不讲这一层」要修正：**physrw 的定位与建窗，有开源实现**，
+两个都是 C、都是 Apache-2.0：
+
+| 项目 | 它给什么 |
+|---|---|
+| [`0x7ff/golb`](https://github.com/0x7ff/golb)（81★，"Mapping physical memory to user space (EL0) on iOS"） | `golb_init(kbase, kread, kwrite)` → `golb_find_phys(virt)` 拿物理地址；`golb_map(ctx, phys, sz, prot)` 把任意物理页映射进用户态；`golb_unmap` 还原；`golb_flush_core_tlb_asid` 刷 TLB；另外自带一套 pfinder 自动定内核符号 |
+| [`0x7ff/maphys`](https://github.com/0x7ff/maphys)（"Accessing physical memory on iOS"） | 同一族：pfinder 定符号 → `kcall`（能调内核函数）→ `phys_copy` 做物理内存搬运 |
+
+**为什么对着我们的项目特别有用**：`golb_init()` 只吃 `kbase + kread + kwrite` 三样，
+而这三样 **Aether 现在全有**（`km_kernel_base` / `km_read` / `km_write`）。
+它不依赖 task port、不依赖 PUAFF 之外的任何东西。
+
+**建窗的真实做法**（`golb_map`，读出来和我们的设想对齐但更细）：
+
+```
+1  mach_vm_allocate(ANYWHERE) 一出虚拟范围
+2  kread our_map + vm_map_flags_off → 置 VM_MAP_FLAGS_NO_ZERO_FILL → kwrite 回去
+3  往这段 VA 每页写 FAULT_MAGIC，逼内核真的建立 PTE（否则只是保留虚拟地址）
+4  它自己查 vm_map_entry → vm_page 链，核 vmp_offset，拿到物理页号
+5  查 pv_head_table[(phys - phys_base) >> page_shift] → 反查出 ptep
+6  读出旧 PTE 存档 → 改写：phys | VALID | ATTRINDX(禁用缓存) | AF | AP | PNX | NG
+7  写回 + 刷 TLB（golb 的做法是临时改自己 pmap 的 sw_asid 再切回，做局部刷新）
+```
+
+第 5 步是关键细节，也是我们原先不知道的：**PTE 的地址要靠 `pv_head_table` 反查**，
+不是「算出窗口 VA 在第几级表里」推出来的——因为一页物理内存可能被多处映射。
+
+### 7.7 这些参考实现用的符号，XPF 全都给（含我们已实测的）
+
+| golb 用的符号 | 它干什么 | Aether 怎么拿 |
+|---|---|---|
+| `pv_head_table` | 从物理页号反查 PTE 地址（第 5 步） | **XPF 有** —— 样本的 `kernelSymbol.pv_head_table` 同一把键；`dynamic_info.h` 里注释着那句内核串 |
+| `pmap_find_phys` | 内核函数：pmap 内 VA→PA | XPF 有（`kernelSymbol` 族） |
+| `vm_map.pmap` / `task.itk_space` / `proc.struct_size` | 找目标进程的地址空间 | **样本解析过这三个键**，XPF 同一批 |
+| `boot_args`（`phys_base` / `mem_sz`） | 物理内存范围 | 走 XPF 或 `hw.memsize` |
+| `phystokv` / `ptov_table` / `gVirtBase` / `gPhysBase` / `cpu_ttep` | 换算与页表根 | **已在设备上实测 8/8 解析成功** |
+
+也就是说：**golb 那条路的每一块零件，Aether 手上都已经有或能拿到**——
+XPF 负责符号（替代 golb 自带的 pfinder），kfd 负责 kread/kwrite，
+缺的只有把 golb 那 7 步移植过来。
+
+> 有待确认：`golb`/`maphys` 的目标版本偏老（2020–2023），跑的是更早的 iOS；
+> 它用的 `pmap` / `vm_map` / `pv_head_table` 布局在 iOS 16.4.1 上是否一致，
+> 必须逐项核对（`vm_map_pmap_off` / `pmap_sw_asid_off` 这些在它的代码里
+> 是按版本分档硬编码的，见 `golb.c:1027-1061`）。
+
 
 
 
