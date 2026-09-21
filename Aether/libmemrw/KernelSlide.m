@@ -1283,33 +1283,32 @@ static bool slide_read_ptov_table(uint64_t slide, km_slide_ptov_entry *out,
         }
 
         /*
-         * ── 用 slide 的硬性质反过来校验上面的数 ──────────────────────────────
+         * ── 核心判据：gVirtBase 的**实测运行时值**是否等于「链接期 + slide」───────
          *
-         * slide 是 KASLR 的位移量，两个硬性质：**16 KB 对齐**、**远小于 64 GB**。
-         * 拿 gVirtBase 的运行时值减链接期值得到的差值必须满足这两条 —— 不满足就说明
-         * 「运行时值」或「链接期值」至少一个不准（屏幕抄错、或 XPF 的 finder 推错）。
+         * 这条为什么是关键：`run->virtBase` 是从内核内存里**读回来的**运行时值，
+         * 而 `gvirtSym + slide` 是由符号推出来的运行时值。两者必须逐位相等 ——
+         * 不相等就说明「读回来的那个值错了」或「slide/符号有一个不对」，
+         * 而这正是上一轮把整件事搅浑的那个点（当时只能靠人比对两个长十六进制串）。
          *
-         * 这一步的价值：它把"我读到的数对不对"变成一个由代码判定的结论，
-         * 而不是又一轮人肉比对数位。
+         * 这里由代码给结论，人只看一行。
          */
-        const uint64_t gvirtSym = km_xpf_resolve_symbol(@"kernelSymbol.gVirtBase");
-        const uint64_t gvirtRt  = run->virtBase; /* slide_read_bases 已读到的运行时值 */
-        if (gvirtSym != 0 && gvirtRt != 0) {
-            const uint64_t delta = (gvirtRt > gvirtSym) ? (gvirtRt - gvirtSym) : 0;
-            const bool aligned = (delta != 0) && ((delta & 0x3fffULL) == 0);
-            const bool inRange = delta < 0x1000000000ULL; /* 64 GB 上界，与自检同一判据 */
-            text_append(t, "  [slide 自洽] gVirtBase 运行时 %#llx − 链接期 %#llx = %#llx\n",
-                        (unsigned long long)gvirtRt, (unsigned long long)gvirtSym,
-                        (unsigned long long)delta);
-            text_append(t, "  [slide 自洽] 该差值 16K 对齐=%s、< 64GB=%s；"
-                           "本模块自检出的 slide=%#llx（两者应相等）\n",
-                        aligned ? "是" : "否", inRange ? "是" : "否",
-                        (unsigned long long)slide);
-            if (delta != slide) {
-                text_append(t, "  [slide 自洽] 不相等：说明 gVirtBase 的运行时值与链接期值"
-                               "配不上这套 slide（或其一读数不准）\n");
+        {
+            const uint64_t gvirtSym = km_xpf_resolve_symbol(@"kernelSymbol.gVirtBase");
+            const uint64_t expect   = (gvirtSym != 0) ? (gvirtSym + slide) : 0;
+            const uint64_t got      = run->virtBase;
+
+            text_append(t, "  [gVirtBase 对账] 链接期+slide=%#llx  实读=%#llx  %s\n",
+                        (unsigned long long)expect,
+                        (unsigned long long)got,
+                        (expect != 0 && expect == got) ? "相等（读数可信）" : "不相等（读数或符号有问题）");
+            if (expect != 0 && expect != got) {
+                const uint64_t gap = (got > expect) ? (got - expect) : (expect - got);
+                text_append(t, "  [gVirtBase 对账] 两者相差 %#llx（%s）—— 这一项即上轮搅浑全场的那个数\n",
+                            (unsigned long long)gap,
+                            (got > expect) ? "实读偏大" : "实读偏小");
             }
         }
+
     }
 
     if (valid == 0) {
