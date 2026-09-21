@@ -68,6 +68,16 @@ struct kfd_assert_site kfd_assert_last = { NULL, 0, NULL };
 static jmp_buf g_kopen_jmp;
 static bool g_kopen_jmp_armed = false;
 
+/*
+ * 断言失败的详情，直接给面板用。
+ *
+ * 为什么不只用 NSLog：设备日志要 Console.app 或 idevicesyslog 才看得到，
+ * 而断言失败的行号正是排查的唯一线索。把它塞进 km_init 的 err（面板首行）
+ * 才能让人一眼看到是 libkfd 的哪一步失守。
+ * 静态缓冲区：*why 的生命周期只需覆盖调用方读取那一次。
+ */
+static char g_kopen_abort_detail[256];
+
 /// 断言失败时由 common.h 的 assert 宏调用：不退出，跳回调用方。
 static void km_assert_fallback(void)
 {
@@ -109,7 +119,17 @@ static uint64_t kfd_try_open(u64 puaf_pages, u64 puaf_method, u64 read_method, u
               kfd_assert_last.line,
               kfd_assert_last.cond ? kfd_assert_last.cond : "?");
         if (why) {
-            *why = "kopen aborted (assert failed)";
+            /*
+             * 把行号一起交给调用方 —— 面板首行会显示它。
+             * 只给"assert failed"等于什么都没说：libkfd 里有几十条 assert，
+             * 不指明哪一条就没法往下查。
+             */
+            snprintf(g_kopen_abort_detail, sizeof(g_kopen_abort_detail),
+                     "kopen 断言失败 %s:%d (%s)",
+                     kfd_assert_last.file ? kfd_assert_last.file : "?",
+                     kfd_assert_last.line,
+                     kfd_assert_last.cond ? kfd_assert_last.cond : "?");
+            *why = g_kopen_abort_detail;
         }
     }
 
@@ -142,19 +162,32 @@ static bool g_linear_map_valid = false;
 
 /// PUAFF 页数。
 ///
-/// 样本不是在启动时硬编码这个值，而是按设备动态选：
-///   sysctl "hw.cpufamily" + "hw.memsize" + os_proc_available_memory
-/// 据此在 {128, 160, 256, 512, 3072} 中挑一个。
-/// 本机（iPad Pro 2022 M2 / 8GB / iPadOS 16.4.1）走到的分支是 0x200 = 512，
-/// 已由离线 unicorn 模拟在 kopen 调用点实测读出（见
-/// _analysis/game/样本puaf_pages_按设备选择.md）。
+/// 回到 2048（kfd README 的示例值 / 上游 ContentView 的默认档）。
 ///
-/// 早先用 2048 是取的 kfd README 示例值，并不在样本的候选集合里；
-/// 页数直接决定 landa 竞态窗口宽度（MAX_WIRE_COUNT / vme3_size / mlock
-/// 循环范围都与之线性相关），差 4 倍足以让竞态从能赢变成必输。
+/// 之前改成 512 是基于对样本的离线模拟推断（样本按
+/// hw.cpufamily + hw.memsize + os_proc_available_memory 在
+/// {128,160,256,512,3072} 里挑）。那个推断有两个问题：
+///   1. 模拟当时读到 kwrite_method = 0（合法域是 0/1/2），说明模拟状态不完整、
+///      走的分支未必是真实路径；
+///   2. 样本的 kfd 是自建 physrw 路径（mach_memory_object_memory_entry_64 +
+///      vm_remap 自建窗口 + physrw_pte），与上游 libkfd 的 PUAF→KRKW 路线不同，
+///      它的页数选择不能直接搬到这条路上。
 ///
-/// kopen 自身断言范围为 16 ... 3072（实测），512 位于其中。
-static const u64 kfd_puaf_pages = 512;
+/// 改回 2048 的直接依据是这次设备上的失败点：
+///   kopen 报 assert failed，最可能落在 krkw.h:222 的 assert_false(krkw_type)
+///   —— 那一行是「在 PUAF 页里没搜到目标内核对象（psemnode / fileproc）」。
+///   而 krkw.h:142 的 grabbed_puaf_pages_goal = number_of_puaf_pages / 4，
+///   512 页会先被「抓走」128 页（上游自称这是浪费 25% 的粗暴启发式），
+///   只剩 384 页可搜。上游文档对此有明确结论：
+///     "a higher number of PUAF pages makes it easier for the rest of the
+///      exploit to achieve a kernel read/write primitive"
+///   2048 时抓走 512、剩 1536 页，是 512 情形下可搜页数的 4 倍。
+///
+/// 关于彩屏：页数与本轮之前那三次 panic **没有因果关系**。panic 链是
+/// perf_run 失败 → longjmp 跳过 puaf_cleanup → 残留 vm_map 被后续操作踩中，
+/// 而那条链已经由 perf_supported = false 切断。页数只影响 KRKW 阶段的搜索
+/// 成功率。kopen 自身断言范围为 16 ... 3072（实测），2048 位于其中。
+static const u64 kfd_puaf_pages = 2048;
 
 /// kernel base 反向扫描上限，防止踩到未映射区域形成死循环。
 static const uint64_t kfd_kbase_scan_max = 0x4000000; /* 64 MB */
