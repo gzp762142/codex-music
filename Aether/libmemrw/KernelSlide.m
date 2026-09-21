@@ -1230,6 +1230,47 @@ static bool slide_read_ptov_table(uint64_t slide, km_slide_ptov_entry *out,
         }
     }
 
+    /*
+     * ── 表格原件：每项一行、值定宽 ──────────────────────────────────────
+     *
+     * 为什么单列这一段：前面的 raw / hex 两段都要靠人从屏幕抄字节，抄错一位结论
+     * 就反了（已经发生过多次）。这一段把每项的三个 64 位值**按固定宽度**打全，
+     * 一行就是一项 —— 不漏字段、不跨行、不怕截断，抄下来即可复算。
+     */
+    text_append(t, "  [ptov原始] 符号运行时=%#llx，每项 {w0, w1, w2}：\n",
+                (unsigned long long)tableAddr);
+    for (uint64_t i = 0; i < KM_SLIDE_PTOV_COUNT; i++) {
+        const uint64_t w0 = table[i].pa, w1 = table[i].va, w2 = table[i].len;
+        text_append(t, "    [%llu] %016llx %016llx %016llx\n",
+                    (unsigned long long)i,
+                    (unsigned long long)w0,
+                    (unsigned long long)w1,
+                    (unsigned long long)w2);
+        if (w0 == 0 && w1 == 0 && w2 == 0) break;
+    }
+
+    /*
+     * 顺带把 XPF 各符号的**运行时地址**（符号 + slide）也列出来。
+     * 这几个量是交叉验证 ptov 表的抓手：表里若有哪一段覆盖了它们，换算结果必须自洽。
+     */
+    {
+        static const char *const syms[] = {
+            "kernelSymbol.gVirtBase", "kernelSymbol.gPhysBase", "kernelSymbol.gPhysSize",
+            "kernelSymbol.cpu_ttep",  "kernelSymbol.phystokv", "kernelSymbol.allproc",
+            "kernelSymbol.ptov_table",
+        };
+        text_append(t, "  [符号运行时] 符号值 + slide：\n");
+        for (size_t i = 0; i < sizeof(syms) / sizeof(syms[0]); i++) {
+            const uint64_t sym = km_xpf_resolve_symbol(@(syms[i]));
+            if (sym == 0) {
+                text_append(t, "    %-28s （取不到）\n", syms[i]);
+                continue;
+            }
+            text_append(t, "    %-28s %#018llx\n",
+                        syms[i], (unsigned long long)(sym + slide));
+        }
+    }
+
     if (valid == 0) {
         text_append(t, "  上面 %llu 项没有一项通过形态检查（表是空的，或全部不合法）\n",
                     (unsigned long long)shown);
