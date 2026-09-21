@@ -493,11 +493,24 @@ km_physwindow_status km_physwindow_probe(void)
     }
     pw_append(&t, "✓ km_ready()=true\n");
 
+    /*
+     * 窗口地址在**函数作用域**算一次，②⑤ 都用它。
+     *
+     * 不能只在 ② 那个块里定义：⑤ 的遍历起点正是这个地址，而块作用域到 ②
+     * 结束就没了 —— CI #153 那两条 "use of undeclared identifier 'window'"
+     * 就是这么来的。也不在 ⑤ 里重算：km_physwindow_address() 会走 sysctl 与
+     * 进程级状态，同一次探测里算两遍就多出一条并列路径，且两遍万一不一致
+     * （页大小中途被改无从发生，但"一次探测一个结论"这条口径要守住）。
+     *
+     * 放在 ① 之后：① 不成立就直接 goto done，连页大小都不必问。
+     * 本调用只读 hw.pagesize，不碰内核内存（见头文件）。
+     */
+    const uint64_t window = km_physwindow_address();
+
     /* ── ② 页大小与窗口地址 ── */
     {
         pw_append(&t, "== ② 窗口地址 ==\n");
         const uint64_t pageSize = km_kernel_page_size();
-        const uint64_t window = km_physwindow_address();
         g_pwAddress = window;
         pw_append(&t, "km_kernel_page_size()=%#llx，km_physwindow_address()=%#llx\n",
                   (unsigned long long)pageSize, (unsigned long long)window);
@@ -656,7 +669,15 @@ km_physwindow_status km_physwindow_probe(void)
             summary = @"[建窗] 中断：算出的地址形态不过（见列表）";
             break;
         case KM_PW_WALK_READ_FAIL:
-            status = KM_PW_READ_FAIL;
+            /*
+             * 对外归到 PMAP_UNRESOLVED，**不新增枚举**。
+             *
+             * 头文件那组状态是面板与下一段共用的契约：某级表项读失败 = ttep 给
+             * 出的那条链走不通，语义就是「pmap 链路取不到」，只是断点在下行
+             * 途中而不是 ttep 本身。摘要与列表里会写明是"读失败"，区分度不丢。
+             * 新增一个枚举值会牵动面板那侧的穷尽 switch，收益却不抵这次改动。
+             */
+            status = KM_PW_PMAP_UNRESOLVED;
             summary = @"[建窗] 中断：某级表项读失败（见列表）";
             break;
         }
