@@ -1258,6 +1258,10 @@ static bool slide_read_ptov_table(uint64_t slide, km_slide_ptov_entry *out,
     /*
      * 顺带把 XPF 各符号的**运行时地址**（符号 + slide）也列出来。
      * 这几个量是交叉验证 ptov 表的抓手：表里若有哪一段覆盖了它们，换算结果必须自洽。
+     *
+     * 定宽输出 + 同时给链接期值：从屏幕抄长度不定的十六进制已经出错四次
+     * （把 `%.18llx` 的定宽当成位宽异常、漏读一位、把 0xfffffe00077 看成 0xfffffe00167…），
+     * 所以这里两个值都按固定 18 位打，少一位就是异常。
      */
     {
         static const char *const syms[] = {
@@ -1265,15 +1269,46 @@ static bool slide_read_ptov_table(uint64_t slide, km_slide_ptov_entry *out,
             "kernelSymbol.cpu_ttep",  "kernelSymbol.phystokv", "kernelSymbol.allproc",
             "kernelSymbol.ptov_table",
         };
-        text_append(t, "  [符号运行时] 符号值 + slide：\n");
+        text_append(t, "  [符号运行时] 每行：符号链接期值 → 运行时值（= 链接期 + slide）：\n");
         for (size_t i = 0; i < sizeof(syms) / sizeof(syms[0]); i++) {
             const uint64_t sym = km_xpf_resolve_symbol(@(syms[i]));
             if (sym == 0) {
-                text_append(t, "    %-28s （取不到）\n", syms[i]);
+                text_append(t, "    %-26s （取不到）\n", syms[i]);
                 continue;
             }
-            text_append(t, "    %-28s %#018llx\n",
-                        syms[i], (unsigned long long)(sym + slide));
+            text_append(t, "    %-26s %#018llx → %#018llx\n",
+                        syms[i],
+                        (unsigned long long)sym,
+                        (unsigned long long)(sym + slide));
+        }
+
+        /*
+         * ── 用 slide 的硬性质反过来校验上面的数 ──────────────────────────────
+         *
+         * slide 是 KASLR 的位移量，两个硬性质：**16 KB 对齐**、**远小于 64 GB**。
+         * 拿 gVirtBase 的运行时值减链接期值得到的差值必须满足这两条 —— 不满足就说明
+         * 「运行时值」或「链接期值」至少一个不准（屏幕抄错、或 XPF 的 finder 推错）。
+         *
+         * 这一步的价值：它把"我读到的数对不对"变成一个由代码判定的结论，
+         * 而不是又一轮人肉比对数位。
+         */
+        const uint64_t gvirtSym = km_xpf_resolve_symbol(@"kernelSymbol.gVirtBase");
+        const uint64_t gvirtRt  = run->virtBase; /* slide_read_bases 已读到的运行时值 */
+        if (gvirtSym != 0 && gvirtRt != 0) {
+            const uint64_t delta = (gvirtRt > gvirtSym) ? (gvirtRt - gvirtSym) : 0;
+            const bool aligned = (delta != 0) && ((delta & 0x3fffULL) == 0);
+            const bool inRange = delta < 0x1000000000ULL; /* 64 GB 上界，与自检同一判据 */
+            text_append(t, "  [slide 自洽] gVirtBase 运行时 %#llx − 链接期 %#llx = %#llx\n",
+                        (unsigned long long)gvirtRt, (unsigned long long)gvirtSym,
+                        (unsigned long long)delta);
+            text_append(t, "  [slide 自洽] 该差值 16K 对齐=%s、< 64GB=%s；"
+                           "本模块自检出的 slide=%#llx（两者应相等）\n",
+                        aligned ? "是" : "否", inRange ? "是" : "否",
+                        (unsigned long long)slide);
+            if (delta != slide) {
+                text_append(t, "  [slide 自洽] 不相等：说明 gVirtBase 的运行时值与链接期值"
+                               "配不上这套 slide（或其一读数不准）\n");
+            }
         }
     }
 
