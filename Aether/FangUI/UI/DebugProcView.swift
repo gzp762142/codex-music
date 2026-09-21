@@ -17,8 +17,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     /// 非空时表格显示这些文本行（Jetsam 报告等），否则显示进程列表
     private var extraRows: [String] = []
     private var gpid: Int32 = 0
-    /// 顶部信息区的高度：三行读数 + 一行 XPF 常驻状态。
-    private let headerH: CGFloat = 64
+    /// 顶部信息区的高度：三行读数 + 一行 XPF 常驻状态 + 一行 Slide 常驻状态。
+    private let headerH: CGFloat = 79
     private let btnRowH: CGFloat = 26
 
     private let countLabel = UILabel()
@@ -31,6 +31,12 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     /// 面板每次收放还会整个重建。而 XPF 一旦初始化成功就一直是就绪的，
     /// 它的结论最该像「［窗口］」那样常驻 —— 重建后靠 xpfNote 恢复。
     private let xpfLabel = UILabel()
+    /// Slide 常驻状态行（「［Slide］未计算 / 就绪 · slide=0x…」）。
+    ///
+    /// 与 xpfLabel 同理：面板收放会整个重建，而 slide 一旦算出来就一直有效
+    /// （它只能通过 kernel_base 处的 Mach-O 头自检才会被发布），所以结论要常驻，
+    /// 重建后靠 slideNote 恢复。
+    private let slideLabel = UILabel()
     private let table = UITableView(frame: .zero, style: .plain)
 
     /// 跑一次：刷新 → 找村口 → 世界 → 名字池，一条链自动走完
@@ -74,6 +80,10 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     /// XPF：读设备的 kernelcache 并解析 physrw 要用的那批内核符号。
     /// 与「窗口」同类 —— 不要求 pid、不依赖内核读写层，可单独跑。
     private let btnXpf = UIButton(type: .system)
+    /// Slide：算出 kernel slide / kernel base，并读回 ptov_table 做 PA→KVA 换算。
+    /// 与「XPF」的差别是它**要 kread**（读 fileproc / fileops / ptov_table），
+    /// 所以前置条件是内核层就绪，且必须与读取链串行（见 runSlideProbe）。
+    private let btnSlide = UIButton(type: .system)
 
     /// 面板上的按钮与其 action。**唯一数据源**：init 按它接线，layoutSubviews 按它排版。
     /// 原先这两处各写一份列表，加一个按钮就得改两个地方、还必须顺序一致 —— 迟早会错位。
@@ -97,7 +107,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         (btnCrashFile, "崩溃文件", #selector(onCrashFile)),
         (btnMemory, "内存", #selector(onMemory)),
         (btnTracker, "自动", #selector(onTracker)),
-        (btnXpf, "XPF", #selector(onXpfProbe))
+        (btnXpf, "XPF", #selector(onXpfProbe)),
+        (btnSlide, "Slide", #selector(onSlideProbe))
     ]
 
     private let accent = UIColor.hex(0x185EE0)
@@ -108,7 +119,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         super.init(frame: frame)
         backgroundColor = .clear
 
-        for l in [countLabel, hitLabel, probeLabel, crashLabel, xpfLabel] {
+        for l in [countLabel, hitLabel, probeLabel, crashLabel, xpfLabel, slideLabel] {
             l.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
             l.textColor = idleText
             l.adjustsFontSizeToFitWidth = true
@@ -137,6 +148,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         // XPF 状态跨面板重建保留（面板收放会新建整个视图）：XPF 只初始化一次，
         // 那几十秒不该因为收起再弹出就白等第二遍。
         xpfLabel.text = DebugProcView.xpfNote
+        // Slide 同理：它只有在通过 kernel_base 的 Mach-O 头自检之后才有结论。
+        slideLabel.text = DebugProcView.slideNote
 
         table.dataSource = self
         table.delegate = self
@@ -169,6 +182,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         crashLabel.frame = CGRect(x: w * 0.6, y: 15, width: w * 0.4, height: 14)
         probeLabel.frame = CGRect(x: 0, y: 30, width: w, height: 14)
         xpfLabel.frame = CGRect(x: 0, y: 45, width: w, height: 14)
+        slideLabel.frame = CGRect(x: 0, y: 60, width: w, height: 14)
 
         // 6 列一行。按钮数由 actionButtons 决定，不再假定正好 12 个（6×2）——
         // 多出来的按钮会自动排到下一行，表格起点跟着让，不会被压住。
@@ -349,6 +363,9 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     ///
     /// 与 `AppDelegate.kernelNote` 同理 —— 只在主线程读写，一个字符串，用不着加锁。
     private static var xpfNote = "［XPF］ 未初始化（点「XPF」按钮）"
+
+    /// Slide 常驻状态行。理由与 xpfNote 完全相同（面板每次收放都会新建本视图）。
+    private static var slideNote = "［Slide］ 未计算（点「Slide」按钮）"
 
     /// 内核就绪后自动刷一次面板 —— 自检是异步的，面板可能先于它建好。
     private var kernelWasReady = false
@@ -962,6 +979,94 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     private static func errorLines(_ error: String?) -> [String] {
         guard let error else { return ["（没有错误文本）"] }
         return error.split(separator: "\n").map(String.init)
+    }
+
+    // MARK: - Slide：kernel slide 与 PA→KVA 换算
+
+    /*
+     * 这个按钮要回答两件事：内核被搬到哪去了（slide / kernel base），以及一个物理
+     * 地址对应哪个内核虚拟地址（PA→KVA）。它是按 PA 改写 PTE 那条路的前置 ——
+     * 「证明某个地址确实已映射」这件事的技术前提，正是一套不依赖页表遍历的换算基准。
+     *
+     * 与「XPF」按钮的关键差别：**它会 kread**
+     * （proc → fd_ofiles → fileproc → fileglob → fileops → fo_kqfilter，再读
+     *  ptov_table 与三个全局）。libkfd 的后端不是线程安全的 —— kread_sem_open 每次读
+     * 都要改写自己 psemnode 的 pinfo，并发的两次 kread 会互相踩。所以这里走
+     * `AutoTracker.shared.syncExternal`，与 runProbe 同一条串行队列。
+     * XPF 不走它：那条路只碰文件与 mmap，和内核读写无关。
+     *
+     * 前置条件只有「内核层已就绪」；XPF 还没初始化时，本按钮会自己初始化它
+     * （要解压解析几十 MB 的 kernelcache，可能几十秒 —— 面板会显示"计算中"）。
+     */
+
+    private var slideBusy = false
+    private var slideStarted = Date.distantPast
+
+    @objc private func onSlideProbe() {
+        runSlideProbe()
+    }
+
+    private func runSlideProbe() {
+        if slideBusy {
+            // 与 XPF 同一套防重入。门槛比 XPF 宽：它可能先花几十秒去初始化 XPF。
+            if Date().timeIntervalSince(slideStarted) <= 120 {
+                showReport("Slide: 还在算（首次要初始化 XPF，可能几十秒）")
+                return
+            }
+        }
+        slideBusy = true
+        slideStarted = Date()
+        slideLabel.text = "［Slide］ 计算中…（可能要先解析 kernelcache）"
+        slideLabel.textColor = idleText
+        probeLabel.text = "Slide: 计算中…"
+        probeLabel.textColor = idleText
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            // 与读取链共用同一条串行队列 —— 本按钮会 kread（理由见上面那段注释）
+            let text = AutoTracker.shared.syncExternal { DebugProcView.slideReport() }
+            DispatchQueue.main.async {
+                guard let s = self else { return }
+                s.slideBusy = false
+                s.showReport(text)
+
+                let ready = km_phystokv_ready()
+                let slide = km_slide_value()
+                let line: String
+                if ready {
+                    line = "［Slide］ 就绪 · slide=0x" + String(slide, radix: 16)
+                        + " · base=0x" + String(km_slide_kernel_base(), radix: 16)
+                } else if slide != 0 {
+                    line = "［Slide］ slide 已通过自检，换算表未就绪（诊断见列表）"
+                } else {
+                    line = "［Slide］ 未完成（诊断见列表）"
+                }
+                s.slideLabel.text = line
+                s.slideLabel.textColor = ready ? s.accent : s.warnText
+                DebugProcView.slideNote = line
+            }
+        }
+    }
+
+    /// 真正碰 C 接口的那些调用。**必须在主线程之外执行**（见 runSlideProbe）。
+    ///
+    /// 报告的正文（每一步的判据与读到的值）由 C 侧拼好放在第一行摘要之后 ——
+    /// 分步逻辑在 KernelSlide.m 里，这里只负责显示：面板不复算任何判据，
+    /// 免得两边各判断一次、结论还不一致。
+    private static func slideReport() -> String {
+        var lines: [String] = []
+
+        let ok = km_slide_resolve()
+        lines.append(ok ? "✓ Slide 就绪" : "✗ Slide 未完成（失败在哪一步见下面第一行摘要）")
+
+        if let diagnostic = km_slide_diagnostic() {
+            lines.append(contentsOf: diagnostic.split(separator: "\n").map(String.init))
+        }
+
+        lines.append("== 对外接口 ==")
+        lines.append("km_slide_value() = 0x" + String(km_slide_value(), radix: 16))
+        lines.append("km_slide_kernel_base() = 0x" + String(km_slide_kernel_base(), radix: 16))
+        lines.append("km_phystokv_ready() = " + (km_phystokv_ready() ? "true" : "false"))
+        return lines.joined(separator: "\n")
     }
 
     @objc private func onCrashFile() {

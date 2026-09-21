@@ -849,6 +849,36 @@ uint64_t km_kernel_base(void)
     return g_kernel_base;
 }
 
+/*
+ * ── 给 KernelSlide 的两个只读接线（声明与理由见 KernelMemory.h）──
+ *
+ * 两者都只是"把已经存在的值读出来"：不发 kread、不写状态，也不参与本文件
+ * 任何一条读路径，所以它们不改变 km_init / km_read / km_translate 的行为。
+ * 刻意返回 0 而不是让调用方自己去解引用 g_handle：`struct kfd` 的布局只应
+ * 出现在本文件里。
+ */
+uint64_t km_current_proc(void)
+{
+    if (g_handle == 0) {
+        return 0;
+    }
+    return ((struct kfd *)g_handle)->info.kaddr.current_proc;
+}
+
+uint64_t km_proc_fd_ofiles_offset(void)
+{
+    if (g_handle == 0) {
+        return 0;
+    }
+    /*
+     * dynamic_info(...) 展开成 kern_versions[kfd->info.env.vid].xxx，是靠名字
+     * 捕获局部变量 `kfd` 的宏（与 km_translate 里那处注记同因），所以这里必须
+     * 有一个同名局部变量。
+     */
+    struct kfd *kfd = (struct kfd *)g_handle;
+    return dynamic_info(proc__p_fd__fd_ofiles);
+}
+
 bool km_read(uint64_t addr, void *out, uint64_t len)
 {
     if (g_handle == 0 || out == NULL || len == 0) {

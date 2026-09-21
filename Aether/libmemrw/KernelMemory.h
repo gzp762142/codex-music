@@ -38,6 +38,28 @@ bool km_write(uint64_t addr, const void *in, uint64_t len);
 /// 把内核地址合法性做一次快速检查（用于日志与断言，不参与功能）。
 bool km_is_kernel_address(uint64_t addr);
 
+#pragma mark - 给 KernelSlide 的两个只读接线
+/*
+ * KernelSlide（KernelSlide.h）要自己走一遍上游 perf.h:97-98 的第一步 ——
+ * 「本进程 proc → p_fd → fd_ofiles」，再顺着 fd 找回 fileproc。
+ * 这条链的两个输入只有本文件拿得到：current_proc 在 kfd 的 info 缓存里，
+ * fd_ofiles 的偏移在版本表里。
+ *
+ * 所以这里各开一个只读访问器，而**不导出 kfd 指针本身** —— 那会把
+ * 「全工程只有 KernelMemory.m 可以 include libkfd.h」这条边界拆掉，
+ * 而那条边界是重复符号问题的唯一防线。
+ *
+ * 两个函数都不发 kread、不改任何状态，只是把已经存在的值读出来，
+ * 所以它们不引入任何新的内核访问。
+ */
+
+/// 本进程 struct proc 的内核地址（info_run 反查所得）。未就绪 / 未反查到返回 0。
+uint64_t km_current_proc(void);
+
+/// `struct proc` 内 `p_fd->fd_ofiles` 的偏移（取自 libkfd 的版本表）。
+/// 内核层未就绪、或当前内核版本不匹配任何表项时返回 0。
+uint64_t km_proc_fd_ofiles_offset(void);
+
 #pragma mark - 地址翻译层
 /*
  * 从「内核读写原语」走到「读目标进程用户态地址」。
