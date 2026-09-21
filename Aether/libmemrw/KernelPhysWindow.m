@@ -334,6 +334,39 @@ static km_pw_walk_result physwindow_walk(km_pw_text *t, uint64_t pmapTtep, uint6
         return KM_PW_WALK_GEOMETRY;
     }
 
+    /*
+     * 掩码 ↔ 表项数自洽检查：把"掩码位宽写错"变成可执行判据。
+     *
+     * 为什么不能靠"看一眼 L1 索引对不对"发现掩码写错：窗口地址 0x7000000000 的
+     * bits 46:39 恰好全为 0，于是 **3 位掩码与 11 位掩码算出来的 L1 索引都是 7**，
+     * 打印出来一模一样。唯一能分辨的是"掩码覆盖几个表项、对不对得上这一级的表项数"：
+     *      (0x0000007000000000 >> 36) + 1 = 8     与 KM_PW_16K_BLOCK_COUNT 相等 ✓
+     *      (0x00007ff000000000 >> 36) + 1 = 2048  ← 当年就是这一版，✗
+     * 本文件踩过这个坑（L1 掩码曾写成 11 位），所以留成判据而不是留成注释。
+     *
+     * L2/L3 用"位移差"表达，同样把位数钉死：L1→L2 与 L2→L3 各跨 11 位索引，
+     * 即两级各有 2^11 = 2048 个表项（与 Dopamine info.c:384-390 的 16K 取值一致）。
+     */
+    const uint64_t l1Entries = (KM_PW_INDEX_L1 >> KM_PW_SHIFT_L1) + 1;
+    const uint64_t l2Entries = (KM_PW_INDEX_L2 >> KM_PW_SHIFT_L2) + 1;
+    const uint64_t l3Entries = (KM_PW_INDEX_L3 >> KM_PW_SHIFT_L3) + 1;
+    const uint64_t spanL1L2 = 1ULL << (KM_PW_SHIFT_L1 - KM_PW_SHIFT_L2);
+    const uint64_t spanL2L3 = 1ULL << (KM_PW_SHIFT_L2 - KM_PW_SHIFT_L3);
+
+    if (l1Entries != KM_PW_16K_BLOCK_COUNT || l2Entries != spanL1L2 || l3Entries != spanL2L3) {
+        pw_append(t, "✗ 页表几何自相矛盾，终止（一次 kread 都不发）：\n");
+        pw_append(t, "  L1 掩码 %#llx 覆盖 %llu 项，块数常量却是 %llu；\n",
+                  (unsigned long long)KM_PW_INDEX_L1, (unsigned long long)l1Entries,
+                  (unsigned long long)KM_PW_16K_BLOCK_COUNT);
+        pw_append(t, "  L2 掩码 %#llx 覆盖 %llu 项，按位移差应为 %llu；\n",
+                  (unsigned long long)KM_PW_INDEX_L2, (unsigned long long)l2Entries,
+                  (unsigned long long)spanL1L2);
+        pw_append(t, "  L3 掩码 %#llx 覆盖 %llu 项，按位移差应为 %llu。\n",
+                  (unsigned long long)KM_PW_INDEX_L3, (unsigned long long)l3Entries,
+                  (unsigned long long)spanL2L3);
+        return KM_PW_WALK_GEOMETRY;
+    }
+
     /* 窗口地址所属的 L1 块基址：掩掉 L1 索引位以下的全部位。 */
     const uint64_t base = window & ~KM_PW_INDEX_L1;
 

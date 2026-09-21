@@ -1701,6 +1701,44 @@ bool km_phystokv_ready(void)
     return ready;
 }
 
+bool km_phystokv_ensure(void)
+{
+    /*
+     * 已就绪是空操作。这一句也是幂等的全部：整条流水线成功后 g_slideSettled 为真，
+     * 重复调用在 km_slide_resolve() 的入口就返回了，不会再碰内核。
+     */
+    if (km_phystokv_ready()) return true;
+
+    /*
+     * 内核读写层没就绪时**不去**初始化 XPF：XPF 的 finder 要在设备上的 kernelcache
+     * 文件上跑，而这一步本身不需要 kread —— 但建立换算表要（读符号内容、读
+     * ptov_table）。先初始化 XPF 再失败，只会把一个几十秒的耗时放进一条注定失败的
+     * 路径里，还会把 XPF 的失败诊断盖在真正的原因（内核层未就绪）上面。
+     */
+    if (!km_ready()) return false;
+
+    /*
+     * 判据**只看换算表**，不看 km_slide_resolve() 的返回值。
+     *
+     * 这不是造型问题：`km_slide_resolve()` 的 true/false 是"整条流水线（slide +
+     * 换算表）是否都成立"，而本函数承诺的是"PA→KVA 可不可用"。在当前实现下两者
+     * 同真同假（理由见 KernelSlide.h 的说明），但判据落在被使用的那一件东西上，
+     * 下游才不必跟着上游的合并语义走。
+     *
+     * km_slide_resolve 内部会按需调 km_xpf_init()（KernelSlide.m:1652）。
+     *
+     * 关于"失败之后可以重来"，这里要划边界（KernelSlide.h 写了完整理由）：
+     * 重跑这条路只有在 **kread 那一侧**才有意义。XPF 的 finder 返回值（包括 0）
+     * 会被上游连同 cached 标志一起缓存（libxpf/xpf/xpf.c:702-705），而
+     * km_xpf_init() 在 ready 时直接返回 true（XpfBridge.m:108-111）—— 所以某个键的
+     * finder 返回过 0 之后，本进程内每次重跑都会拿到同一个 0，本函数会稳定失败。
+     * 真要重试必须先 km_xpf_deinit()（几十秒重解析）；本函数**不**隐式做这件事，
+     * 因为那等于把一个几十秒的副作用藏进"再点一次按钮"里。
+     */
+    (void)km_slide_resolve();
+    return km_phystokv_ready();
+}
+
 /*
  * 无锁版本，只在已持有 g_slideLock 的路径里用（resolve 自己的抽样验证）。
  * 公开的 km_phystokv 是它的加锁包装 —— 分开写是为了避免自己把自己锁死。

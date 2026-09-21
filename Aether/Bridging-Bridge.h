@@ -20,6 +20,13 @@
 // 依赖 KernelSlide 的 km_phystokv（页表项里是 PA，下钻要 KVA），
 // 所以面板侧同样要与读取链串行（见 DebugProcView.runPhysWindowProbe）。
 #include "KernelPhysWindow.h"
+// 「建页表窗口」第二段的**写入**路径（libmemrw，实现在 KernelPhysMap.m）：
+// 在窗口地址 0x7000000000 上手工建出页表、写自映射 —— 与上面那个只读探针是
+// 同一件事的两半，但**会写内核内存**，所以是两个按钮、两套状态枚举。
+// XPF 初始化与 PA→KVA 换算表由它自己在入口经 km_phystokv_ensure() 按需建立，
+// 所以面板上不必先点「Slide」（首次会花几十秒解析 kernelcache，按钮要先切到
+// "计算中…"）。调用同样要与读取链串行（AutoTracker.syncExternal）。
+#include "KernelPhysMap.h"
 // 进程枚举需要 sysctl 与 kinfo_proc。iOS SDK 里有 <sys/sysctl.h>，
 // 但**没有 <libproc.h>**（那是 macOS 的手册），所以 proc_listpids / proc_pidpath
 // 无法在编译期声明，改在 Swift 里用 dlsym 运行时取。

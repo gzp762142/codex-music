@@ -1,0 +1,2061 @@
+//
+//  KernelPhysMap.m
+//  Aether
+//
+//  实现见 KernelPhysMap.h 的组织说明。这里只写「为什么这么写」与证据指针。
+//
+//  行号引用约定：`util.c:NNN` / `translation.c:NNN` / `kernel.c:NNN` / `physrw_pte.c:NNN`
+//  一律指 D:\工作区\_Aether_rev\refs\Dopamine\BaseBin\libjailbreak\src\ 下的同名文件；
+//  `pte.h:NNN` / `pvh.h:NNN` 同目录；`static_info.h:NNN` 指
+//  Aether/libmemrw/kfd/libkfd/info/static_info.h；`common.c` / `non_ppl.c` / `xpf.c`
+//  指 Aether/libxpf/xpf/ 下的同名文件（只读快照）。
+//
+
+#import <Foundation/Foundation.h>
+
+#import "KernelMemory.h"
+#import "KernelSlide.h"
+#import "KernelPhysWindow.h"
+#import "KernelPhysMap.h"
+#import "XpfBridge.h"
+
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#pragma mark - 页表几何（16K 三级）
+
+/*
+ * L1 块大小 / 块数 / L2 块大小 / 块数。
+ *
+ * 出处是 Dopamine 的 info.c:338-394（四个 getter），16K 那一档：
+ *     get_l1_block_size()  = 0x1000000000
+ *     get_l1_block_count() = 8
+ *     get_l2_block_size()  = 0x2000000
+ *     get_l2_block_count() = 2048
+ *
+ * 「L1 块数 = 8」这一条同时定死了 L1 索引的位宽：用户地址空间上界 2^39
+ * （T1SZ_BOOT = 25 的机型的用户空间），除以一个 L1 表项覆盖的 2^36，正好 8 项
+ * → **L1 索引 3 位**。XPF 的 common.c:113-127 对 T1SZ_BOOT = 25 返回的
+ * ARM_TT_L1_INDEX_MASK 就是 0x7000000000（bits 38:36），本文件一律从那里取，
+ * 不在这里写死 —— 理由见下面 KM_PM_L1_INDEX_MASK 的说明。
+ *
+ * 窗口地址 = L1_BLOCK_SIZE × (L1_BLOCK_COUNT − 1) = 7 × 2^36 = 0x7000000000
+ * （physrw_pte.c:13 的 MAGIC_PT_ADDRESS；本文件用 km_physwindow_address() 取，
+ * 不另立一份）。
+ */
+#define KM_PM_16K_L1_BLOCK_SIZE 0x1000000000ULL /* 2^36 */
+#define KM_PM_16K_L1_BLOCK_COUNT 8ULL
+#define KM_PM_16K_L2_BLOCK_SIZE 0x2000000ULL /* 2^25 */
+#define KM_PM_16K_L2_BLOCK_COUNT 2048ULL
+
+#define KM_PM_L1_BLOCK_MASK (KM_PM_16K_L1_BLOCK_SIZE - 1ULL)
+#define KM_PM_L2_BLOCK_MASK (KM_PM_16K_L2_BLOCK_SIZE - 1ULL)
+
+/*
+ * L2 / L3 的 shift 与索引掩码：pte.h:77-78、pte.h:82-83 的
+ * ARM_16K_TT_L2_SHIFT / ARM_16K_TT_L2_INDEX_MASK / ARM_16K_TT_L3_SHIFT /
+ * ARM_16K_TT_L3_INDEX_MASK。这两级**不随** T1SZ_BOOT 变（L2/L3 各自 11 位，
+ * 3 + 11 + 11 + 14 = 39），所以是常量而不是从 XPF 取。
+ */
+#define KM_PM_SHIFT_L2 25ULL
+#define KM_PM_SHIFT_L3 14ULL
+#define KM_PM_INDEX_L2 0x0000000ffe000000ULL /* bits 35:25，11 位 */
+#define KM_PM_INDEX_L3 0x0000000001ffc000ULL /* bits 24:14，11 位 */
+
+/*
+ * 三级的「页内偏移掩码」（pte.h:71 / :76 / :81 的 ARM_16K_TT_L*_OFFMASK）。
+ * 只在 vtophys_lvl 撞到 block 描述符时用来把块基址 + va 低位置拼成最终物理地址
+ * （translation.c:83）—— 那一步逐字照抄，所以这三个值也要跟着照抄。
+ */
+#define KM_PM_OFFMASK_L1 0x0000000fffffffffULL /* 2^36 − 1 */
+#define KM_PM_OFFMASK_L2 0x0000000001ffffffULL /* 2^25 − 1 */
+#define KM_PM_OFFMASK_L3 0x0000000000003fffULL /* 2^14 − 1 */
+
+/// L1 索引掩码的**唯一来源是 XPF**（kernelConstant.ARM_TT_L1_INDEX_MASK）。
+///
+/// 为什么不像 L2/L3 那样写常量：ARM_LARGE_MEMORY 内核把用户空间从 47 位削到
+/// 39 位，L1 索引从 11 位变 3 位（common.c:113-127 三个 case 分别返回
+/// 0x7ff000000000 / 0x7000000000 / 0x3fc0000000）。本工程的目标机是 16K + 大内存
+/// 配置（窗口地址 0x7000000000 的存在本身就要求 L1 块数是 8），但我们**不靠这个
+/// 推断去写常量** —— 推断错了会在 L1 那一步索引到别的表项，而那种错在这里的
+/// 表现形式是「读到一张不属于自己的表，然后把它的内容当下一级表地址」。
+/// 取不到就直接报 KM_PM_KEYS_MISSING 并中止（头文件承诺：不许回退成硬编码常量）。
+
+/// pmap 结构头部两个字段（static_info.h:255-257：struct pmap 以 tte / ttep 开头）。
+#define KM_PM_PMAP_OFF_TTE 0x00ULL
+#define KM_PM_PMAP_OFF_TTEP 0x08ULL
+
+/// pt_desc 三处偏移，出处 Dopamine info.c:107-109。
+#define KM_PM_PT_DESC_OFF_PMAP 0x10ULL
+#define KM_PM_PT_DESC_OFF_VA 0x18ULL
+
+/*
+ * pmap 里三个字段的偏移，出处 Dopamine info.c:86-88 / :90-92。
+ *
+ * arm64e 支：sw_asid = 0xBE + pmapEl2Adjust、wx_allowed = 0xC2 + adj、
+ *            type = 0xC8 + adj，其中 adj = (kernel_el == 2) ? 8 : 0（info.c:42）。
+ * arm64 支（A8-A11）：sw_asid = 0x96、type = 0x9c + pmapA11Adjust。
+ *
+ * 本文件只实现 arm64e 支（A12+ 的机型都是 arm64e 内核），并用三条运行时佐证
+ * 把关（见 kpm_verify_pmap_layout）；佐证不过就跳过这一步，而不是换一支继续猜。
+ * 头文件「没能确证的部分」一节写了这条假设的来历与代价。
+ */
+#define KM_PM_PMAP_OFF_SW_ASID_ARM64E 0xBEULL
+#define KM_PM_PMAP_OFF_WX_ALLOWED_ARM64E 0xC2ULL
+#define KM_PM_PMAP_OFF_TYPE_ARM64E 0xC8ULL
+#define KM_PM_PMAP_EL2_ADJUST 0x8ULL
+
+/// pmap->type 的期望值：用户进程的 pmap 是 PMAP_TYPE_USER = 0。
+/// 依据是 Dopamine util.c:283-289 —— 那一段把 type 设成 3（nested）再设回 0，
+/// 说明 0 就是"普通用户 pmap"的取值。这条是下面的布局佐证之一。
+#define KM_PM_PMAP_TYPE_USER 0x0ULL
+
+#pragma mark - 页表项与 PVH 常量
+
+/*
+ * 描述符判据。pte.h:53-58（TTE）+ pte.h:35（ARM_TTE_TYPE_L3BLOCK）。
+ *
+ * 逐级不同这一点必须照抄：L3 的 typeBlock 是 ARM_TTE_TYPE_L3BLOCK = 0x2
+ * （bit1 = 1 表示"是页描述符"），而 L1/L2 的 typeBlock 是 ARM_TTE_TYPE_BLOCK = 0
+ * （bit1 = 0 表示"是大页"）。translation.c:138-145 就是这么设的。
+ */
+#define KM_PM_TTE_VALID 0x0000000000000001ULL
+#define KM_PM_TTE_TYPE_MASK 0x0000000000000002ULL
+#define KM_PM_TTE_TYPE_BLOCK 0x0000000000000000ULL
+#define KM_PM_TTE_TYPE_TABLE 0x0000000000000002ULL
+#define KM_PM_TTE_TYPE_L3BLOCK 0x0000000000000002ULL
+#define KM_PM_TTE_TABLE_MASK 0x0000fffffffff000ULL
+#define KM_PM_TTE_PA_MASK 0x0000fffffffff000ULL
+
+/*
+ * L3 叶项模板。**不是硬编码出来的，是从 pte.h 的四条定义推出来的**：
+ *
+ *   PERM_TO_PTE(PERM_KRW_URW)   = 0x60000000000040   (kernel.h:15 的 0x7 + pte.h:23-25)
+ *   | PTE_NON_GLOBAL            = 0x000000000000800   (pte.h:4,  1 << 11)
+ *   | PTE_OUTER_SHAREABLE       = 0x000000000000200   (pte.h:6,  2 << 8)
+ *   | PTE_LEVEL3_ENTRY          = 0x000000000000403   (pte.h:5 + :11, (1 << 10) | 3)
+ *   ────────────────────────────────────────────────────────────
+ *                               = 0x6000000000000E43
+ *
+ * 这个值同时是样本那三处 `orr <pte>, <pa>, #0x6000000000000e43` 用的常量
+ * （docs/当前任务.md §0.2）—— 两边**逐位相同**，是这条移植路线的独立交叉印证。
+ *
+ * 位域含义（pte.h:23-25 的逆运算）：bit54 UXN / bit53 PXN（都置 1 ⇒ 不可执行）、
+ * bit6 AP[1]（置 1 ⇒ EL0 可读写）、bit10 AF、bit1 描述符类型。
+ * AP[1] 与 UXN/PXN 这两组位是"用户态也能碰这张页"的关键 —— 与头文件里
+ * 「PPL 不拦这条路径」那段结论指向同一件事。
+ *
+ * 注意 bits[47:12] 全 0：这是模板**不是成品**，必须 `pa | 它` 之后再写
+ * （docs/当前任务.md §0.2 的加粗警告：裸写等于把 VA 指到物理页 0）。
+ */
+#define KM_PM_PERM_KRW_URW 0x7ULL
+#define KM_PM_PERM_TO_PTE(perm) \
+    (((((perm) & 0xCULL) << 4) | (((perm) & 0x2ULL) << 52) | (((perm) & 0x1ULL) << 54)))
+#define KM_PM_PTE_NON_GLOBAL (1ULL << 11)
+#define KM_PM_PTE_VALID (1ULL << 10)
+#define KM_PM_PTE_OUTER_SHAREABLE (2ULL << 8)
+#define KM_PM_PTE_LEVEL3_ENTRY (KM_PM_PTE_VALID | 0x3ULL)
+#define KM_PM_PTE_LEAF                                                       \
+    (KM_PM_PERM_TO_PTE(KM_PM_PERM_KRW_URW) | KM_PM_PTE_NON_GLOBAL |          \
+     KM_PM_PTE_OUTER_SHAREABLE | KM_PM_PTE_LEVEL3_ENTRY)
+
+/*
+ * pv_head 表项的打包格式。pvh.h:4-5 / :16-17 / :19-22 三条。
+ *
+ * PVH_HIGH_FLAGS 那一位集合在高 16 位全 1 的内核地址上是**幂等**的（bits 63..48
+ * 本来就全是 1），所以 `(entry & PVH_LIST_MASK) | PVH_HIGH_FLAGS` 得到的就是
+ * ptd 的 KVA —— 这正是 Dopamine kernel.c:114 能直接 kread 它的原因。
+ */
+#define KM_PM_PVH_TYPE_MASK 0x3ULL
+#define KM_PM_PVH_LIST_MASK (~KM_PM_PVH_TYPE_MASK)
+#define KM_PM_PVH_TYPE_NULL 0x0ULL
+#define KM_PM_PVH_TYPE_PVEP 0x1ULL
+#define KM_PM_PVH_TYPE_PTEP 0x2ULL
+#define KM_PM_PVH_TYPE_PTDP 0x3ULL
+#define KM_PM_PVH_HIGH_FLAGS                                                              \
+    ((1ULL << 62) | (1ULL << 61) | (1ULL << 60) | (1ULL << 59) | (1ULL << 58) |           \
+     (1ULL << 57) | (1ULL << 56) | (1ULL << 54))
+
+/// PMAP_TT_L*_LEVEL（pte.h:60-63）。
+#define KM_PM_TT_L1_LEVEL 0x1ULL
+#define KM_PM_TT_L2_LEVEL 0x2ULL
+#define KM_PM_TT_L3_LEVEL 0x3ULL
+
+/// 建表循环的防御上限。Dopamine util.c:308-333 的 do-while 每轮至少把 leafLevel
+/// 抬一级，正常最多两轮；给 4 是"够用且能在几何被改坏时立刻停下"。
+#define KM_PM_EXPAND_LOOP_GUARD 4
+
+/// alloc_page_table_unassigned 的重试上限。Dopamine util.c:141 是 `while (true)` ——
+/// 无限重试；本工程不许有不可终止的循环（面板在等它），所以给一个上界，
+/// 超了就按"确定失败"返回。8 次 × 32 MB 的临时虚拟分配在目标机上是安全的
+/// （每次失败都会 free 掉那一块）。
+#define KM_PM_ALLOC_ATTEMPTS 8
+
+/// 取一张"无主页表页"时临时占用的用户地址范围 = 一个 L2 块（util.c:143）。
+#define KM_PM_ALLOC_SPAN KM_PM_16K_L2_BLOCK_SIZE
+
+/// refcount 抬到 0x1337（util.c:194），回来时归 0（util.c:211）。
+#define KM_PM_REFCOUNT_PINNED 0x1337U
+
+/// 诊断文本缓冲。分成预检与执行两块会重复太多，共用一份。
+#define KM_PM_TEXT_SIZE 16384
+
+#pragma mark - 状态
+
+// 诊断文本与两个结论值。都只在 km_physmap_precheck() / km_physmap_build() 的末尾写，
+// 在访问器里读。调用方（面板）保证这些调用都在同一条串行路径上
+// （AutoTracker.syncExternal）—— 与 KernelPhysWindow.m 的 g_pwText 同一套口径。
+static NSString *g_physmapText = nil;
+static uint64_t g_physmapWindow = 0;
+static uint64_t g_physmapMagicPT = 0;
+
+/// 是否已经跑过至少一次。用来区分「还没跑过」与「跑过了但诊断文本没能落地」——
+/// 两者在面板上都表现为 g_physmapText 为 nil，但要求 YG 做的事完全不同。
+static bool g_physmapRan = false;
+
+/*
+ * 把诊断缓冲收成 g_physmapText。
+ *
+ * **本文件没有钉 -fobjc-arc**（project.yml:28-30 只给 Aether/libmemrw/xpf 加了
+ * -fobjc-arc），所以这里必须自己持有对象：`[NSString stringWithUTF8String:]`
+ * 返回的是 autorelease 对象，直接赋给静态变量在 MRC 下等于"借一个随时会被
+ * 回收池收走的东西"，面板随后读它就是 use-after-free。
+ * 工程里另两处同样的赋值在 KernelPhysWindow.m（`g_pwText =` 那一句）与
+ * KernelSlide.m 的 `text_append` 家族里。**这里刻意只引函数/变量名、不引行号**：
+ * KernelPhysWindow.m 正在被并行修改（本轮就经历了 736 行 → 661 行的重构），
+ * 行号引用会在作者毫不知情的时候指到别的地方去 —— 指错比不指更糟。
+ * 是这个形态；本文件不复刻它。
+ *
+ * 两级编码是为了兑现头文件那句「永不返回 nil」：UTF-8 失败时用 ISO-Latin-1，
+ * 它对任意字节序列都能成功（最坏情况是显示成乱码，而不是给不出文本）。
+ * ARC 那一支走 stringWithUTF8String（ARC 下它会被正常持有）。
+ */
+static void kpm_store_text(const char *buffer)
+{
+#if __has_feature(objc_arc)
+    g_physmapText = [NSString stringWithUTF8String:buffer];
+#else
+    NSString *text = [[NSString alloc] initWithBytes:buffer
+                                              length:strlen(buffer)
+                                            encoding:NSUTF8StringEncoding];
+    if (text == nil) {
+        text = [[NSString alloc] initWithBytes:buffer
+                                        length:strlen(buffer)
+                                      encoding:NSISOLatin1StringEncoding];
+    }
+    [g_physmapText release];
+    g_physmapText = text;
+#endif
+    g_physmapRan = true;
+}
+
+#pragma mark - 文本工具
+
+/*
+ * 追加——记账按**实际写入**的字节数（strlen），不用 vsnprintf 的返回值。
+ *
+ * 理由是 KernelMemory.m 里 km_self_test 那段踩过的坑：截断时 snprintf 返回的是
+ * "空间够的话本来会写多少"，它**大于**实际可用空间，`size - used` 在 size_t 上
+ * 回绕成天文数字，下一句就写出缓冲区。本缓冲区是静态的，越界就是踩相邻静态数据。
+ */
+typedef struct {
+    char *buf;
+    size_t size;
+    size_t used;
+    bool truncated;
+} km_pm_text;
+
+/*
+ * 前向声明带 format 属性 —— 本文件 100+ 处调用点的格式串由此获得编译期校验。
+ *
+ * 为什么非加不可：自定义变参函数没有这个属性时，Clang **不对任何调用点**做
+ * `-Wformat` 检查（全工程此前 `__attribute__((format` 零命中）。本文件是工程里
+ * 格式串最密集的地方，而"格式符与实参不匹配"是一类不报错、读垃圾、可能崩的错
+ * （本轮就查出过一处 `%#llu`：`#` 标志与 `u` 搭配在 C 标准里是未定义行为）。
+ * 加属性之后 CI 会替人盯着它；本地没有编译器，这一层只能交给它。
+ */
+static void kpm_append(km_pm_text *t, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+
+static void kpm_append(km_pm_text *t, const char *fmt, ...)
+{
+    if (t->used >= t->size) {
+        t->truncated = true;
+        return;
+    }
+    const size_t room = t->size - t->used;
+    va_list args;
+    va_start(args, fmt);
+    const int written = vsnprintf(t->buf + t->used, room, fmt, args);
+    va_end(args);
+
+    t->used += strlen(t->buf + t->used);
+    if (written < 0 || (size_t)written >= room) {
+        t->truncated = true;
+    }
+}
+
+#pragma mark - 地址工具
+
+/*
+ * 形态检查——本模块每一条 kread/kwrite 之前的唯一闸门。
+ *
+ * 与 KernelPhysWindow.m 的 `physwindow_shape_ok()` 同口径（那里写成 static，
+ * 跨文件用不了；本文件自己留一份，是为了让"每一条进入内核读写原语的地址都经过
+ * 同一个判据"这件事在本文件里可自查，而不是依赖另一个正在被修的模块）。
+ *
+ * 两个判据：
+ *   ① 内核地址域：与 km_is_kernel_address 同口径（高 16 位全 1）。
+ *      **刻意同口径而不是更严**：km_read64/km_write 自己也查这一条，本函数若更严，
+ *      被拒的访问在诊断里会显示成"我拒了"，而实际上是底层会拒 —— 口径一致，
+ *      诊断文本才对应得上真实行为。
+ *   ② 8 字节对齐：一条页表项永远是 8 字节，错位地址读到的是相邻两项各一半拼起来的
+ *      垃圾 —— 那种值"看着像合法表项"，会被类型判据放行，然后被当成下一级表地址。
+ *      这正是"错值比 0 危险"的同一个形态：0 会被拦下，错值不会。
+ */
+static bool kpm_shape_ok(uint64_t addr)
+{
+    if ((addr >> 48) != 0xFFFF) {
+        return false;
+    }
+    if ((addr & 0x7ULL) != 0) {
+        return false;
+    }
+    return true;
+}
+
+/// 无溢出的加法。页表项里的 PA 加上换算出的基准理论上不会溢出，但"理论上"不是判据：
+/// 溢出让地址回绕到一个**形态合法**的小内核地址，正是形态检查拦不住的那类值。
+static bool kpm_add(uint64_t a, uint64_t b, uint64_t *out)
+{
+    if (UINT64_MAX - a < b) {
+        return false;
+    }
+    *out = a + b;
+    return true;
+}
+
+/// 无溢出的乘法。
+static bool kpm_mul(uint64_t a, uint64_t b, uint64_t *out)
+{
+    if (a != 0 && b > UINT64_MAX / a) {
+        return false;
+    }
+    *out = a * b;
+    return true;
+}
+
+#pragma mark - 页表遍历
+
+/// 一级的几何。与 Dopamine translation.c:8-15 的 struct tt_level 同构。
+typedef struct {
+    uint64_t offMask;
+    uint64_t shift;
+    uint64_t indexMask;
+    uint64_t validMask;
+    uint64_t typeMask;
+    uint64_t typeBlock;
+} km_pm_tt_level;
+
+/*
+ * 遍历失败原因。前三个与 Dopamine 的 errno 一一对应（translation.c:51 的 1041、
+/// :77 的 1042、:72 的 1043），后三个是本工程的机制差异带出来的新分支
+ * （Dopamine 的 physread64 不会"换算不出来"，也不会自查形态）。
+ */
+typedef enum {
+    KM_PM_E_NONE = 0,
+    /// curLevel 越过 L3（对应 errno 1041）：几何或 leaf_level 入参坏了。
+    KM_PM_E_LEVEL,
+    /// 某级表项 invalid（对应 errno 1042）。**这不是错误**：调用方靠它判断
+    /// "页表在这里断了、该建下一级"，`*leaf_level` 与 `*leaf_addr` 保留在断点那一级。
+    KM_PM_E_INVALID,
+    /// 起点不是物理地址（高位非 0，对应 errno 1043 那一支）。本工程只走物理路径，
+    /// 所以遇到就中止，而不是回退去用 kread。
+    KM_PM_E_PATH,
+    /// PA → KVA 换算不出来（km_phystokv 返回 0，或换算表未就绪）。
+    KM_PM_E_PHYS2VIRT,
+    /// 自己算出来的地址连形态检查都不过。
+    KM_PM_E_SHAPE,
+    /// 表项读失败（km_read64 两次读到不同的值）。
+    KM_PM_E_READ
+} km_pm_vt_err;
+
+/// 遍历的整体输入。字段在 kpm_load() 里一次性填好，之后只读。
+typedef struct {
+    uint64_t pageSize;
+    uint64_t pageShift;
+    uint64_t window;
+
+    km_pm_tt_level levels[4]; /* 下标即 PMAP_TT_L*_LEVEL，[0] 不用（16K 从 L1 起） */
+
+    /* pmap 链路 */
+    uint64_t proc;
+    uint64_t task;
+    uint64_t map;
+    uint64_t pmap;
+    uint64_t ttep; /* 顶层表的**物理地址** */
+
+    /* XPF 取来的符号（已 + slide，可直接 kread） */
+    uint64_t slide;
+    uint64_t pvHeadTable; /* kernel.c:109 的 kread64(ksymbol(pv_head_table)) 的**符号地址** */
+    uint64_t vmFirstPhysSymbol;
+    uint64_t cpuTtepSymbol;
+    uint64_t cpuTtep; /* 上面那个符号的**内容** = TTBR1 的值（PA） */
+
+    /* 上面三个符号的**内容**（读一次，之后记账链与遍历都用它们，不再重复 kread） */
+    uint64_t pvHeadTableValue; /* = pai_to_pvh 的基址（kernel.c:109） */
+    uint64_t vmFirstPhysValue; /* = pa_index 的基准（kernel.c:104） */
+
+    /* XPF 取来的常量（值，不是地址） */
+    uint64_t ptIndexMax;
+
+    /* pmap 布局（arm64e 支） */
+    uint64_t ptDescOffPtdInfo;
+    uint64_t swAsidOff;
+    uint64_t typeOff;
+    uint64_t wxAllowedOff;
+
+    /* 窗口探测结果（kpm_probe_window 填） */
+    uint64_t windowLeafLevel;
+    uint64_t windowLeafAddr; /* 表项自身的**物理地址** */
+    uint64_t windowLeafEntry;
+    uint64_t windowWalkPa;
+    km_pm_vt_err windowWalkErr;
+    bool windowHasL3;
+} km_pm_ctx;
+
+/// 逐级下行。语义**逐条对齐** Dopamine translation.c:39-97，差异只在读表项那一步
+/// （那边是 physread64(tte_pa)，这边是 km_phystokv(tte_pa) 之后 km_read64）；
+/// 头文件「与 Dopamine 的有意差异」第 1 条。
+///
+/// 返回值的两种含义要一起看（这是调用方能工作的全部前提）：
+///   · 撞到 block 描述符 → 返回映射出来的**物理地址**，`*leaf_level` 停在那一级；
+///   · 一路走到 LEAF_LEVEL 全是表描述符 → 返回**最后一级表的物理地址**
+///     （translation.c:94-96 的注释）；
+///   · 某级 invalid → 返回 0，但 `*leaf_addr` / `*leaf_level` **保留在断点那一级**
+///     （translation.c:60-62 先写地址与级号、再读表项的顺序就是为此）。
+///
+/// 所以返回值 0 **不等于**失败：`*err == KM_PM_E_INVALID` 时它是"这里还没有表"。
+static uint64_t kpm_vtophys_lvl(const km_pm_ctx *ctx, uint64_t tte_ttep, uint64_t va,
+                                uint64_t *leaf_level, uint64_t *leaf_addr,
+                                km_pm_vt_err *err)
+{
+    if (err) {
+        *err = KM_PM_E_NONE;
+    }
+
+    const uint64_t ROOT_LEVEL = KM_PM_TT_L1_LEVEL;
+    /// 进入时取一次（translation.c:43 的 `const uint64_t LEAF_LEVEL = *leaf_level;`）。
+    /// 循环条件用的就是这一份，所以函数中途改 `*leaf_level` 不会改自己的边界。
+    const uint64_t LEAF_LEVEL = (leaf_level != NULL) ? *leaf_level : KM_PM_TT_L3_LEVEL;
+
+    /*
+     * translation.c:47 —— 高位为 0 走"物理"路径。
+     *
+     * 本工程的遍历起点**永远**是物理地址（pmap->ttep 与 cpu_ttep 都是），所以
+     * physical 恒为真。保留这个判据而不是删掉它，是为了让"某天有人把一个 KVA
+     * 当 tte 传进来"这件事在这里立刻变成 E_PATH，而不是被当成 PA 继续算下去 ——
+     * 那种错的产物是一个形态合法的错地址。
+     */
+    const bool physical = ((tte_ttep & 0xf000000000000000ULL) == 0);
+    if (!physical) {
+        if (err) {
+            *err = KM_PM_E_PATH;
+        }
+        return 0;
+    }
+
+    for (uint64_t curLevel = ROOT_LEVEL; curLevel <= LEAF_LEVEL; curLevel++) {
+        if (curLevel > KM_PM_TT_L3_LEVEL) {
+            if (err) {
+                *err = KM_PM_E_LEVEL;
+            }
+            return 0;
+        }
+
+        const km_pm_tt_level *lvlp = &ctx->levels[curLevel];
+        const uint64_t tteIndex = (va & lvlp->indexMask) >> lvlp->shift;
+
+        uint64_t indexBytes = 0;
+        uint64_t tte_pa = 0;
+        if (!kpm_mul(tteIndex, sizeof(uint64_t), &indexBytes) ||
+            !kpm_add(tte_ttep, indexBytes, &tte_pa)) {
+            if (err) {
+                *err = KM_PM_E_SHAPE;
+            }
+            return 0;
+        }
+
+        /*
+         * 顺序要紧（translation.c:60-62）：**先**把这一级表项自身的地址与级号交出去，
+         * **再**读表项。上面「返回值 0 时断点信息仍有效」这条契约完全建立在
+         * 这个顺序上 —— 倒过来写，调用方拿到的就是上一级的信息，
+         * 于是它会去写一个属于祖先表的表项。
+         */
+        if (leaf_addr) {
+            *leaf_addr = tte_pa;
+        }
+        if (leaf_level) {
+            *leaf_level = curLevel;
+        }
+
+        /// 读表项：PA → KVA。Dopamine 到这里直接 physread64(tte_pa)；
+        /// 本工程必须换成 km_phystokv + km_read64（头文件差异第 1 条）。
+        if (!km_phystokv_ready()) {
+            if (err) {
+                *err = KM_PM_E_PHYS2VIRT;
+            }
+            return 0;
+        }
+        const uint64_t tte_kva = km_phystokv(tte_pa);
+        if (tte_kva == 0) {
+            if (err) {
+                *err = KM_PM_E_PHYS2VIRT;
+            }
+            return 0;
+        }
+        if (!kpm_shape_ok(tte_kva)) {
+            if (err) {
+                *err = KM_PM_E_SHAPE;
+            }
+            return 0;
+        }
+
+        bool ok = false;
+        const uint64_t tteEntry = km_read64(tte_kva, &ok);
+        if (!ok) {
+            if (err) {
+                *err = KM_PM_E_READ;
+            }
+            return 0;
+        }
+
+        if ((tteEntry & lvlp->validMask) != lvlp->validMask) {
+            if (err) {
+                *err = KM_PM_E_INVALID;
+            }
+            return 0;
+        }
+
+        if ((tteEntry & lvlp->typeMask) == lvlp->typeBlock) {
+            /// translation.c:81-84 —— 撞上块映射，无论在哪一级都是终点。
+            return ((tteEntry & KM_PM_TTE_PA_MASK & ~lvlp->offMask) | (va & lvlp->offMask));
+        }
+
+        tte_ttep = tteEntry & KM_PM_TTE_TABLE_MASK;
+    }
+
+    return tte_ttep;
+}
+
+/// 内核 VA → PA，等价于 Dopamine translation.c:105-108 的
+/// `kvtophys(va) { return vtophys(kconstant(cpuTTEP), va); }`。
+///
+/// Dopamine 的 `cpuTTEP` 是 info.c:289 读出来的**符号内容**（TTBR1 的值），
+/// 本函数用同一个来源。返回值 0 或 err 非 NONE 表示换算不出来。
+static uint64_t kpm_kvtophys(const km_pm_ctx *ctx, uint64_t va, km_pm_vt_err *err)
+{
+    uint64_t level = KM_PM_TT_L3_LEVEL;
+    uint64_t leafAddr = 0;
+    return kpm_vtophys_lvl(ctx, ctx->cpuTtep, va, &level, &leafAddr, err);
+}
+
+#pragma mark - 物理页记账链（kernel.c:102-115）
+
+/// kernel.c:102-105 —— pa_index(pa) = atop(pa − kread64(ksymbol(vm_first_phys)))。
+/// 本工程的 vm_first_phys **内容**在 kpm_load 里已经读到，不再每次 kread。
+static uint64_t kpm_pa_index(const km_pm_ctx *ctx, uint64_t pa)
+{
+    return (pa - ctx->vmFirstPhysValue) >> ctx->pageShift;
+}
+
+/// kernel.c:107-110 —— pai_to_pvh(pai) = kread64(ksymbol(pv_head_table)) + pai × 8。
+/// 同样：pv_head_table 的**内容**（表基址）在 kpm_load 里已读好。
+static uint64_t kpm_pai_to_pvh(const km_pm_ctx *ctx, uint64_t pai)
+{
+    uint64_t offset = 0;
+    if (!kpm_mul(pai, sizeof(uint64_t), &offset)) {
+        return 0;
+    }
+    uint64_t pvh = 0;
+    if (!kpm_add(ctx->pvHeadTableValue, offset, &pvh)) {
+        return 0;
+    }
+    return pvh;
+}
+
+/// kernel.c:112-115 —— pvh_ptd(pvh) = (kread64(pvh) & PVH_LIST_MASK) | PVH_HIGH_FLAGS。
+static uint64_t kpm_pvh_ptd(uint64_t pvhEntry)
+{
+    return (pvhEntry & KM_PM_PVH_LIST_MASK) | KM_PM_PVH_HIGH_FLAGS;
+}
+
+/// pvh 表项低 2 位的类型名（pvh.h:19-22 的四个值）。只给诊断文本用。
+///
+/// 为什么要把它翻成名字而不是只打数字：`type` 是这一步唯一的**形态判据**
+/// （本工程只认 PTDP），而"读到 2 还是 3"这种事从屏幕上一眼分不出来 ——
+/// 本项目已经因为"从屏幕抄字节抄错"烧掉过四轮设备实验（KernelSlide.m:1090-1098
+/// 那段删掉原始 dump 的理由）。名字是给观察者的护栏。
+///
+/// 命名只照抄 pvh.h 的宏名，**不替上游解释语义** —— 页表页与页表描述符页
+/// 在 PTEP/PTDP 之间到底怎么分，本工程没有独立证据（见头文件「没能确证的部分」）。
+static const char *kpm_pvh_type_name(uint64_t type)
+{
+    switch (type) {
+    case KM_PM_PVH_TYPE_NULL: return "NULL";
+    case KM_PM_PVH_TYPE_PVEP: return "PVEP";
+    case KM_PM_PVH_TYPE_PTEP: return "PTEP";
+    case KM_PM_PVH_TYPE_PTDP: return "PTDP（可作 pt_desc 用）";
+    }
+    return "未定义";
+}
+
+#pragma mark - 受检写入
+
+/*
+ * ═══ 写入路径的纪律（硬约束 3）═══
+ *
+ * 每一次内核写都走这两条函数之一，它们做的是同一件事的三步：
+ *     读旧值 → （旧值已是目标值则跳过写）→ 写 → 回读核对 → 不符即返回 false。
+ * **没有**任何一条路径可以"先全部写完再统一验证"：每一步不符就立刻停，
+ * 后面的步骤不会执行。理由写在头文件硬约束 3：写错一个地址的代价是整机内核
+ * panic，而"先写完再验证"会让一个已经错了的中间状态继续被下一级当成输入。
+ *
+ * 旧值已是目标值时跳过写：这不是优化，是减少一次没有收益的内核写 ——
+ * 重复调用 build 时自映射那一项已经是期望值，再写一遍只多一次风险窗口。
+ */
+static bool kpm_write_u64_kva(km_pm_text *t, uint64_t kva, uint64_t value, const char *what)
+{
+    if (!kpm_shape_ok(kva)) {
+        kpm_append(t, "  [写入中止] %s：目标地址 %#llx 形态不过（未发出 kwrite）\n", what,
+                   (unsigned long long)kva);
+        return false;
+    }
+
+    bool ok = false;
+    const uint64_t old = km_read64(kva, &ok);
+    if (!ok) {
+        kpm_append(t, "  [写入中止] %s：目标 %#llx 写前读失败（两次读不一致）\n", what,
+                   (unsigned long long)kva);
+        return false;
+    }
+    if (old == value) {
+        kpm_append(t, "  [写入跳过] %s：%#llx 处旧值已是目标值 %#llx\n", what,
+                   (unsigned long long)kva, (unsigned long long)value);
+        return true;
+    }
+
+    if (!km_write(kva, &value, sizeof(value))) {
+        kpm_append(t, "  [写入中止] %s：kwrite(%#llx) 被底层拒绝（地址形态或长度）\n", what,
+                   (unsigned long long)kva);
+        return false;
+    }
+
+    const uint64_t back = km_read64(kva, &ok);
+    if (!ok || back != value) {
+        kpm_append(t, "  [写入中止] %s：%#llx 回读不符 —— 期望 %#llx，回读 %#llx%s\n", what,
+                   (unsigned long long)kva, (unsigned long long)value, (unsigned long long)back,
+                   ok ? "" : "（且两次读不一致）");
+        return false;
+    }
+    kpm_append(t, "  [写入核对] %s：%#llx 旧值 %#llx → 新值 %#llx，回读一致\n", what,
+               (unsigned long long)kva, (unsigned long long)old, (unsigned long long)value);
+    return true;
+}
+
+/// 物理地址入口：先 km_phystokv 换 KVA。**换算不出来就中止**，
+/// 绝不自己拼 `pa + 某个 delta` 兜底（头文件硬约束 2）。
+static bool kpm_write_u64_phys(km_pm_text *t, uint64_t pa, uint64_t value, const char *what)
+{
+    if (!km_phystokv_ready()) {
+        kpm_append(t, "  [写入中止] %s：换算表未就绪（km_phystokv_ready()=false）\n", what);
+        return false;
+    }
+    const uint64_t kva = km_phystokv(pa);
+    if (kva == 0) {
+        kpm_append(t, "  [写入中止] %s：PA %#llx 换算不出 KVA —— 中止，不猜地址\n", what,
+                   (unsigned long long)pa);
+        return false;
+    }
+    return kpm_write_u64_kva(t, kva, value, what);
+}
+
+/*
+ * 16 位字段的受检写入（refcount 用）。
+ *
+ * Dopamine util.c:194 / :211 用的是 physwrite16；本工程只能 8 字节粒度写
+ * （km_write 要求 len 是 8 的倍数），所以做读-改-写：读旧 8 字节 → 只替换低
+ * 16 位 → 写回 → 回读核对低 16 位。比 Dopamine 的裸写多保住高 6 字节
+ * （头文件差异第 3 条）。
+ *
+ * 这里明说一个**没能消除**的竞态：内核自己也会改 pinfo 指向那个结构的相邻字段，
+ * 而"读"与"写"之间有窗口。缓解手段是让两步之间不做任何别的事（下面两句紧挨），
+ * 以及写后回读核对。真正无竞态的做法是只写 2 字节，而本工程的写原语给不了。
+ */
+static bool kpm_write_u16_kva(km_pm_text *t, uint64_t kva, uint16_t value, const char *what)
+{
+    if (!kpm_shape_ok(kva)) {
+        kpm_append(t, "  [写入中止] %s：目标地址 %#llx 形态不过（未发出 kwrite）\n", what,
+                   (unsigned long long)kva);
+        return false;
+    }
+
+    bool ok = false;
+    const uint64_t old = km_read64(kva, &ok);
+    if (!ok) {
+        kpm_append(t, "  [写入中止] %s：目标 %#llx 写前读失败（两次读不一致）\n", what,
+                   (unsigned long long)kva);
+        return false;
+    }
+    if ((uint16_t)(old & 0xFFFFULL) == value) {
+        kpm_append(t, "  [写入跳过] %s：%#llx 处低 16 位已是 %#x\n", what,
+                   (unsigned long long)kva, (unsigned)value);
+        return true;
+    }
+
+    const uint64_t next = (old & ~0xFFFFULL) | (uint64_t)value;
+    if (!km_write(kva, &next, sizeof(next))) {
+        kpm_append(t, "  [写入中止] %s：kwrite(%#llx) 被底层拒绝\n", what, (unsigned long long)kva);
+        return false;
+    }
+
+    const uint64_t back = km_read64(kva, &ok);
+    if (!ok || (uint16_t)(back & 0xFFFFULL) != value) {
+        kpm_append(t, "  [写入中止] %s：%#llx 回读不符 —— 期望低 16 位 %#x，回读 %#llx\n", what,
+                   (unsigned long long)kva, (unsigned)value, (unsigned long long)back);
+        return false;
+    }
+    kpm_append(t, "  [写入核对] %s：%#llx 低 16 位 %#x → %#x，回读一致\n", what,
+               (unsigned long long)kva, (unsigned)(old & 0xFFFFULL), (unsigned)value);
+    return true;
+}
+
+#pragma mark - 前置装载
+
+/*
+ * 把「建表要用的每一个输入」读出来。返回 km_physmap_status：
+ *   KM_PM_READY 之后的步骤只有在返回 KM_PM_READY 或 KM_PM_TABLE_ALREADY 时才走。
+ *
+ * 诊断分区 ①-④ 在这里写；⑤ 之后的窗口探测与记账链在 kpm_probe_window /
+ * kpm_report_accounting 里。
+ */
+static km_physmap_status kpm_load(km_pm_ctx *ctx, km_pm_text *t)
+{
+    memset(ctx, 0, sizeof(*ctx));
+
+    kpm_append(t, "== ① 前置 ==\n");
+    if (!km_ready()) {
+        kpm_append(t, "✗ km_ready()=false：内核读写层未就绪（km_init 未成功），本次一次内核访问都不发。\n");
+        return KM_PM_NOT_READY;
+    }
+    kpm_append(t, "✓ km_ready()=true\n");
+
+    /* ── XPF 与 PA→KVA 换算表：**按需建立**，不要求用户先去点另一个按钮 ── */
+    /*
+     * 这两样要走 km_phystokv_ensure() 而不是"检查就绪就报错、让用户去点 Slide"：
+     * 面板上只有一个按钮是"我这个动作"，用户不该知道实现里分成几步
+     * （KernelSlide.h 的 km_phystokv_ensure 说明写了为什么换算表与 slide 分不开）。
+     * ensure 内部：已就绪则空操作；否则自己 km_xpf_init + 跑完那套自检。
+     *
+     * 耗时说明要留在诊断里：首次可能几十秒（解析 kernelcache），
+     * 面板那侧必须先把按钮切到"计算中…"，否则会被读成卡死。
+     */
+    if (!km_phystokv_ready()) {
+        kpm_append(t, "  PA→KVA 换算表未就绪 —— 调 km_phystokv_ensure() 按需建立\n");
+        kpm_append(t, "  （首次要解压解析几十 MB 的 kernelcache，几十秒是预期耗时，不是卡死）\n");
+    }
+    if (!km_phystokv_ensure()) {
+        if (!km_xpf_ready()) {
+            kpm_append(t, "✗ XPF 未就绪且这次初始化没成功：建表要的六个符号/常量全部来自它。\n");
+            NSString *const xpfError = km_xpf_last_error();
+            kpm_append(t, "  原因：%s\n", xpfError != nil ? xpfError.UTF8String : "(没有错误文本)");
+            return KM_PM_NOT_READY;
+        }
+        kpm_append(t, "✗ 换算表建立失败：页表项里存的是**物理**地址，没有这条换算，\n");
+        kpm_append(t, "  本模块连一次下钻都完成不了。原因见 km_slide_diagnostic()。\n");
+        return KM_PM_NOT_READY;
+    }
+    kpm_append(t, "✓ PA→KVA 换算表可用（km_phystokv_ready()=true）\n");
+
+    ctx->slide = km_slide_value();
+    if (ctx->slide == 0) {
+        kpm_append(t, "✗ slide=0：符号的运行时地址算不出来。\n");
+        kpm_append(t, "  （XPF 给的 kernelSymbol.* 是**链接期**地址 —— XpfBridge.h 写明，\n");
+        kpm_append(t, "   必须自己加 slide 才能 kread；见 KernelSlide.m:1073 的同口径用法。\n");
+        kpm_append(t, "   本模块与「建窗」探针的区别就在这里：它只用 pmap 链路（不碰符号），\n");
+        kpm_append(t, "   而建表要读 pv_head_table / vm_first_phys / cpu_ttep 三个符号。）\n");
+        return KM_PM_NOT_READY;
+    }
+    kpm_append(t, "✓ slide=%#llx（km_slide_value()）\n", (unsigned long long)ctx->slide);
+
+    ctx->pageSize = km_kernel_page_size();
+    if (ctx->pageSize != 0x4000) {
+        /*
+         * 只做 16K。4K 是四级表（多一级 L0，shift 39），而本文件的几何只有三级；
+         * 拿 16K 的 L1 掩码去索引 4K 的 L1 表会取到**另一张表**里的表项，然后把它
+         * 当下一级表地址 —— 那不是可以赌的事。（KernelPhysWindow.m 的
+         * `physwindow_walk()` 里有同一条几何判据；那里只引函数名不引行号，
+         * 因为那个文件正被并行修改。）
+         */
+        kpm_append(t, "✗ 页大小 %#llx：本模块只实现 16K 的三级几何（4K 是四级表，多一级 L0）。\n",
+                   (unsigned long long)ctx->pageSize);
+        return KM_PM_NOT_READY;
+    }
+    uint64_t shift = 0;
+    while (((uint64_t)1 << shift) < ctx->pageSize && shift < 63) {
+        shift++;
+    }
+    if (((uint64_t)1 << shift) != ctx->pageSize) {
+        kpm_append(t, "✗ 页大小 %#llx 不是 2 的幂 —— 页内掩码算不出来。\n",
+                   (unsigned long long)ctx->pageSize);
+        return KM_PM_NOT_READY;
+    }
+    ctx->pageShift = shift;
+    kpm_append(t, "✓ 页大小 %#llx → page_shift=%llu（16K 三级几何）\n",
+               (unsigned long long)ctx->pageSize, (unsigned long long)ctx->pageShift);
+
+    ctx->window = km_physwindow_address();
+    if (ctx->window == 0) {
+        kpm_append(t, "✗ 窗口地址算不出来（km_physwindow_address()=0）。\n");
+        return KM_PM_NOT_READY;
+    }
+    g_physmapWindow = ctx->window;
+
+    /* ── ② XPF 键 ── */
+    kpm_append(t, "== ② XPF 键（缺任一就中止，不许回退成硬编码常量）==\n");
+    km_xpf_physmap_keys keys = {};
+    if (!km_xpf_physmap_keys_fetch(&keys)) {
+        kpm_append(t, "✗ km_xpf_physmap_keys_fetch 失败：XPF 未就绪。\n");
+        return KM_PM_NOT_READY;
+    }
+    const km_xpf_item_result *const all[] = {
+        &keys.pv_head_table, &keys.vm_first_phys,  &keys.vm_last_phys, &keys.cpu_ttep,
+        &keys.pt_index_max,  &keys.kernel_el,      &keys.arm_tt_l1_index_mask, &keys.t1sz_boot,
+    };
+    for (int i = 0; i < 8; i++) {
+        const km_xpf_item_result *r = all[i];
+        kpm_append(t, "  [%d] %s：registered=%s fetched=%s value=%#llx\n", i,
+                   km_xpf_physmap_key_name(i), r->registered ? "yes" : "no",
+                   r->fetched ? "yes" : "no", (unsigned long long)r->value);
+    }
+
+    /*
+     * 这六个必须有值（另外两个 vm_last_phys / t1sz_boot 只用于佐证与上界检查；
+     * vm_last_phys 目前确实只作参考 —— 本文件用 vm_first_phys 做下溢检查，
+     * 上界检查留到有实测需求时再加，不在这一轮凭空添一条没人验证过的判据）：
+     *   pv_head_table   → 物理页记账表（kernel.c:109）
+     *   vm_first_phys   → 物理页索引的基准（kernel.c:104）
+     *   cpu_ttep        → 内核页表根，算 sw_asid 那一页的物理地址用（translation.c:107）
+     *   PT_INDEX_MAX    → pt_desc 里 va[] 数组的长度（info.c:109）
+     *   kernel_el       → pmapEl2Adjust（info.c:42）
+     *   ARM_TT_L1_INDEX_MASK → L1 索引掩码，页表几何的一部分（translation.c:125）
+     */
+    if (!keys.pv_head_table.fetched || !keys.vm_first_phys.fetched || !keys.cpu_ttep.fetched ||
+        !keys.pt_index_max.fetched || !keys.kernel_el.fetched ||
+        !keys.arm_tt_l1_index_mask.fetched) {
+        kpm_append(t, "✗ 上面标 fetched=no 的键里有必需项缺失 —— 中止（不回退成硬编码常量）。\n");
+        return KM_PM_KEYS_MISSING;
+    }
+
+    /* ── ③ 页表几何 ── */
+    kpm_append(t, "== ③ 页表几何（L1 掩码来自 XPF，L2/L3 是 16K 常量）==\n");
+    const uint64_t l1IndexMask = keys.arm_tt_l1_index_mask.value;
+    kpm_append(t, "  kernelConstant.ARM_TT_L1_INDEX_MASK=%#llx（T1SZ_BOOT 实读=%#llx）\n",
+               (unsigned long long)l1IndexMask, (unsigned long long)keys.t1sz_boot.value);
+
+    uint64_t l1Shift = 0;
+    while (l1Shift < 63 && ((l1IndexMask >> l1Shift) & 0x1ULL) == 0) {
+        l1Shift++;
+    }
+    if (l1IndexMask == 0 || ((l1IndexMask >> l1Shift) & 0x1ULL) == 0) {
+        kpm_append(t, "✗ L1 索引掩码 %#llx 解不出位移 —— 中止。\n",
+                   (unsigned long long)l1IndexMask);
+        return KM_PM_KEYS_MISSING;
+    }
+
+    ctx->levels[KM_PM_TT_L1_LEVEL] = (km_pm_tt_level){
+        .offMask = KM_PM_OFFMASK_L1,
+        .shift = l1Shift,
+        .indexMask = l1IndexMask,
+        .validMask = KM_PM_TTE_VALID,
+        .typeMask = KM_PM_TTE_TYPE_MASK,
+        .typeBlock = KM_PM_TTE_TYPE_BLOCK,
+    };
+    ctx->levels[KM_PM_TT_L2_LEVEL] = (km_pm_tt_level){
+        .offMask = KM_PM_OFFMASK_L2,
+        .shift = KM_PM_SHIFT_L2,
+        .indexMask = KM_PM_INDEX_L2,
+        .validMask = KM_PM_TTE_VALID,
+        .typeMask = KM_PM_TTE_TYPE_MASK,
+        .typeBlock = KM_PM_TTE_TYPE_BLOCK,
+    };
+    ctx->levels[KM_PM_TT_L3_LEVEL] = (km_pm_tt_level){
+        .offMask = KM_PM_OFFMASK_L3,
+        .shift = KM_PM_SHIFT_L3,
+        .indexMask = KM_PM_INDEX_L3,
+        .validMask = KM_PM_TTE_VALID,
+        .typeMask = KM_PM_TTE_TYPE_MASK,
+        .typeBlock = KM_PM_TTE_TYPE_L3BLOCK,
+    };
+
+    const uint64_t windowL1Index = (ctx->window & l1IndexMask) >> l1Shift;
+    const uint64_t windowL2Index = (ctx->window & KM_PM_INDEX_L2) >> KM_PM_SHIFT_L2;
+    const uint64_t windowL3Index = (ctx->window & KM_PM_INDEX_L3) >> KM_PM_SHIFT_L3;
+    kpm_append(t, "  窗口 %#llx 的三级索引：L1=%llu（shift %llu） L2=%llu（shift %llu） L3=%llu（shift %llu）\n",
+               (unsigned long long)ctx->window, (unsigned long long)windowL1Index,
+               (unsigned long long)l1Shift, (unsigned long long)windowL2Index,
+               (unsigned long long)KM_PM_SHIFT_L2, (unsigned long long)windowL3Index,
+               (unsigned long long)KM_PM_SHIFT_L3);
+    /*
+     * 合法性判据（两条都不是"应该成立"，是这条算法的前提）：
+     *   · L1 索引 < L1_BLOCK_COUNT：窗口是"最后一个 L1 块"，索引必须是 7（16K）。
+     *     越界就说明 XPF 的掩码与窗口地址说的不是同一台设备。
+     *   · L3 索引必须是 0：自映射写的是窗口地址那条 L3 表的**第 0 项**。
+     *     L3 索引非 0 时"窗口的页表项 = 表第 0 项"就不成立，写进去的是别的项的地址
+     *     —— 那是一次写错地址的内核写。
+     */
+    if (windowL1Index >= KM_PM_16K_L1_BLOCK_COUNT) {
+        kpm_append(t, "✗ 窗口的 L1 索引 %llu ≥ L1 块数 %llu —— 掩码与窗口地址不自洽，中止。\n",
+                   (unsigned long long)windowL1Index,
+                   (unsigned long long)KM_PM_16K_L1_BLOCK_COUNT);
+        return KM_PM_KEYS_MISSING;
+    }
+    if (windowL3Index != 0) {
+        kpm_append(t, "✗ 窗口的 L3 索引 %llu ≠ 0 —— 自映射写的是表第 0 项这条前提不成立，中止。\n",
+                   (unsigned long long)windowL3Index);
+        return KM_PM_KEYS_MISSING;
+    }
+    kpm_append(t, "✓ L1 索引 %llu < %llu（= L1_BLOCK_COUNT）；L3 索引 0（自映射写第 0 项的前提）\n",
+               (unsigned long long)windowL1Index, (unsigned long long)KM_PM_16K_L1_BLOCK_COUNT);
+
+    /*
+     * ── 几何自洽，两条 ──
+     *
+     * 这不是"再确认一遍"，而是把一个**已经踩过的坑**变成可执行判据：
+     * L1 索引掩码有两种写法（11 位 0x7ff000000000 / 3 位 0x7000000000），
+     * 而窗口地址 0x7000000000 在**两种写法下都给出索引 7** —— 于是"用错掩码"
+     * 这件事在看索引那一行时**看不出来**。掩码与块数的关系才是能分辨它的东西：
+     *     (l1IndexMask >> l1Shift) + 1 必须等于 L1 块数（16K 大内存机型 = 8）
+     * 11 位掩码会算出 2048，立刻中止 —— 而它一旦漏过去，遍历会在 L1 那一步
+     * 索引到别的表项，把一个不属于自己的表当成下一级表。
+     *
+     * 第二条同理：一个 L2 块覆盖多少页，必须与 Dopamine util.c:384-394 的块数一致
+     * （16K：0x2000000 / 0x4000 = 2048）。把"我抄的两个数是不是同一台机器的"
+     * 变成可执行检查，而不是靠人比对两行常量。
+     */
+    const uint64_t l1BlockCountFromMask = ((l1IndexMask >> l1Shift) + 1);
+    kpm_append(t, "  自洽：掩码 %#llx >> %llu 再 +1 = %llu 个 L1 块（常量 %llu）；"
+                  "L2 块 %#llx / 页 %#llx = %llu 页（常量 %llu）\n",
+               (unsigned long long)l1IndexMask, (unsigned long long)l1Shift,
+               (unsigned long long)l1BlockCountFromMask,
+               (unsigned long long)KM_PM_16K_L1_BLOCK_COUNT,
+               (unsigned long long)KM_PM_16K_L2_BLOCK_SIZE, (unsigned long long)ctx->pageSize,
+               (unsigned long long)(KM_PM_16K_L2_BLOCK_SIZE / ctx->pageSize),
+               (unsigned long long)KM_PM_16K_L2_BLOCK_COUNT);
+    if (l1BlockCountFromMask != KM_PM_16K_L1_BLOCK_COUNT) {
+        kpm_append(t, "✗ L1 掩码与 L1 块数不自洽：掩码推出 %llu 块，常量是 %llu ——\n",
+                   (unsigned long long)l1BlockCountFromMask,
+                   (unsigned long long)KM_PM_16K_L1_BLOCK_COUNT);
+        kpm_append(t, "  说明 XPF 给的掩码不是这台机器的几何（或常量抄错了），中止。\n");
+        return KM_PM_KEYS_MISSING;
+    }
+    if ((KM_PM_16K_L2_BLOCK_SIZE / ctx->pageSize) != KM_PM_16K_L2_BLOCK_COUNT) {
+        kpm_append(t, "✗ L2 块 / 页大小 = %llu ≠ 常量 %llu —— 几何常量之间不自洽，中止。\n",
+                   (unsigned long long)(KM_PM_16K_L2_BLOCK_SIZE / ctx->pageSize),
+                   (unsigned long long)KM_PM_16K_L2_BLOCK_COUNT);
+        return KM_PM_KEYS_MISSING;
+    }
+    kpm_append(t, "✓ 几何自洽（L1 掩码↔块数、L2 块↔页大小都一致）\n");
+
+    /* ── ④ pmap 链路 ── */
+    kpm_append(t, "== ④ pmap 链路（proc → task → vm_map → pmap）==\n");
+    const uint64_t taskOff = km_proc_object_size();
+    const uint64_t mapOff = km_task_map_offset();
+    const uint64_t pmapOff = km_vm_map_pmap_offset();
+    kpm_append(t, "  偏移：proc→task=%#llx · task→map=%#llx · map→pmap=%#llx\n",
+               (unsigned long long)taskOff, (unsigned long long)mapOff,
+               (unsigned long long)pmapOff);
+    if (taskOff == 0 || mapOff == 0 || pmapOff == 0) {
+        kpm_append(t, "✗ 有一个偏移是 0 —— 版本表没命中，或结构体定义被改坏。\n");
+        return KM_PM_PMAP_UNRESOLVED;
+    }
+
+    ctx->proc = km_current_proc();
+    if (ctx->proc == 0) {
+        kpm_append(t, "✗ km_current_proc()=0：info_run 没反查到本进程 proc。\n");
+        return KM_PM_PMAP_UNRESOLVED;
+    }
+    kpm_append(t, "  current_proc=%#llx\n", (unsigned long long)ctx->proc);
+
+    if (!kpm_add(ctx->proc, taskOff, &ctx->task) || !kpm_shape_ok(ctx->task)) {
+        kpm_append(t, "✗ proc+%#llx=%#llx 形态不过。\n", (unsigned long long)taskOff,
+                   (unsigned long long)ctx->task);
+        return KM_PM_PMAP_UNRESOLVED;
+    }
+    bool ok = false;
+    ctx->map = km_read64(ctx->task + mapOff, &ok);
+    kpm_append(t, "  task=%#llx +%#llx → vm_map=%#llx%s\n", (unsigned long long)ctx->task,
+               (unsigned long long)mapOff, (unsigned long long)ctx->map,
+               ok ? "" : "  ← 读失败（两次不一致）");
+    if (!ok || ctx->map == 0) {
+        return KM_PM_PMAP_UNRESOLVED;
+    }
+
+    uint64_t mapPmapAddr = 0;
+    if (!kpm_add(ctx->map, pmapOff, &mapPmapAddr) || !kpm_shape_ok(mapPmapAddr)) {
+        kpm_append(t, "✗ vm_map+%#llx=%#llx 形态不过。\n", (unsigned long long)pmapOff,
+                   (unsigned long long)mapPmapAddr);
+        return KM_PM_PMAP_UNRESOLVED;
+    }
+    ctx->pmap = km_read64(mapPmapAddr, &ok);
+    kpm_append(t, "  vm_map=%#llx +%#llx → pmap=%#llx%s\n", (unsigned long long)ctx->map,
+               (unsigned long long)pmapOff, (unsigned long long)ctx->pmap,
+               ok ? "" : "  ← 读失败（两次不一致）");
+    if (!ok || ctx->pmap == 0 || !kpm_shape_ok(ctx->pmap)) {
+        return KM_PM_PMAP_UNRESOLVED;
+    }
+
+    const uint64_t tte = km_read64(ctx->pmap + KM_PM_PMAP_OFF_TTE, &ok);
+    const bool tteOk = ok;
+    ctx->ttep = km_read64(ctx->pmap + KM_PM_PMAP_OFF_TTEP, &ok);
+    kpm_append(t, "  pmap->tte =%#llx%s\n", (unsigned long long)tte, tteOk ? "" : "  ← 读失败");
+    kpm_append(t, "  pmap->ttep=%#llx%s   ← 遍历起点（PA，physrw_pte.c:122 同构）\n",
+               (unsigned long long)ctx->ttep, ok ? "" : "  ← 读失败");
+    if (!ok || ctx->ttep == 0) {
+        return KM_PM_PMAP_UNRESOLVED;
+    }
+    if ((ctx->ttep & 0xf000000000000000ULL) != 0) {
+        kpm_append(t, "✗ ttep 高位非 0 —— 它不是物理地址，物理路径的遍历不成立。\n");
+        return KM_PM_PMAP_UNRESOLVED;
+    }
+    /*
+     * 交叉核对：tte 是同一张表的内核虚拟别名。两者若一致（tte − ttep ==
+     * km_phystokv(ttep) − ttep）说明换算表与 pmap 说的是同一件事。
+     * **不相等不代表谁错** —— 来源完全不同，相等是佐证、不相等只是没有额外证据。
+     * 刻意不把任何一个值写回全局或当基准：KernelMemory.m 的 g_linear_delta 那次
+     * 彩屏就是"把 tte − ttep 当基准"（KernelMemory.m:176-205 的完整推导）。
+     */
+    const uint64_t kvFromTable = km_phystokv(ctx->ttep);
+    kpm_append(t, "  参考：tte − ttep = %#llx；km_phystokv(ttep) = %#llx%s\n",
+               (unsigned long long)(tte - ctx->ttep), (unsigned long long)kvFromTable,
+               (kvFromTable == tte) ? "  （一致 ⇒ 换算表与 pmap 指着同一张表）"
+                                    : "  （不一致 ⇒ 只说明来源不同，都不作基准）");
+
+    /* ── 符号内容（+slide 之后 kread）── */
+    kpm_append(t, "== ⑤ 符号内容（链接期地址 + slide 之后读出来）==\n");
+    ctx->pvHeadTable = keys.pv_head_table.value + ctx->slide;
+    ctx->vmFirstPhysSymbol = keys.vm_first_phys.value + ctx->slide;
+    ctx->cpuTtepSymbol = keys.cpu_ttep.value + ctx->slide;
+    ctx->ptIndexMax = keys.pt_index_max.value;
+
+    if (!kpm_shape_ok(ctx->pvHeadTable) || !kpm_shape_ok(ctx->vmFirstPhysSymbol) ||
+        !kpm_shape_ok(ctx->cpuTtepSymbol)) {
+        kpm_append(t, "✗ 符号运行时地址形态不过（slide 可能不对）：pv_head_table=%#llx "
+                      "vm_first_phys=%#llx cpu_ttep=%#llx\n",
+                   (unsigned long long)ctx->pvHeadTable,
+                   (unsigned long long)ctx->vmFirstPhysSymbol,
+                   (unsigned long long)ctx->cpuTtepSymbol);
+        return KM_PM_KEYS_MISSING;
+    }
+    kpm_append(t, "  pv_head_table  = %#llx（链接期 %#llx + slide）\n",
+               (unsigned long long)ctx->pvHeadTable,
+               (unsigned long long)keys.pv_head_table.value);
+    kpm_append(t, "  vm_first_phys  = %#llx（链接期 %#llx + slide）\n",
+               (unsigned long long)ctx->vmFirstPhysSymbol,
+               (unsigned long long)keys.vm_first_phys.value);
+    kpm_append(t, "  cpu_ttep       = %#llx（链接期 %#llx + slide）\n",
+               (unsigned long long)ctx->cpuTtepSymbol,
+               (unsigned long long)keys.cpu_ttep.value);
+
+    /*
+     * 三处 kread 逐字对照 Dopamine：
+     *   kernel.c:109  pai_to_pvh 里 kread64(ksymbol(pv_head_table)) → 表的基址
+     *   kernel.c:104  pa_index 里   kread64(ksymbol(vm_first_phys)) → 物理基址
+     *   info.c:289    cpuTTEP =     kread64(ksymbol(cpu_ttep))       → TTBR1 的值
+     */
+    ctx->pvHeadTableValue = km_read64(ctx->pvHeadTable, &ok);
+    kpm_append(t, "  · pv_head_table 内容 = %#llx%s\n", (unsigned long long)ctx->pvHeadTableValue,
+               ok ? "" : "  ← 读失败");
+    if (!ok || !kpm_shape_ok(ctx->pvHeadTableValue)) {
+        kpm_append(t, "✗ pv_head_table 内容不是内核地址 —— 中止。\n");
+        return KM_PM_KEYS_MISSING;
+    }
+
+    ctx->vmFirstPhysValue = km_read64(ctx->vmFirstPhysSymbol, &ok);
+    kpm_append(t, "  · vm_first_phys 内容 = %#llx%s\n", (unsigned long long)ctx->vmFirstPhysValue,
+               ok ? "" : "  ← 读失败");
+    if (!ok || ctx->vmFirstPhysValue >= (1ULL << 48)) {
+        kpm_append(t, "✗ vm_first_phys 内容不像物理地址（≥ 2^48）—— 中止。\n");
+        return KM_PM_KEYS_MISSING;
+    }
+
+    ctx->cpuTtep = km_read64(ctx->cpuTtepSymbol, &ok);
+    kpm_append(t, "  · cpu_ttep 内容（TTBR1 的值）= %#llx%s\n", (unsigned long long)ctx->cpuTtep,
+               ok ? "" : "  ← 读失败");
+    if (!ok || ctx->cpuTtep == 0) {
+        kpm_append(t, "✗ cpu_ttep 读不出来 —— sw_asid 那一页的物理地址算不出来（可选步骤）。\n");
+        ctx->cpuTtep = 0;
+    } else if ((ctx->cpuTtep & 0xf000000000000000ULL) != 0) {
+        kpm_append(t, "✗ cpu_ttep 内容高位非 0 —— 它不是页表根的物理地址，遍历不成立。\n");
+        ctx->cpuTtep = 0;
+    } else {
+        kpm_append(t, "✓ cpu_ttep 是物理地址，可用作内核页表遍历的起点。\n");
+    }
+
+    /* ── pmap 布局（arm64e 支）+ 记账链偏移 ── */
+    kpm_append(t, "== ⑥ pmap / pt_desc 布局（arm64e 支，见头文件「没能确证的部分」）==\n");
+    const uint64_t elAdjust = (keys.kernel_el.value == 2) ? KM_PM_PMAP_EL2_ADJUST : 0;
+    ctx->swAsidOff = KM_PM_PMAP_OFF_SW_ASID_ARM64E + elAdjust;
+    ctx->wxAllowedOff = KM_PM_PMAP_OFF_WX_ALLOWED_ARM64E + elAdjust;
+    ctx->typeOff = KM_PM_PMAP_OFF_TYPE_ARM64E + elAdjust;
+
+    /*
+     * PT_INDEX_MAX 的范围判据必须在**用它算偏移之前**（这是复查时改过来的顺序）：
+     * 它来自 XPF 的一次计数（common.c:129-176 数 str 指令直到 RET），返回的是一个
+     * 计数器而不是经过形态检查的地址。一个垃圾值乘 8 就是溢出，而溢出出来的偏移
+     * 会指向 pmap 对象**外面**的内存 —— 后面每一次 kread/kwrite 都会打在别的东西上。
+     * 判据放在前面，崩溃面就只在下游而不是在这里。
+     */
+    if (ctx->ptIndexMax == 0 || ctx->ptIndexMax > 64) {
+        kpm_append(t, "✗ PT_INDEX_MAX=%llu 不在合理范围（1..64）—— ptd_info 偏移不可信，中止。\n",
+                   (unsigned long long)ctx->ptIndexMax);
+        return KM_PM_KEYS_MISSING;
+    }
+    ctx->ptDescOffPtdInfo = KM_PM_PT_DESC_OFF_VA + (ctx->ptIndexMax * sizeof(uint64_t));
+
+    kpm_append(t, "  kernelConstant.kernel_el 实读 = %llu → pmapEl2Adjust = %#llx\n",
+               (unsigned long long)keys.kernel_el.value, (unsigned long long)elAdjust);
+    kpm_append(t, "  ⇒ sw_asid=%#llx  wx_allowed=%#llx  type=%#llx（info.c:86-88 的 arm64e 支）\n",
+               (unsigned long long)ctx->swAsidOff, (unsigned long long)ctx->wxAllowedOff,
+               (unsigned long long)ctx->typeOff);
+    kpm_append(t, "  pt_desc.pmap=%#llx  pt_desc.va=%#llx  PT_INDEX_MAX=%llu → ptd_info=%#llx"
+                  "（info.c:107-109）\n",
+               (unsigned long long)KM_PM_PT_DESC_OFF_PMAP, (unsigned long long)KM_PM_PT_DESC_OFF_VA,
+               (unsigned long long)ctx->ptIndexMax, (unsigned long long)ctx->ptDescOffPtdInfo);
+    return KM_PM_READY;
+}
+
+#pragma mark - 窗口探测与记账链诊断
+
+/// 对窗口地址逐级下行，把级号 / 断点表项地址 / 旧值 / 结论留下来。
+static void kpm_probe_window(km_pm_ctx *ctx, km_pm_text *t)
+{
+    kpm_append(t, "== ⑦ 窗口地址上的页表（对 va 逐级算索引，不是从块基址走）==\n");
+    kpm_append(t, "  窗口 = %#llx = L1_BLOCK_SIZE %#llx × (L1_BLOCK_COUNT %llu − 1)\n",
+               (unsigned long long)ctx->window, (unsigned long long)KM_PM_16K_L1_BLOCK_SIZE,
+               (unsigned long long)KM_PM_16K_L1_BLOCK_COUNT);
+
+    uint64_t level = KM_PM_TT_L3_LEVEL;
+    uint64_t leafAddr = 0;
+    km_pm_vt_err err = KM_PM_E_NONE;
+    ctx->windowWalkPa = kpm_vtophys_lvl(ctx, ctx->ttep, ctx->window, &level, &leafAddr, &err);
+    ctx->windowLeafLevel = level;
+    ctx->windowLeafAddr = leafAddr;
+    ctx->windowWalkErr = err;
+
+    const char *errName = "none";
+    switch (err) {
+    case KM_PM_E_NONE: errName = "none"; break;
+    case KM_PM_E_LEVEL: errName = "level-overflow"; break;
+    case KM_PM_E_INVALID: errName = "invalid（这一级还没有表）"; break;
+    case KM_PM_E_PATH: errName = "path"; break;
+    case KM_PM_E_PHYS2VIRT: errName = "phys2virt-failed"; break;
+    case KM_PM_E_SHAPE: errName = "shape-bad"; break;
+    case KM_PM_E_READ: errName = "read-failed"; break;
+    }
+
+    static const char *const levelNames[4] = { "L0", "L1", "L2", "L3" };
+    kpm_append(t, "  下钻结果：停在 %s（%llu） · 断点表项自身 PA=%#llx · 返回=%#llx · 状态=%s\n",
+               levelNames[level & 0x3], (unsigned long long)level,
+               (unsigned long long)leafAddr, (unsigned long long)ctx->windowWalkPa, errName);
+
+    /*
+     * 读那个表项的旧值。这一步既是诊断（"现在是什么"），也是**写入路径的第一步**
+     * （硬约束 3 的"写前读旧值"）—— 所以它在预检里也要发生。
+     */
+    ctx->windowLeafEntry = 0;
+    if (err == KM_PM_E_NONE || err == KM_PM_E_INVALID) {
+        const uint64_t kva = km_phystokv(leafAddr);
+        if (kva == 0 || !kpm_shape_ok(kva)) {
+            kpm_append(t, "  ✗ 表项自身 PA=%#llx 换算不出可用的 KVA（km_phystokv→%#llx）\n",
+                       (unsigned long long)leafAddr, (unsigned long long)kva);
+        } else {
+            bool ok = false;
+            ctx->windowLeafEntry = km_read64(kva, &ok);
+            kpm_append(t, "  表项旧值：PA=%#llx → KVA=%#llx → %#llx%s\n",
+                       (unsigned long long)leafAddr, (unsigned long long)kva,
+                       (unsigned long long)ctx->windowLeafEntry,
+                       ok ? "" : "  ← 读失败（两次不一致）");
+        }
+    }
+
+    ctx->windowHasL3 = (err == KM_PM_E_NONE && level == KM_PM_TT_L3_LEVEL);
+
+    /*
+     * 结论分档。**"有 L3 表"与"没有"是两件事，而"撞上大页"是第三件** ——
+     * 撞上大页时既不需要建表（那一段本来就有映射），也不能按样本那条路写 PTE
+     * （没有独立的 L3 表项可写）。把三者混成 bool 会让面板只能给出一句含糊的话。
+     */
+    if (ctx->windowHasL3) {
+        kpm_append(t, "  ⇒ 窗口地址上**已经有 L3 表项**（表项值 %#llx）—— 建表这一步已经完成过。\n",
+                   (unsigned long long)ctx->windowLeafEntry);
+    } else if (err == KM_PM_E_INVALID) {
+        kpm_append(t, "  ⇒ 页表在 %s 就断了（表项 %#llx）—— **需要建表**，这正是本模块要做的。\n",
+                   levelNames[level & 0x3], (unsigned long long)ctx->windowLeafEntry);
+    } else if (err == KM_PM_E_NONE && level < KM_PM_TT_L3_LEVEL && ctx->windowWalkPa != 0) {
+        kpm_append(t, "  ⇒ %s 上是块描述符（大页）：没有独立的 L3 表项可写，本模块的算法不适用。\n",
+                   levelNames[level & 0x3]);
+    }
+}
+
+/// 窗口地址上**是不是已经写好了自映射**。是则把表页 PA 写进 *outTablePa。
+///
+/// 判据：窗口的 L3 第 0 项必须等于「L2 表项指向的那张 L3 表页的 PA | 叶模板」——
+/// 也就是它确实指向表页自己。左边来自 `kpm_probe_window` 读到的表项旧值，
+/// 右边来自一次沿 L2 停下的遍历（`vtophys_lvl` 在 L2 停下时返回的就是那张表页的 PA）。
+///
+/// 为什么不能用"窗口上有 L3 表项"当判据：那一项完全可能是别的值（手工建表被
+/// 打断、或别的实现留下的）。**只读**：一次遍历 + 一次比较，不写任何东西。
+static bool kpm_window_is_selfmapped(const km_pm_ctx *ctx, uint64_t *outTablePa)
+{
+    if (outTablePa) {
+        *outTablePa = 0;
+    }
+    if (!ctx->windowHasL3) {
+        return false;
+    }
+
+    uint64_t level = KM_PM_TT_L2_LEVEL;
+    uint64_t leafAddr = 0;
+    km_pm_vt_err err = KM_PM_E_NONE;
+    const uint64_t tablePa =
+        kpm_vtophys_lvl(ctx, ctx->ttep, ctx->window, &level, &leafAddr, &err);
+    if (tablePa == 0 || err != KM_PM_E_NONE) {
+        return false;
+    }
+    if (outTablePa) {
+        *outTablePa = tablePa;
+    }
+    return ctx->windowLeafEntry == (tablePa | KM_PM_PTE_LEAF);
+}
+
+/// 记账链诊断：把「新页表页 PA 是怎么来的、现在有没有」说清楚。
+static void kpm_report_accounting(const km_pm_ctx *ctx, km_pm_text *t)
+{
+    kpm_append(t, "== ⑧ 物理页记账链（kernel.c:102-115）==\n");
+    kpm_append(t, "  vm_first_phys 内容 = %#llx（物理基址）\n",
+               (unsigned long long)ctx->vmFirstPhysValue);
+    kpm_append(t, "  pv_head_table 基址 = %#llx（每项 8 字节，下标 = 物理页号）\n",
+               (unsigned long long)ctx->pvHeadTableValue);
+    kpm_append(t, "  pa_index(pa) = (pa − vm_first_phys) >> %llu\n",
+               (unsigned long long)ctx->pageShift);
+    kpm_append(t, "  pt_desc 布局：pmap@+%#llx va@+%#llx ptd_info@+%#llx\n",
+               (unsigned long long)KM_PM_PT_DESC_OFF_PMAP,
+               (unsigned long long)KM_PM_PT_DESC_OFF_VA,
+               (unsigned long long)ctx->ptDescOffPtdInfo);
+    kpm_append(t, "  分配公式：posix_memalign(%#llx 对齐, %#llx) → 触碰一页 → vtophys_lvl(只到 L2)\n",
+               (unsigned long long)KM_PM_ALLOC_SPAN, (unsigned long long)KM_PM_ALLOC_SPAN);
+    kpm_append(t, "  ⇒ **新页表页的 PA 此刻还不存在**：预检是只读的，不会去分配；\n");
+    kpm_append(t, "    它由执行阶段现场取得（util.c:132-222）。这里能核对的只是它的全部输入。\n");
+    if (g_physmapMagicPT != 0) {
+        kpm_append(t, "  （上一次执行建出的 magicPT = %#llx）\n", (unsigned long long)g_physmapMagicPT);
+    }
+}
+
+/// pmap 布局的三条佐证。返回 true 表示"可以按 arm64e 支继续"。
+///
+/// 为什么需要它：sw_asid / type / wx_allowed 三个偏移是硬编码的（头文件写明未确证）。
+/// 佐证用的是**语义上必须成立**的三件事，而不是"读出来不为 0"这类弱判据：
+///   ① kernel_el 取到了（它是偏移公式的输入，取不到就无从谈起）；
+///   ② pmap->type 读出来是 PMAP_TYPE_USER(0) —— Dopamine util.c:283-289 把 type
+///      当"是不是 nested"的开关用（设 3 再设回 0），用户进程的 pmap 必须是 0；
+///   ③ wx_allowed 是一个 bool（低字节只能是 0 或 1）—— 读出来别的值说明偏移落在了
+///      一个非布尔字段中间。
+/// 三条全过也**不等于**确证（0 与 1 都可能碰巧），所以诊断里把实读值原样打出来，
+/// 让人自己看。任一条不过就跳过这一步 —— 它只服务于 Dopamine 的 flush_tlb()，
+/// 而 Aether 没有 flush_tlb。
+static bool kpm_verify_pmap_layout(const km_pm_ctx *ctx, km_pm_text *t)
+{
+    kpm_append(t, "== ⑨ sw_asid 那一步的前置佐证（三条全过才执行）==\n");
+
+    if (ctx->cpuTtep == 0) {
+        kpm_append(t, "✗ cpu_ttep 不可用：算不出 sw_asid 那一页的物理地址。\n");
+        return false;
+    }
+    kpm_append(t, "✓ ① cpu_ttep 可用（TTBR1 的值 %#llx，可作内核页表遍历起点）\n",
+               (unsigned long long)ctx->cpuTtep);
+
+    bool ok = false;
+    const uint64_t typeAddr = ctx->pmap + ctx->typeOff;
+    if (!kpm_shape_ok(typeAddr)) {
+        kpm_append(t, "✗ ② pmap->type 地址 %#llx 形态不过。\n", (unsigned long long)typeAddr);
+        return false;
+    }
+    const uint64_t typeWord = km_read64(typeAddr, &ok);
+    const uint8_t typeValue = (uint8_t)(typeWord & 0xFFULL);
+    kpm_append(t, "  ② pmap+%#llx 读出的字节 = %#x（期望 PMAP_TYPE_USER=0）\n",
+               (unsigned long long)ctx->typeOff, (unsigned)typeValue);
+    if (!ok || typeValue != KM_PM_PMAP_TYPE_USER) {
+        kpm_append(t, "✗ ② 不符：type 偏移在这一台上不是我们假设的那个位置 —— 跳过这一步。\n");
+        return false;
+    }
+
+    const uint64_t wxAddr = ctx->pmap + ctx->wxAllowedOff;
+    if (!kpm_shape_ok(wxAddr)) {
+        kpm_append(t, "✗ ③ pmap->wx_allowed 地址 %#llx 形态不过。\n", (unsigned long long)wxAddr);
+        return false;
+    }
+    const uint64_t wxWord = km_read64(wxAddr, &ok);
+    const uint8_t wxValue = (uint8_t)(wxWord & 0xFFULL);
+    kpm_append(t, "  ③ pmap+%#llx 读出的字节 = %#x（bool，期望 0 或 1）\n",
+               (unsigned long long)ctx->wxAllowedOff, (unsigned)wxValue);
+    if (!ok || wxValue > 1) {
+        kpm_append(t, "✗ ③ 不符：wx_allowed 偏移不像一个 bool 字段 —— 跳过这一步。\n");
+        return false;
+    }
+
+    kpm_append(t, "⇒ 三条佐证都过：按 arm64e 支的偏移继续（sw_asid=%#llx）。\n",
+               (unsigned long long)ctx->swAsidOff);
+    kpm_append(t, "  （说明：这一步只服务于 Dopamine 的 flush_tlb()；Aether 目前没有 flush_tlb，\n");
+    kpm_append(t, "   跳过它的代价只是窗口里少一条 sw_asid 页的映射，不影响建表与自映射。）\n");
+    return true;
+}
+
+#pragma mark - 建表
+
+/// 页表页分配的结果。
+typedef enum {
+    KM_PM_ALLOC_OK = 0,
+    KM_PM_ALLOC_MEMALIGN_FAILED,
+    KM_PM_ALLOC_WALK_FAILED,
+    KM_PM_ALLOC_ACCOUNTING_FAILED,
+    KM_PM_ALLOC_REFCOUNT_BUSY,
+    KM_PM_ALLOC_WRITE_FAILED
+} km_pm_alloc_result;
+
+/*
+ * alloc_page_table_unassigned —— 逐行对照 Dopamine util.c:132-222。
+ *
+ * 它要解决的问题：**怎么从内核手里弄到一张"没有主人"的 L3 页表页**。
+ * 内核只为它自己的映射建表，所以办法是"自己制造一个映射、把它下面那张表骗过来"：
+ *   ① 分配一个 L2 块大小的用户地址范围（起始按 L2 块对齐）—— 这样那张 L3 表
+ *      只服务我们这一段映射，可以假定归我们独占（util.c:142 的注释）；
+ *   ② 触碰一页，逼内核为它建出页表；
+ *   ③ 用页表遍历找到刚建的那张 L3 表（只走到 L2 就返回，见下面）；
+ *   ④ 顺着物理页记账链找到这张表的 pt_desc，把它的引用计数抬到 0x1337；
+ *   ⑤ free() 掉那段用户地址 —— 引用计数不为 0，内核不会释放那张表，它就此"泄漏"成无主表；
+ *   ⑥ 把原来指向它的那个 L2 表项清 0，正式解除它与原地址的关联；
+ *   ⑦ 引用计数归 0（我们的新表项不进 pmap 记账，所以这张表自身必须是 0）。
+ *
+ * 四处物理读写（Dopamine 的注释逐条说明了为什么）：⑤ 之后的行为全部依赖 ④ 的
+ * 引用计数——顺序不能换。
+ */
+static km_pm_alloc_result kpm_alloc_page_table_unassigned(km_pm_ctx *ctx, km_pm_text *t,
+                                                          uint64_t *outPa)
+{
+    for (int attempt = 0; attempt < KM_PM_ALLOC_ATTEMPTS; attempt++) {
+        void *freeLvl2 = NULL;
+
+        /* util.c:143 */
+        if (posix_memalign(&freeLvl2, (size_t)KM_PM_ALLOC_SPAN, (size_t)KM_PM_ALLOC_SPAN) != 0) {
+            kpm_append(t, "  ✗ posix_memalign(%#llx) 失败\n", (unsigned long long)KM_PM_ALLOC_SPAN);
+            return KM_PM_ALLOC_MEMALIGN_FAILED;
+        }
+
+        /* util.c:148 —— 触碰一页。volatile 保证这次访问真的发生（编译器不许省掉它）。 */
+        *(volatile uint64_t *)freeLvl2;
+
+        /*
+         * util.c:151-152 —— **只走到 L2**。
+         *
+         * 这一点是整套算法的关键：LEAF_LEVEL 传 PMAP_TT_L2_LEVEL，于是 vtophys_lvl
+         * 在 L2 就停下并返回"最后一级表的地址"（translation.c:94-96），也就是
+         * L2 表项指向的**那张 L3 表的 PA**；同时 `tte_lvl2` 拿到的是
+         * **指向它的那个 L2 表项自身的 PA**（下面第 ⑥ 步要清的就是它）。
+         */
+        uint64_t lvl = KM_PM_TT_L2_LEVEL;
+        uint64_t tteLvl2 = 0;
+        km_pm_vt_err err = KM_PM_E_NONE;
+        const uint64_t allocatedPt =
+            kpm_vtophys_lvl(ctx, ctx->ttep, (uint64_t)freeLvl2, &lvl, &tteLvl2, &err);
+        if (allocatedPt == 0 || err != KM_PM_E_NONE) {
+            kpm_append(t, "  ✗ 找不到刚分配的页表（va=%#llx 设备=%#llx err=%d）\n",
+                       (unsigned long long)(uint64_t)freeLvl2, (unsigned long long)allocatedPt,
+                       (int)err);
+            free(freeLvl2);
+            return KM_PM_ALLOC_WALK_FAILED;
+        }
+
+        /* ── 记账链：allocatedPt → pai → pvh → ptdp → pinfo ── */
+        if (allocatedPt < ctx->vmFirstPhysValue) {
+            kpm_append(t, "  ✗ 新表 PA %#llx < vm_first_phys %#llx —— 减法会下溢（kernel.c:104）\n",
+                       (unsigned long long)allocatedPt,
+                       (unsigned long long)ctx->vmFirstPhysValue);
+            free(freeLvl2);
+            return KM_PM_ALLOC_ACCOUNTING_FAILED;
+        }
+        const uint64_t pai = kpm_pa_index(ctx, allocatedPt);
+        const uint64_t pvh = kpm_pai_to_pvh(ctx, pai);
+        if (pvh == 0 || !kpm_shape_ok(pvh)) {
+            kpm_append(t, "  ✗ pvh 地址 %#llx 形态不过（pai=%llu）\n", (unsigned long long)pvh,
+                       (unsigned long long)pai);
+            free(freeLvl2);
+            return KM_PM_ALLOC_ACCOUNTING_FAILED;
+        }
+
+        bool ok = false;
+        const uint64_t pvhEntry = km_read64(pvh, &ok);
+        if (!ok) {
+            kpm_append(t, "  ✗ pvh 表项 %#llx 读失败\n", (unsigned long long)pvh);
+            free(freeLvl2);
+            return KM_PM_ALLOC_ACCOUNTING_FAILED;
+        }
+
+        /*
+         * **类型判据（本工程加的，Dopamine 没有）**：pvh 表项低 2 位是类型，
+         * 页表描述符必须是 PVH_TYPE_PTDP(3)（pvh.h:19-22）。
+         *
+         * 为什么非加不可：kpm_pvh_ptd() 做的是 `entry & ~3 | HIGH_FLAGS`。
+         * 如果这一项其实是 PVH_TYPE_NULL(0)，那么 entry 往往就是 0，
+         * 于是算出来的 ptdp 等于 PVH_HIGH_FLAGS —— 一个**形态合法**的内核地址，
+         * 后面的 kread 会直接打在内核空洞上。这正是"0 会被拦下、错值不会"的
+         * 同一个形态（KernelMemory.m:196-200）。
+         */
+        const uint64_t pvhType = pvhEntry & KM_PM_PVH_TYPE_MASK;
+        kpm_append(t, "  pvh[%llu]=%#llx（type=%llu = %s）\n", (unsigned long long)pai,
+                   (unsigned long long)pvhEntry, (unsigned long long)pvhType,
+                   kpm_pvh_type_name(pvhType));
+        if (pvhType != KM_PM_PVH_TYPE_PTDP) {
+            free(freeLvl2);
+            return KM_PM_ALLOC_ACCOUNTING_FAILED;
+        }
+
+        const uint64_t ptdp = kpm_pvh_ptd(pvhEntry);
+        if (!kpm_shape_ok(ptdp)) {
+            kpm_append(t, "  ✗ ptdp=%#llx 形态不过\n", (unsigned long long)ptdp);
+            free(freeLvl2);
+            return KM_PM_ALLOC_ACCOUNTING_FAILED;
+        }
+
+        uint64_t pinfoAddr = 0;
+        if (!kpm_add(ptdp, ctx->ptDescOffPtdInfo, &pinfoAddr) || !kpm_shape_ok(pinfoAddr)) {
+            kpm_append(t, "  ✗ ptdp+ptd_info=%#llx 形态不过\n", (unsigned long long)pinfoAddr);
+            free(freeLvl2);
+            return KM_PM_ALLOC_ACCOUNTING_FAILED;
+        }
+        const uint64_t pinfo = km_read64(pinfoAddr, &ok);
+        kpm_append(t, "  ptdp=%#llx ptd_info@+%#llx → pinfo=%#llx%s\n", (unsigned long long)ptdp,
+                   (unsigned long long)ctx->ptDescOffPtdInfo, (unsigned long long)pinfo,
+                   ok ? "" : "  ← 读失败");
+        if (!ok || !kpm_shape_ok(pinfo)) {
+            free(freeLvl2);
+            return KM_PM_ALLOC_ACCOUNTING_FAILED;
+        }
+
+        /*
+         * util.c:159-164 —— 引用计数必须是 1。
+         *
+         * 为什么是 1：这张表此刻只被"我们为它造的那一个映射"引用。不等于 1 说明
+         * 它还被别的映射共用，那我们就不能把它整张偷走（偷走会连带毁掉别人的映射）。
+         *
+         * 这里用单次 km_read（不是 km_read64 的双读一致检查）：refcount 是内核对
+         * 象里会被并发改动的字段，双读一致检查会把"内核刚好在这两次读之间动了它"
+         * 误报成读失败。判据本身带重试（下一轮），所以单次读足够 ——
+         * Dopamine util.c:159 的 physread16 同样是单次读。
+         */
+        uint16_t refCount = 0;
+        if (!km_read(pinfo, &refCount, sizeof(refCount))) {
+            kpm_append(t, "  ✗ pinfo=%#llx 读不到引用计数\n", (unsigned long long)pinfo);
+            free(freeLvl2);
+            return KM_PM_ALLOC_ACCOUNTING_FAILED;
+        }
+        kpm_append(t, "  第 %d 次尝试：新表 PA=%#llx refcount=%u\n", attempt + 1,
+                   (unsigned long long)allocatedPt, (unsigned)refCount);
+        if (refCount != 1) {
+            free(freeLvl2);
+            continue; /* util.c:160-163 的重试 */
+        }
+
+        /* ── ④ 抬高引用计数（util.c:194）── */
+        if (!kpm_write_u16_kva(t, pinfo, (uint16_t)KM_PM_REFCOUNT_PINNED,
+                               "抬高页表页引用计数")) {
+            free(freeLvl2);
+            return KM_PM_ALLOC_WRITE_FAILED;
+        }
+
+        /* ── ⑤ 释放地址范围（util.c:197）：引用计数不为 0，那张表不会被回收 ── */
+        free(freeLvl2);
+        freeLvl2 = NULL;
+        kpm_append(t, "  已 free() 掉那段 %#llx 的地址范围（表被引用计数保住）\n",
+                   (unsigned long long)KM_PM_ALLOC_SPAN);
+
+        /* ── ⑥ 解除它与原地址的关联（util.c:200）── */
+        if (!kpm_write_u64_phys(t, tteLvl2, 0, "清掉原 L2 表项（解除关联）")) {
+            /*
+             * 停在这里的**残留状态**必须说清楚，因为它不是"什么都没发生"：
+             * 那张 L3 表已经被引用计数保下来了（第 ④ 步）、并且已经从原地址
+             * 泄漏出来 —— 但指向它的 L2 表项还挂着，所以它此刻**既是我们的孤儿、
+             * 又被原来的映射引用着**。不做回退：回退要再写一次，而"再写一次"
+             * 本身就是这次要避免的东西；泄漏一张 16 KB 表页是可控代价。
+             */
+            kpm_append(t, "  ⇒ 残留状态：那张表页已被引用计数保下（0x%x）且已从原地址泄漏出来，\n",
+                       (unsigned)KM_PM_REFCOUNT_PINNED);
+            kpm_append(t, "    但原 L2 表项仍指向它。不做回退（回退要再写一次内核内存）。\n");
+            return KM_PM_ALLOC_WRITE_FAILED;
+        }
+
+        /*
+         * ── ⑦ 引用计数归 0（util.c:211）──
+         * 我们的新 PTE 不进 pmap 层，所以这张表的记账必须是 0；
+         * 留成 0x1337 会让内核的页表记账与实际情况不符。
+         */
+        if (!kpm_write_u16_kva(t, pinfo, 0, "引用计数归 0")) {
+            kpm_append(t, "  ⇒ 残留状态：表页已完全泄漏（原关联已断），引用计数停在 0x%x。\n",
+                       (unsigned)KM_PM_REFCOUNT_PINNED);
+            kpm_append(t, "    这张表是孤儿、不会被任何一条路径回收；停在 0x%x 只影响记账，不影响安全。\n",
+                       (unsigned)KM_PM_REFCOUNT_PINNED);
+            return KM_PM_ALLOC_WRITE_FAILED;
+        }
+
+        *outPa = allocatedPt;
+        return KM_PM_ALLOC_OK;
+    }
+
+    kpm_append(t, "✗ 连续 %d 次拿到的页表页引用计数都不是 1 —— 放弃（不无限重试）。\n",
+               KM_PM_ALLOC_ATTEMPTS);
+    return KM_PM_ALLOC_REFCOUNT_BUSY;
+}
+
+/*
+ * pmap_alloc_page_table —— 逐行对照 Dopamine util.c:224-250。
+ *
+ * 拿到一张无主 L3 表之后，把它的归属从"当前 pmap 的那个临时地址"换成
+ * "要用它的那个地址"：写 pt_desc.pmap 与 pt_desc.va。
+ *
+ * **与 Dopamine 的差异（头文件第 2 条）**：Dopamine 在这两步之前做了
+ * `ptdp_pa = kvtophys(ptdp)`，因为它的 physwrite64 吃物理地址；Aether 的
+ * pvh_ptd 返回值本来就是内核虚拟地址，直接 km_write 更短，也少一次换算——
+ * 少一次换算就少一处可能出错的地方。
+ */
+static uint64_t kpm_pmap_alloc_page_table(km_pm_ctx *ctx, km_pm_text *t, uint64_t va)
+{
+    uint64_t tt_p = 0;
+    const km_pm_alloc_result r = kpm_alloc_page_table_unassigned(ctx, t, &tt_p);
+    if (r != KM_PM_ALLOC_OK || tt_p == 0) {
+        kpm_append(t, "  ✗ alloc_page_table_unassigned 失败（结果 %d）\n", (int)r);
+        return 0;
+    }
+
+    if (tt_p < ctx->vmFirstPhysValue) {
+        kpm_append(t, "  ✗ 新表 PA %#llx < vm_first_phys —— 记账链会下溢，中止\n",
+                   (unsigned long long)tt_p);
+        return 0;
+    }
+    const uint64_t pai = kpm_pa_index(ctx, tt_p);
+    const uint64_t pvh = kpm_pai_to_pvh(ctx, pai);
+    if (pvh == 0 || !kpm_shape_ok(pvh)) {
+        kpm_append(t, "  ✗ 新表的 pvh 地址 %#llx 形态不过\n", (unsigned long long)pvh);
+        return 0;
+    }
+    bool ok = false;
+    const uint64_t pvhEntry = km_read64(pvh, &ok);
+    if (!ok || (pvhEntry & KM_PM_PVH_TYPE_MASK) != KM_PM_PVH_TYPE_PTDP) {
+        kpm_append(t, "  ✗ 新表的 pvh 表项 %#llx 不是 PTDP（或读失败）—— 不给它挂链\n",
+                   (unsigned long long)pvhEntry);
+        return 0;
+    }
+    const uint64_t ptdp = kpm_pvh_ptd(pvhEntry);
+    if (!kpm_shape_ok(ptdp)) {
+        kpm_append(t, "  ✗ 新表的 ptdp=%#llx 形态不过\n", (unsigned long long)ptdp);
+        return 0;
+    }
+
+    /* util.c:241 */
+    if (!kpm_write_u64_kva(t, ptdp + KM_PM_PT_DESC_OFF_PMAP, ctx->pmap, "关联 pt_desc.pmap")) {
+        return 0;
+    }
+
+    /*
+     * util.c:245-247 —— 按槽位写 va。
+     *
+     * Dopamine 的循环上界是 vm_page_size、步长是 vm_real_kernel_page_size，
+     * 而 `physwrite64(ptdp_pa + va + (po / vm_page_size), va + po)` 里那个下标
+     * **没有乘 8** —— 在 16K 机型上两个页大小相等，po 只能取 0，于是循环头一轮
+     * 就把 (va+0) 写进 offset 0，之后 po 已经 ≥ 上界而退出。所以本机行为就是
+     * 「只写第一个槽」；上游注释（util.c:244）也写着 "in practice, only the first
+     * slot is used"。这里照抄循环形状，把语义留在注释里，而不是偷偷改成一句
+     * 赋值 —— 日后若真有 po 走第二轮的机型，形状还在。
+     */
+    for (uint64_t po = 0; po < ctx->pageSize; po += ctx->pageSize) {
+        const uint64_t vaSlot = ptdp + KM_PM_PT_DESC_OFF_VA + (po / ctx->pageSize);
+        if (!kpm_write_u64_kva(t, vaSlot, va + po, "关联 pt_desc.va")) {
+            return 0;
+        }
+    }
+    return tt_p;
+}
+
+/// pmap_expand_range 的结果。
+///
+/// 枚举值刻意**避开**上面那个 `KM_PM_EXPAND_LOOP_GUARD` 宏名：预处理阶段宏会把
+/// 同名标识符整个换掉，枚举那一行就会变成 `4`，编译直接报 "expected identifier"。
+/// 这类错本地两个脚本都抓不到（它们只看词法与括号），只有 CI 会炸。
+typedef enum {
+    KM_PM_EXPAND_OK = 0,
+    KM_PM_EXPAND_WALK_FAILED,
+    KM_PM_EXPAND_ALLOC_FAILED,
+    KM_PM_EXPAND_LINK_FAILED,
+    KM_PM_EXPAND_LOOP_RUNAWAY
+} km_pm_expand_result;
+
+/*
+ * pmap_expand_range —— 逐行对照 Dopamine util.c:303-335（**无 kcall 的那一支**）。
+ *
+ * 那一支为什么不需要 kcall：它自己就是"页表遍历 + 物理写"两步的循环 ——
+ * 每次下钻看断在哪一级，就在该级缺表的地方手工挂一张新表上去，直到能走到 L3 为止。
+ * 让内核建表（有 kcall 那一支）反而是绕路：先建好再撤掉，只为了让那张空表留下。
+ *
+ * 循环的语义（靠 vtophys_lvl 的两条契约才成立）：
+ *   · leafLevel 每轮先置回 L3 作为 LEAF_LEVEL 入参；
+ *   · 断在 L2 → 缺的是 L3 表 → 在**窗口地址所在 L2 块**的基址上关联新表；
+ *   · 断在 L1 → 缺的是 L2 表 → 在**窗口地址所在 L1 块**的基址上关联新表；
+ *   · 走到 L3 → 什么都不做（这一级已经有了），循环也到此为止。
+ */
+static km_pm_expand_result kpm_pmap_expand_range(km_pm_ctx *ctx, km_pm_text *t, uint64_t vaStart,
+                                                 uint64_t size)
+{
+    /* util.c:304-305 */
+    const uint64_t l2Start = vaStart & ~KM_PM_L2_BLOCK_MASK;
+    const uint64_t l2End = (((vaStart + size) + KM_PM_L2_BLOCK_MASK) & ~KM_PM_L2_BLOCK_MASK);
+
+    kpm_append(t, "  范围 L2 块：%#llx .. %#llx（步长 %#llx）\n", (unsigned long long)l2Start,
+               (unsigned long long)l2End, (unsigned long long)KM_PM_16K_L2_BLOCK_SIZE);
+
+    for (uint64_t va = l2Start; va < l2End; va += KM_PM_16K_L2_BLOCK_SIZE) {
+        uint64_t leafLevel = KM_PM_TT_L3_LEVEL;
+        int guard = 0;
+        do {
+            if (++guard > KM_PM_EXPAND_LOOP_GUARD) {
+                kpm_append(t, "  ✗ 建表循环超过 %d 轮（几何被改坏的迹象）—— 中止\n",
+                           KM_PM_EXPAND_LOOP_GUARD);
+                return KM_PM_EXPAND_LOOP_RUNAWAY;
+            }
+
+            /* util.c:307-311 */
+            leafLevel = KM_PM_TT_L3_LEVEL;
+            uint64_t pte = 0;
+            km_pm_vt_err err = KM_PM_E_NONE;
+            kpm_vtophys_lvl(ctx, ctx->ttep, va, &leafLevel, &pte, &err);
+
+            if (err != KM_PM_E_NONE && err != KM_PM_E_INVALID) {
+                /*
+                 * invalid 之外的失败（换算不出来 / 形态不过 / 读失败）**不是**
+                 * "这里没有表"，而是"我们不知道这里有什么"。此时按 Dopamine 的
+                 * 流程会拿一个无效的 pte 去写 —— 这里必须停下。
+                 */
+                kpm_append(t, "  ✗ 下钻 %#llx 失败（err=%d）—— 中止，不写\n",
+                           (unsigned long long)va, (int)err);
+                return KM_PM_EXPAND_WALK_FAILED;
+            }
+
+            kpm_append(t, "  va=%#llx 断在 %s：该级缺表，要挂新表的表项 PA=%#llx\n",
+                       (unsigned long long)va,
+                       (leafLevel == KM_PM_TT_L1_LEVEL
+                            ? "L1"
+                            : (leafLevel == KM_PM_TT_L2_LEVEL ? "L2" : "L3")),
+                       (unsigned long long)pte);
+
+            if (leafLevel != KM_PM_TT_L3_LEVEL) {
+                /* util.c:313-324 —— 这一级缺表，缺的是它的**下一级** */
+                uint64_t pt_va = 0;
+                if (leafLevel == KM_PM_TT_L1_LEVEL) {
+                    pt_va = va & ~KM_PM_L1_BLOCK_MASK;
+                } else if (leafLevel == KM_PM_TT_L2_LEVEL) {
+                    pt_va = va & ~KM_PM_L2_BLOCK_MASK;
+                } else {
+                    /* leafLevel 只可能是 1 或 2（3 已被上面排除）；真出现别的值说明
+                       vtophys_lvl 的级号语义被改坏了，宁可停下。 */
+                    kpm_append(t, "  ✗ 断点级号 %llu 不在 L1/L2 之内 —— 中止\n",
+                               (unsigned long long)leafLevel);
+                    return KM_PM_EXPAND_WALK_FAILED;
+                }
+                leafLevel++;
+
+                if (guard > 1) {
+                    kpm_append(t, "  （第 %d 轮：再补一级）\n", guard);
+                }
+                const uint64_t newTable = kpm_pmap_alloc_page_table(ctx, t, pt_va);
+                if (newTable == 0) {
+                    kpm_append(t, "  ✗ 分配页表页失败（pt_va=%#llx）—— 中止\n",
+                               (unsigned long long)pt_va);
+                    return KM_PM_EXPAND_ALLOC_FAILED;
+                }
+                kpm_append(t, "  新页表页 PA=%#llx（关联到 pt_va=%#llx）\n",
+                           (unsigned long long)newTable, (unsigned long long)pt_va);
+
+                /* util.c:327 —— ARM_TTE_VALID | ARM_TTE_TYPE_TABLE = 0x3 */
+                if (!kpm_write_u64_phys(t, pte, newTable | KM_PM_TTE_VALID | KM_PM_TTE_TYPE_TABLE,
+                                        "把它挂进上一级表项")) {
+                    return KM_PM_EXPAND_LINK_FAILED;
+                }
+            }
+        } while (leafLevel < KM_PM_TT_L3_LEVEL);
+    }
+    return KM_PM_EXPAND_OK;
+}
+
+#pragma mark - 对外：预检
+
+km_physmap_status km_physmap_precheck(void)
+{
+    static char buffer[KM_PM_TEXT_SIZE];
+    memset(buffer, 0, sizeof(buffer));
+    km_pm_text t = { buffer, sizeof(buffer), 0, false };
+
+    kpm_append(&t, "[建表] 预检未完成\n");
+
+    km_physmap_status status = KM_PM_NOT_READY;
+    NSString *summary = nil;
+
+    km_pm_ctx ctx;
+    const km_physmap_status load = kpm_load(&ctx, &t);
+    if (load != KM_PM_READY) {
+        status = load;
+        switch (load) {
+        case KM_PM_NOT_READY: summary = @"[建表] 前置不成立（见列表）"; break;
+        case KM_PM_KEYS_MISSING: summary = @"[建表] 有必需的 XPF 键取不到"; break;
+        case KM_PM_PMAP_UNRESOLVED: summary = @"[建表] pmap 链路取不到"; break;
+        default: summary = @"[建表] 预检未通过（见列表）"; break;
+        }
+        goto done;
+    }
+
+    kpm_probe_window(&ctx, &t);
+    kpm_report_accounting(&ctx, &t);
+    kpm_verify_pmap_layout(&ctx, &t); /* 只写诊断，不阻断预检结论 */
+
+    if (ctx.windowHasL3) {
+        /*
+         * "有 L3 表项"与"已经写好自映射"是两件事，面板上要分开说：
+         * 前者说明这一步已经动过，后者才说明**可以跳过建表**。
+         * 预检多做一次只读遍历就能分辨，比让人去点一次写按钮便宜得多。
+         */
+        uint64_t tablePa = 0;
+        status = KM_PM_TABLE_ALREADY;
+        if (kpm_window_is_selfmapped(&ctx, &tablePa)) {
+            summary = @"[建表] 窗口上已经是自映射（建表与自映射都已完成）";
+        } else {
+            summary = @"[建表] 窗口上已有 L3 表项，但还不是自映射项（见列表）";
+        }
+    } else if (ctx.windowWalkErr == KM_PM_E_NONE && ctx.windowLeafLevel < KM_PM_TT_L3_LEVEL &&
+               ctx.windowWalkPa != 0) {
+        status = KM_PM_BLOCK_MAPPING;
+        summary = @"[建表] 窗口落在已有的大页里（没有独立 L3 表项）";
+    } else if (ctx.windowWalkErr == KM_PM_E_INVALID) {
+        status = KM_PM_READY;
+        summary = @"[建表] ✓ 前置齐备且窗口上没有页表 —— 可以执行建表";
+        kpm_append(&t, "== ⑩ 结论 ==\n");
+        kpm_append(&t, "✓ 可以执行：km_physmap_build() 会在 %#llx 上建表 → 写自映射。\n",
+                   (unsigned long long)ctx.window);
+    } else {
+        status = KM_PM_PMAP_UNRESOLVED;
+        summary = @"[建表] 窗口下钻状态异常（见列表）";
+    }
+
+done:
+    if (t.truncated && (status == KM_PM_NOT_READY || status == KM_PM_PMAP_UNRESOLVED ||
+                        status == KM_PM_KEYS_MISSING)) {
+        status = KM_PM_TRUNCATED;
+    }
+    if (summary != nil) {
+        const char *s = summary.UTF8String;
+        const size_t len = strlen(s);
+        if (len + 1 <= sizeof(buffer)) {
+            memcpy(buffer, s, len);
+            buffer[len] = '\n';
+            for (size_t i = len + 1; i < 44 && i < sizeof(buffer) - 1 && buffer[i] != '\n'; i++) {
+                buffer[i] = ' ';
+            }
+        }
+    }
+    kpm_store_text(buffer);
+    /*
+     * 只在真的算出了窗口地址时才更新它。`kpm_load` 提前返回时 `ctx` 已被 memset
+     * 成 0（窗口那一项还没算），无条件赋值会把"最近一次算出的窗口地址"抹成 0 ——
+     * 于是 km_physmap_window_address() 会回落去重算，与它自己"优先回最近一次
+     * 算出的那一个"的承诺相反。这是复查时发现的，不是设备上撞出来的。
+     */
+    if (ctx.window != 0) {
+        g_physmapWindow = ctx.window;
+    }
+    return status;
+}
+
+#pragma mark - 对外：执行
+
+km_physmap_build_status km_physmap_build(void)
+{
+    static char buffer[KM_PM_TEXT_SIZE];
+    memset(buffer, 0, sizeof(buffer));
+    km_pm_text t = { buffer, sizeof(buffer), 0, false };
+
+    kpm_append(&t, "[建表] 执行未完成\n");
+
+    km_physmap_build_status status = KM_PM_BUILD_NOT_READY;
+    NSString *summary = nil;
+
+    km_pm_ctx ctx;
+    const km_physmap_status load = kpm_load(&ctx, &t);
+    if (load != KM_PM_READY) {
+        status = KM_PM_BUILD_NOT_READY;
+        summary = (load == KM_PM_KEYS_MISSING)
+                      ? @"[建表] 未执行：有必需的 XPF 键取不到"
+                      : (load == KM_PM_PMAP_UNRESOLVED ? @"[建表] 未执行：pmap 链路取不到"
+                                                       : @"[建表] 未执行：前置不成立");
+        goto done;
+    }
+
+    kpm_probe_window(&ctx, &t);
+    if (ctx.windowWalkErr == KM_PM_E_NONE && ctx.windowLeafLevel < KM_PM_TT_L3_LEVEL &&
+        ctx.windowWalkPa != 0) {
+        kpm_append(&t, "== 结论（未进入建表，本次未写任何内存）==\n");
+        kpm_append(&t, "✗ 窗口地址落在已有的大页里：没有独立的 L3 表项可写，本模块的算法不适用。\n");
+        status = KM_PM_BUILD_EXPAND_FAILED;
+        summary = @"[建表] 未执行：窗口落在已有大页里";
+        goto done;
+    }
+
+    if (ctx.windowHasL3) {
+        uint64_t tablePa = 0;
+        const bool selfmapped = kpm_window_is_selfmapped(&ctx, &tablePa);
+        if (selfmapped) {
+            g_physmapMagicPT = tablePa;
+            kpm_append(&t, "== 结论（幂等命中，本次未写任何内存）==\n");
+            kpm_append(&t, "✓ 窗口 %#llx 上**已经是自映射**：L3 第 0 项 = %#llx = 表页 PA %#llx | 叶模板。\n",
+                       (unsigned long long)ctx.window, (unsigned long long)ctx.windowLeafEntry,
+                       (unsigned long long)tablePa);
+            kpm_append(&t, "  ⇒ 本次**没有写任何内核内存**（建表与自映射都已生效，重写没有收益只有风险）。\n");
+            status = KM_PM_BUILD_ALREADY;
+            summary = @"[建表] 已经建过且自映射已生效（本次未写任何内存）";
+            goto done;
+        }
+        if (tablePa != 0) {
+            kpm_append(&t, "  注：窗口上已有 L3 表项（%#llx）但它**不是**指向表页自己的自映射项"
+                           "（表页 PA=%#llx）—— 按未建完处理，继续走下面的建表流程。\n",
+                       (unsigned long long)ctx.windowLeafEntry, (unsigned long long)tablePa);
+        }
+    }
+
+    /* ── 建表（util.c:303-335）── */
+    kpm_append(&t, "== ⑩ 建表（pmap_expand_range 的无 kcall 支）==\n");
+    const km_pm_expand_result expand =
+        kpm_pmap_expand_range(&ctx, &t, ctx.window, KM_PM_16K_L2_BLOCK_SIZE);
+    if (expand != KM_PM_EXPAND_OK) {
+        kpm_append(&t, "✗ 建表失败（结果 %d）—— **停止**，自映射不执行。\n", (int)expand);
+        status = KM_PM_BUILD_EXPAND_FAILED;
+        summary = @"[建表] ✗ 建表失败（见列表）";
+        goto done;
+    }
+
+    /*
+     * 取 magicPT（physrw_pte.c:129-130）：LEAF_LEVEL 传 L2，
+     * 于是返回的是 L2 表项指向的**那张 L3 表的 PA**（不是叶的值）。
+     */
+    uint64_t magicLevel = KM_PM_TT_L2_LEVEL;
+    uint64_t magicLeafAddr = 0;
+    km_pm_vt_err err = KM_PM_E_NONE;
+    const uint64_t magicPT =
+        kpm_vtophys_lvl(&ctx, ctx.ttep, ctx.window, &magicLevel, &magicLeafAddr, &err);
+    kpm_append(&t, "  建表后取表：vtophys_lvl(ttep, 窗口, 只到 L2) = %#llx（状态 %d，L2 表项 PA=%#llx）\n",
+               (unsigned long long)magicPT, (int)err, (unsigned long long)magicLeafAddr);
+    if (magicPT == 0 || err != KM_PM_E_NONE) {
+        kpm_append(&t, "✗ 建表之后仍然取不到那张 L3 表 —— **停止**，不写自映射。\n");
+        status = KM_PM_BUILD_EXPAND_FAILED;
+        summary = @"[建表] ✗ 建表后取表失败（见列表）";
+        goto done;
+    }
+
+    /* ── 自映射（physrw_pte.c:132）── */
+    kpm_append(&t, "== ⑪ 自映射（physrw_pte.c:132）==\n");
+    kpm_append(&t, "  表页 PA=%#llx；窗口 %#llx 的 L3 表项 = 该表的第 0 项（L3 索引 0 已在 ③ 核对）\n",
+               (unsigned long long)magicPT, (unsigned long long)ctx.window);
+    kpm_append(&t, "  写入值 = 表页 PA | 叶模板 %#llx（PERM_TO_PTE(0x7)|NG|OSH|L3ENTRY）\n",
+               (unsigned long long)KM_PM_PTE_LEAF);
+    if (!kpm_write_u64_phys(&t, magicPT, magicPT | KM_PM_PTE_LEAF, "自映射")) {
+        kpm_append(&t, "✗ 自映射写失败或回读不符 —— **停止**。\n");
+        status = KM_PM_BUILD_SELFMAP_FAILED;
+        summary = @"[建表] ✗ 自映射失败（见列表）";
+        goto done;
+    }
+    g_physmapMagicPT = magicPT;
+
+    /*
+     * 自映射之后的独立复核：从**窗口那条路**再走一遍，看看窗口地址现在能不能翻出
+     * 表页自己。这一步纯粹是证据 —— 如果 ⑪ 的回读已通过，这一步必然通过；
+     * 不通过说明前面的判据之间有矛盾，那比写失败更值得看。
+     */
+    uint64_t verifyLevel = KM_PM_TT_L3_LEVEL;
+    uint64_t verifyAddr = 0;
+    err = KM_PM_E_NONE;
+    const uint64_t verifyPa =
+        kpm_vtophys_lvl(&ctx, ctx.ttep, ctx.window, &verifyLevel, &verifyAddr, &err);
+    kpm_append(&t, "  [复核] 再走一遍窗口：级号 %llu · 表项 PA=%#llx · 翻出的 PA=%#llx · 状态 %d\n",
+               (unsigned long long)verifyLevel, (unsigned long long)verifyAddr,
+               (unsigned long long)verifyPa, (int)err);
+    if (verifyPa == magicPT) {
+        kpm_append(&t, "  ✓ 复核通过：窗口地址现在指向表页自己（自映射已生效）。\n");
+    } else {
+        kpm_append(&t, "  ✗ 复核不符：期望 %#llx，得到 %#llx —— 停下并如实报告。\n",
+                   (unsigned long long)magicPT, (unsigned long long)verifyPa);
+        status = KM_PM_BUILD_SELFMAP_FAILED;
+        summary = @"[建表] ✗ 自映射复核不符（见列表）";
+        goto done;
+    }
+
+    /* ── sw_asid 那一步（physrw_pte.c:134-140）── */
+    kpm_append(&t, "== ⑫ sw_asid 页映射（physrw_pte.c:134-140）==\n");
+    if (!kpm_verify_pmap_layout(&ctx, &t)) {
+        status = KM_PM_BUILD_SWASID_SKIPPED;
+        summary = @"[建表] ✓ 建表+自映射完成；sw_asid 一步前置佐证不过，已跳过";
+        goto done;
+    }
+
+    const uint64_t swAsidKva = ctx.pmap + ctx.swAsidOff;
+    const uint64_t swAsidPage = swAsidKva & ~(ctx.pageSize - 1);
+    const uint64_t swAsidPageOff = swAsidKva & (ctx.pageSize - 1);
+    kpm_append(&t, "  pmap->sw_asid 的内核地址 = %#llx（pmap %#llx + %#llx）\n",
+               (unsigned long long)swAsidKva, (unsigned long long)ctx.pmap,
+               (unsigned long long)ctx.swAsidOff);
+
+    err = KM_PM_E_NONE;
+    const uint64_t swAsidPagePa = kpm_kvtophys(&ctx, swAsidPage, &err);
+    kpm_append(&t, "  所在页 %#llx → 内核页表遍历（cpu_ttep=%#llx）= %#llx（状态 %d）\n",
+               (unsigned long long)swAsidPage, (unsigned long long)ctx.cpuTtep,
+               (unsigned long long)swAsidPagePa, (int)err);
+    if (swAsidPagePa == 0 || err != KM_PM_E_NONE) {
+        kpm_append(&t, "✗ 那一页的物理地址算不出来 —— **跳过**（不猜一个 PA 写进去）。\n");
+        status = KM_PM_BUILD_SWASID_SKIPPED;
+        summary = @"[建表] ✓ 建表+自映射完成；sw_asid 页 PA 算不出，已跳过";
+        goto done;
+    }
+    if (swAsidPagePa >= (1ULL << 48)) {
+        kpm_append(&t, "✗ 算出的 PA %#llx ≥ 2^48 —— 不是物理地址，跳过。\n",
+                   (unsigned long long)swAsidPagePa);
+        status = KM_PM_BUILD_SWASID_SKIPPED;
+        summary = @"[建表] ✓ 建表+自映射完成；sw_asid 页 PA 不在物理域，已跳过";
+        goto done;
+    }
+
+    /*
+     * 交叉核对（**只作证据，不作判据**）：那一页若落在内核线性映射段，
+     * km_phystokv 会把它换回同一个内核地址。成立时这是很强的正向证据；
+     * 不成立**不代表 PA 错** —— 内核堆对象未必在线性映射段，
+     * 所以这一条不能拿来否决上面的结果。头文件「没能确证的部分」写明了这一点。
+     */
+    const uint64_t backKva = km_phystokv(swAsidPagePa);
+    kpm_append(&t, "  [交叉核对] km_phystokv(%#llx) = %#llx%s\n",
+               (unsigned long long)swAsidPagePa, (unsigned long long)backKva,
+               (backKva == swAsidPage)
+                   ? "  ⇒ 与遍历结果一致（强证据）"
+                   : "  ⇒ 不一致：只说明该页不在线性映射段，不作判据");
+
+    const uint64_t slotValue = swAsidPagePa | KM_PM_PTE_LEAF;
+    kpm_append(&t, "  写入 magicPT+8 = %#llx（值 %#llx；窗口 +%#llx → %#llx 指向该页的 %#llx 偏移）\n",
+               (unsigned long long)(magicPT + 8), (unsigned long long)slotValue,
+               (unsigned long long)ctx.pageSize,
+               (unsigned long long)(ctx.window + ctx.pageSize),
+               (unsigned long long)swAsidPageOff);
+    if (!kpm_write_u64_phys(&t, magicPT + 8, slotValue, "sw_asid 页映射")) {
+        kpm_append(&t, "✗ sw_asid 页映射写失败或回读不符 —— **停止**。\n");
+        status = KM_PM_BUILD_SWASID_FAILED;
+        summary = @"[建表] ✗ sw_asid 页映射失败（见列表）";
+        goto done;
+    }
+
+    status = KM_PM_BUILD_OK;
+    summary = @"[建表] ✓✓ 建表 + 自映射 + sw_asid 映射全部完成";
+    kpm_append(&t, "== ⑬ 结论 ==\n");
+    kpm_append(&t, "✓ 全部完成：magicPT=%#llx，窗口 %#llx 现在指向表页自己。\n",
+               (unsigned long long)magicPT, (unsigned long long)ctx.window);
+    kpm_append(&t, "  复查办法：再点一次「建窗」（KernelPhysWindow 的只读探针），\n");
+    kpm_append(&t, "  它应当在窗口地址上看到 L3 有效叶；两个模块的结论必须对得上。\n");
+
+done:
+    /*
+     * 截断只降级"没得出判据"的那一类结论（NOT_READY），不覆盖已经算出来的失败态。
+     *
+     * 与 precheck 那边**刻意不对称**：precheck 会把 NOT_READY / PMAP_UNRESOLVED /
+     * KEYS_MISSING 三种都降级成 TRUNCATED，因为那三种都是"还没走到判据"；
+     * 而 build 这边一旦走到 EXPAND_FAILED / SELFMAP_FAILED / SWASID_FAILED，
+     * 说明**写路径已经动过内核内存**，那条结论比文本完整性重要得多 ——
+     * 把它换成"诊断被截断"会让 YG 以为什么都没发生。失败态一律保留原值。
+     */
+    if (t.truncated && (status == KM_PM_BUILD_NOT_READY)) {
+        status = KM_PM_BUILD_TRUNCATED;
+    }
+    if (summary != nil) {
+        const char *s = summary.UTF8String;
+        const size_t len = strlen(s);
+        if (len + 1 <= sizeof(buffer)) {
+            memcpy(buffer, s, len);
+            buffer[len] = '\n';
+            for (size_t i = len + 1; i < 46 && i < sizeof(buffer) - 1 && buffer[i] != '\n'; i++) {
+                buffer[i] = ' ';
+            }
+        }
+    }
+    kpm_store_text(buffer);
+    /*
+     * 只在真的算出了窗口地址时才更新它。`kpm_load` 提前返回时 `ctx` 已被 memset
+     * 成 0（窗口那一项还没算），无条件赋值会把"最近一次算出的窗口地址"抹成 0 ——
+     * 于是 km_physmap_window_address() 会回落去重算，与它自己"优先回最近一次
+     * 算出的那一个"的承诺相反。这是复查时发现的，不是设备上撞出来的。
+     */
+    if (ctx.window != 0) {
+        g_physmapWindow = ctx.window;
+    }
+    return status;
+}
+
+#pragma mark - 对外：访问器
+
+uint64_t km_physmap_window_address(void)
+{
+    /*
+     * 优先回最近一次预检/执行算出的那一个：面板显示时那次调用刚跑完，
+     * 再调 km_physwindow_address() 会走一遍 sysctl 与进程级状态，
+     * 多出一条与本次结论**并列**的计算路径（KernelPhysWindow.h 里
+     * `km_physwindow_last_address()` 的说明就是这条口径）。
+     * 还没跑过时（0）才回落到重算 —— 那一次调用不会与任何结论并列。
+     */
+    if (g_physmapWindow != 0) {
+        return g_physmapWindow;
+    }
+    return km_physwindow_address();
+}
+
+uint64_t km_physmap_magic_pt(void)
+{
+    return g_physmapMagicPT;
+}
+
+NSString *km_physmap_diagnostic(void)
+{
+    if (g_physmapText != nil) {
+        return g_physmapText;
+    }
+    /*
+     * 跑过、但文本没转成字符串：这两句话必须分开。
+     * 合成一句"还没跑过"是**误导** —— 用户会因为那句话去重点一次按钮，
+     * 而那一次会重新跑一遍整条几十秒的链路；真实情况是上次已经跑过、
+     * 结论值（status 与 km_physmap_magic_pt()）都在，只是文本没落地。
+     */
+    if (g_physmapRan) {
+        return @"== 建表诊断 ==\n上一次跑过了，但诊断文本没能转成字符串（缓冲区不是合法 UTF-8）。\n"
+                "结论值仍然有效，见 status 与 km_physmap_magic_pt()。\n";
+    }
+    return @"== 建表诊断 ==\n还没跑过：先点「建表预检」（只读），再点「建表」（写）。\n"
+            "顺序见 KernelPhysMap.h 的「面板调用顺序」。\n";
+}

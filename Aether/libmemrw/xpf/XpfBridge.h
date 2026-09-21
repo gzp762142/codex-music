@@ -61,6 +61,81 @@ uint64_t km_xpf_resolve_symbol(NSString *name);
 /// 本函数只读内存里的解析结果，**不碰内核**。
 uint64_t km_xpf_kernel_base(void);
 
+#pragma mark - 「建页表窗口」那条路要的键（KernelPhysMap 用）
+
+/*
+ * 为什么要有这一段，而不让调用方直接调 km_xpf_resolve_symbol()：
+ *
+ * ① 语义分流。XPF 的 item 表里两类键的**返回值含义完全不同**，混用一次就是把
+ *    一个地址当常量、或把一个常量的位模式当地址去 kread（后者直接彩屏）：
+ *      · `kernelSymbol.*`     —— finder 解析出的是**链接期 vmaddr**
+ *        （xpf.c:697 的 xpf_item_resolve 只是调 finder，不加 slide；
+ *         PatchFinder_arm64.c:52-75 的 resolve_adrp_..._reference 返回
+ *        section 的链接期地址）。要用它必须自己 + slide。
+ *      · `kernelConstant.*`   —— finder 直接算出一个**数值**（例如
+ *        common.c:113-127 的 ARM_TT_L1_INDEX_MASK 就是按 T1SZ_BOOT 选出的
+ *        掩码本身），**不能**再加 slide、也不能当地址解引用。
+ *    这条区分在 KernelSlide.m:1073 已经用掉过一次（`symbol + slide`），
+ *    但那处是调用方自己记得；这里把它变成类型上的区分。
+ *
+ * ② 三种"没有值"必须分开。`xpf_item_resolve` 对「键没注册」与「finder 失败」
+ *    一律返回 0（xpf.c:710），而这两者的处置完全不同：前者是"这份 XPF 快照
+ *    不含这个键"，后者是"含，但这次没找到"。所以取值结果带 registered 标志。
+ *
+ * ③ 一次取齐。8 个键分 8 次调用会被人误会成"8 个独立步骤"，而实际上它们是
+ *    建表这一个动作的**同一组输入**；一次取齐也让诊断能把它们并列显示。
+ */
+typedef struct {
+    /// 键在 XPF 的 item 链表里注册过（xpf_item_register 走过一次）。
+    bool registered;
+    /// finder 返回了非 0 值。
+    ///
+    /// **注意时效**：XPF 会把 finder 的返回值（包括 0）连同 cached 标志一起写在
+    /// 节点上（xpf.c:702-705），只有 xpf_stop()（即 km_xpf_deinit()）才清链表。
+    /// 所以 `fetched == false` 的含义不是"这一次没找到"，而是
+    /// "**本进程内该键的 finder 至今返回 0**" —— 同一个进程里重试不会改变它。
+    bool fetched;
+    /// 取到的值。仅 fetched 为 true 时有意义。
+    uint64_t value;
+} km_xpf_item_result;
+
+/// 「建页表窗口」这条路一次要用到的全部 XPF 键。
+/// 字段名即键名（下划线换点），注释标出返回值是哪一类。
+typedef struct {
+    km_xpf_item_result pv_head_table;        /* kernelSymbol.pv_head_table   → 链接期地址 */
+    km_xpf_item_result vm_first_phys;        /* kernelSymbol.vm_first_phys   → 链接期地址 */
+    km_xpf_item_result vm_last_phys;         /* kernelSymbol.vm_last_phys    → 链接期地址 */
+    km_xpf_item_result cpu_ttep;             /* kernelSymbol.cpu_ttep        → 链接期地址 */
+    km_xpf_item_result pt_index_max;         /* kernelConstant.PT_INDEX_MAX  → 数值 */
+    km_xpf_item_result kernel_el;            /* kernelConstant.kernel_el     → 数值 */
+    km_xpf_item_result arm_tt_l1_index_mask; /* kernelConstant.ARM_TT_L1_INDEX_MASK → 数值 */
+    km_xpf_item_result t1sz_boot;            /* kernelConstant.T1SZ_BOOT     → 数值 */
+} km_xpf_physmap_keys;
+
+/// 一次取齐上面那 8 个键（同一个临界区内完成，避免中途 deinit 让结果自相矛盾）。
+///
+/// 返回 false 只有两种含义：out 为 NULL，或 **XPF 未初始化**（此前置不成立）。
+/// **不含**"某个键取不到" —— 那要看逐键的 registered / fetched（两者要分开报告，
+/// 因为"键没注册"与"finder 没解析出来"要求的动作完全不同）。
+///
+/// 失败时 `*out` 会被清零（入口先 memset），所以即使调用方忘了初始化自己的结构体，
+/// 也不会把栈垃圾读成"某个键取到了值"。
+bool km_xpf_physmap_keys_fetch(km_xpf_physmap_keys *out);
+
+/*
+ * 刻意**不导出**「只取一个键」的公开版本：上面的 fetch 已经一次取齐全部 8 个
+ * （同一个临界区），另开一个单键入口会是一条谁都不走的路 —— 工程里不要
+ * "看起来能跑的空壳"。逐键形状的取值由 fetch 内部的 item_get_locked 承担。
+ */
+
+/// 一个键的键名（给诊断文本用）。返回**静态 C 字符串**，永不返回 NULL
+/// （下标越界时返回 ""）。
+///
+/// 为什么返回 const char * 而不是 NSString *：它只用来填 `%s`。返回 NSString
+/// 会在每个无 autorelease pool 的调用线程上漏一个对象（KernelSlide.m:622-626
+/// 记着这条），而这里一毛钱好处都换不来。
+const char *km_xpf_physmap_key_name(int index);
+
 /// 最近一次失败/异常的可读说明（可能多行）；没有失败时返回 nil。
 /// 初始化失败时，内容形如：
 ///     /System/Library/.../kernelcache: open failed (errno 2 (No such file or directory))

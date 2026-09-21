@@ -21,6 +21,7 @@
 
 #include <limits.h>
 #include <pthread.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -208,6 +209,131 @@ uint64_t km_xpf_kernel_base(void)
 
     pthread_mutex_unlock(&g_xpfLock);
     return base;
+}
+
+#pragma mark - 「建页表窗口」那条路的键（KernelPhysMap 用）
+
+/*
+ * 键名表。**顺序必须与 XpfBridge.h 的 km_xpf_physmap_keys 字段顺序逐个对齐** ——
+ * km_xpf_physmap_key_name 按下标取名字，取错名字会让诊断把 A 键的结果挂在 B 键
+ * 的标题下，而那种错在屏幕上看起来完全正常（这正是最该防的一类）。
+ */
+static const char *const kPhysmapKeyNames[] = {
+    "kernelSymbol.pv_head_table",
+    "kernelSymbol.vm_first_phys",
+    "kernelSymbol.vm_last_phys",
+    "kernelSymbol.cpu_ttep",
+    "kernelConstant.PT_INDEX_MAX",
+    "kernelConstant.kernel_el",
+    "kernelConstant.ARM_TT_L1_INDEX_MASK",
+    "kernelConstant.T1SZ_BOOT",
+};
+#define KM_XPF_PHYSMAP_KEY_COUNT 8
+
+_Static_assert(sizeof(kPhysmapKeyNames) / sizeof(kPhysmapKeyNames[0]) == KM_XPF_PHYSMAP_KEY_COUNT,
+               "key name table size must match km_xpf_physmap_keys");
+
+/*
+ * 「名字表下标 ↔ 结构体字段」的**机器检查**。
+ *
+ * 上面那句 _Static_assert 只钉了名字表自己的条数，**钉不住结构体**：
+ * km_xpf_physmap_keys 的 8 个字段类型完全相同（都是 km_xpf_item_result），
+ * 所以 `out->cpu_ttep = results[3]` 这种赋值在字段被改名或换序之后**照样编译**，
+ * 只是把 A 键的结果静默地放进 B 字段 —— 而那种错在屏幕上看起来完全正常，
+ * 正是本项目最忌的一类（KernelSlide.m:1090-1098 记着"观测格式害人抄错"的账）。
+ *
+ * offsetof 是唯一能钉住顺序的东西：字段换序 → 偏移变 → 这两句立刻编译失败。
+ * 钉三个不均匀分布的下标（0 与 7 由 sizeof 那句间接覆盖）。
+ */
+_Static_assert(offsetof(km_xpf_physmap_keys, cpu_ttep) == 3 * sizeof(km_xpf_item_result),
+               "field order drift: cpu_ttep must stay at slot 3");
+_Static_assert(offsetof(km_xpf_physmap_keys, pt_index_max) == 4 * sizeof(km_xpf_item_result),
+               "field order drift: pt_index_max must stay at slot 4");
+_Static_assert(offsetof(km_xpf_physmap_keys, t1sz_boot) == 7 * sizeof(km_xpf_item_result),
+               "field order drift: t1sz_boot must stay at slot 7");
+_Static_assert(sizeof(km_xpf_physmap_keys) == 8 * sizeof(km_xpf_item_result),
+               "field count drift: km_xpf_physmap_keys must hold exactly 8 results");
+
+const char *km_xpf_physmap_key_name(int index)
+{
+    if (index < 0 || index >= KM_XPF_PHYSMAP_KEY_COUNT) return "";
+    return kPhysmapKeyNames[index];
+}
+
+/// 锁内实现。调用者必须已持有 g_xpfLock。
+static km_xpf_item_result item_get_locked(const char *name)
+{
+    km_xpf_item_result r = { false, false, 0 };
+
+    /*
+     * 「有没有注册」只能靠遍历链表回答：xpf_item_resolve 对未注册的键与
+     * finder 返回 0 的键**都**返回 0（xpf.c:697-711 的循环走完就 return 0），
+     * 两者在下游的处置完全不同：前者说明这份 XPF 快照不含这个键，后者说明含、
+     * 但 finder 没解析出来。
+     *
+     * 注意 fetched=false 的**时效**：xpf.c:702-705 会把 finder 的返回值（**包括 0**）
+     * 连同 `cached = true` 一起写在节点上，只有 xpf_stop()（即 km_xpf_deinit()）
+     * 才清链表。所以它不是"这一次没找到"，而是"**本进程内该键的 finder 至今
+     * 返回 0**"—— 重试同一个进程不会改变这个结果（见 KernelSlide.h 里
+     * km_phystokv_ensure 对"可重来"那条承诺的限定）。
+     *
+     * 链表布局来自 xpf.h:10-17 的 XPFItem（nextItem / name / finder / ctx /
+     * cached / cache），头在 gXPF.firstItem（xpf.h:101）。
+     */
+    for (const XPFItem *item = gXPF.firstItem; item != NULL; item = item->nextItem) {
+        if (item->name == NULL) continue;
+        if (strcmp(item->name, name) == 0) {
+            r.registered = true;
+            break;
+        }
+    }
+    if (!r.registered) return r;
+
+    const uint64_t value = xpf_item_resolve(name);
+    r.value = value;
+    r.fetched = (value != 0);
+    return r;
+}
+
+bool km_xpf_physmap_keys_fetch(km_xpf_physmap_keys *out)
+{
+    if (out == NULL) return false;
+    /* 入口先清零：失败路径不写 *out，调用方若忘了初始化就会读到自己的栈垃圾 ——
+       那会被误读成"取到了某个键，值是垃圾"。 */
+    memset(out, 0, sizeof(*out));
+
+    km_xpf_item_result results[KM_XPF_PHYSMAP_KEY_COUNT] = {};
+    bool anyTaken = false;
+
+    pthread_mutex_lock(&g_xpfLock);
+    if (g_xpfState.ready) {
+        anyTaken = true;
+        for (int i = 0; i < KM_XPF_PHYSMAP_KEY_COUNT; i++) {
+            results[i] = item_get_locked(kPhysmapKeyNames[i]);
+        }
+    }
+    pthread_mutex_unlock(&g_xpfLock);
+
+    /*
+     * false 只有两种含义：out 为 NULL，或 XPF 未初始化。**不含**"某个键取不到" ——
+     * 那要看逐键的 registered / fetched（两者要分开报告，理由见 km_xpf_item_result）。
+     */
+    if (!anyTaken) return false;
+
+    /*
+     * 按位置逐个搬运而不是 memcpy：memcpy 会在字段换序/改名时静静地跟着错。
+     * 逐个赋值同样挡不住（八个字段类型相同），所以顺序由上面那组 offsetof
+     * 静态断言来钉。
+     */
+    out->pv_head_table = results[0];
+    out->vm_first_phys = results[1];
+    out->vm_last_phys = results[2];
+    out->cpu_ttep = results[3];
+    out->pt_index_max = results[4];
+    out->kernel_el = results[5];
+    out->arm_tt_l1_index_mask = results[6];
+    out->t1sz_boot = results[7];
+    return true;
 }
 
 NSString *km_xpf_last_error(void)

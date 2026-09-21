@@ -101,10 +101,24 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     ///
     /// 与「窗口」按钮的区别要说清：那个建的是**用户态**的本地虚拟地址窗口
     /// （vm_remap，见 MemoryProbe），本按钮碰的是**内核页表**。名字相近、层次不同。
-    /// 与「Slide」的依赖关系是硬的：页表项里存的是 PA，下钻要 KVA，
-    /// 而那个换算只有 KernelSlide 提供 —— 所以本按钮得在 Slide 就绪之后才有结论，
-    /// 没就绪时会明确报「先跑 Slide」而不是猜一个地址。
+    ///
+    /// 页表项里存的是 PA，下钻要 KVA，所以它需要 PA→KVA 换算表。本按钮在探测前
+    /// 先调 `km_phystokv_ensure()` 按需建立那张表（首次几十秒解析 kernelcache），
+    /// 于是**不必先点「Slide」** —— 换算表与 slide 是数据依赖、分不开，但那件事
+    /// 由 ensure 收进入口，面板侧不该再要求用户按某个顺序点按钮。
     private let btnPhysWindow = UIButton(type: .system)
+    /// 表预检：`KernelPhysMap` 的**只读**预检。它问的与「建窗」不是同一个问题 ——
+    /// 「建窗」问"那里现在有没有页表"，本按钮问"能不能在那里把表建出来"：
+    /// 它把建表要用的每一个输入先读出来核对（pmap 链路、ttep、窗口地址上的
+    /// `vtophys_lvl` 结果、XPF 的五个键、`pmap->sw_asid` 的三条佐证）。**不发写**。
+    private let btnPhysMapPre = UIButton(type: .system)
+    /// 建表：**写内核内存**的那一步（建页表 → 写自映射 → sw_asid 可跳过）。
+    ///
+    /// 这是全工程唯一会写内核页表的按钮，而写错一个地址的代价是**整机 panic 重启**
+    /// （不是 App 崩，见 docs/Slide彩屏取证.md 那次的第一手取证）。所以它与只读的
+    /// 「表预检」是两个按钮、两套状态枚举 —— 分工写在 KernelPhysMap.h 开头。
+    /// 幂等：已经建过时它一个字节都不写（判据是逐项核对 L3 第 0 项是否指向表页自己）。
+    private let btnPhysMapBuild = UIButton(type: .system)
 
     /// 面板上的按钮与其 action。**唯一数据源**：init 按它接线，layoutSubviews 按它排版。
     /// 原先这两处各写一份列表，加一个按钮就得改两个地方、还必须顺序一致 —— 迟早会错位。
@@ -130,7 +144,9 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         (btnTracker, "自动", #selector(onTracker)),
         (btnXpf, "XPF", #selector(onXpfProbe)),
         (btnSlide, "Slide", #selector(onSlideProbe)),
-        (btnPhysWindow, "建窗", #selector(onPhysWindowProbe))
+        (btnPhysWindow, "建窗", #selector(onPhysWindowProbe)),
+        (btnPhysMapPre, "表预检", #selector(onPhysMapPre)),
+        (btnPhysMapBuild, "建表", #selector(onPhysMapBuild))
     ]
 
     private let accent = UIColor.hex(0x185EE0)
@@ -379,6 +395,13 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
          */
         var rows = out.map { "［内核］ " + $0 }
         rows.append("［窗口］ " + MemoryProbe.windowLine)
+        /*
+         * 表预检与建表两行也常驻，理由与上面那行"窗口"完全相同：
+         * 建表是这个项目的关键动作，它的结论 —— 尤其是"这次到底写了没有" ——
+         * 最该一直挂在面板上被人看见；而 extraRows 每点一次别的按钮就会被整份覆盖。
+         */
+        rows.append(DebugProcView.physMapPreNote)
+        rows.append(DebugProcView.physMapBuildNote)
         return rows
     }
 
@@ -409,6 +432,21 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     /// 一个只为取状态枚举的重复调用，不值得把串行纪律破掉。
     /// 由 physWindowReport() 在后台线程写、主线程读 —— 与 xpfNote/slideNote 同一套。
     private static var physWindowLastStatus: km_physwindow_status = KM_PW_NOT_READY
+
+    /// 表预检 / 建表的常驻状态行。
+    ///
+    /// 与 xpfNote 同因（面板每次收放都会新建本视图），但语义上更接近 physWindowNote：
+    /// 这两个结论**会随执行而变**（预检说"没有页表"→ 建表 → 再预检就该说"已有"），
+    /// 所以这里只是显示快照，判断一律以 C 侧当次的返回值为准（C 侧也刻意不缓存结论）。
+    ///
+    /// 「建表」那一行的措辞要能回答"这次到底写了没有"—— 因为 `KM_PM_BUILD_ALREADY`
+    /// 是**成功且一个字节都没写**，把它显示成"又建了一次"会让人以为重复写是安全的。
+    private static var physMapPreNote = "［表预检］ 未跑（点「表预检」，只读）"
+    private static var physMapBuildNote = "［建表］ 未跑（点「建表」，**会写内核内存**）"
+
+    /// 上面两行的状态枚举快照，理由同 physWindowLastStatus（主线程不复算）。
+    private static var physMapLastStatus: km_physmap_status = KM_PM_NOT_READY
+    private static var physMapBuildLastStatus: km_physmap_build_status = KM_PM_BUILD_NOT_READY
 
     /// 内核就绪后自动刷一次面板 —— 自检是异步的，面板可能先于它建好。
     private var kernelWasReady = false
@@ -1225,6 +1263,144 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         lines.append("km_kernel_page_size() = 0x" + String(km_kernel_page_size(), radix: 16))
         lines.append("km_phystokv_ready() = " + (km_phystokv_ready() ? "true" : "false"))
         lines.append("km_physwindow_probe() status = " + String(status.rawValue))
+        return lines.joined(separator: "\n")
+    }
+
+    // MARK: - 建表（KernelPhysMap）：只读预检 + 写路径
+
+    /*
+     * 「建表」是本工程**唯一**会写内核内存的按钮，所以它的写法与只读按钮有两条硬差别：
+     *   1. 失败之后不能"再点一次就好" —— 面板必须能看出停在哪一步、已经写进去了什么。
+     *      C 侧的状态枚举把"前置不成立（一次写都没发）"与"写过了但某级不符"分开，
+     *      就是为了这两句话要求人做的事完全不同（见 KernelPhysMap.h）。
+     *   2. 两个调用都可能触发 XPF 初始化（解压解析几十 MB kernelcache，几十秒），
+     *      所以必须先切"计算中…"，否则用户看到的是面板卡住 —— 与「Slide」同一套。
+     */
+
+    private var physMapBusy = false
+    private var physMapStarted = Date.distantPast
+
+    @objc private func onPhysMapPre() { runPhysMap(precheck: true) }
+
+    @objc private func onPhysMapBuild() { runPhysMap(precheck: false) }
+
+    private func runPhysMap(precheck: Bool) {
+        if physMapBusy {
+            // 门槛按 Slide 的 120 秒放行：首次真的要解析 kernelcache，不是卡死
+            if Date().timeIntervalSince(physMapStarted) <= 120 {
+                showReport((precheck ? "表预检" : "建表")
+                           + ": 上一次调用还没回来（首次要解析 kernelcache，可能几十秒）")
+                return
+            }
+        }
+        physMapBusy = true
+        physMapStarted = Date()
+        probeLabel.text = precheck ? "表预检: 只读核对中…" : "建表: 执行中…（会写内核页表）"
+        probeLabel.textColor = idleText
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            // 必须与读取链串行：本调用会 kread/kwrite，而 libkfd 的后端不是线程安全的
+            let text = AutoTracker.shared.syncExternal {
+                precheck ? DebugProcView.physMapPreReport() : DebugProcView.physMapBuildReport()
+            }
+            DispatchQueue.main.async {
+                guard let s = self else { return }
+                s.physMapBusy = false
+                // showReport 会把 C 侧写好的摘要行放进 probeLabel —— 不要在这里覆盖它，
+                // 那句话里带着"停在哪一步"的具体原因，比面板自己拼的短语有用。
+                s.showReport(text)
+
+                /*
+                 * 常驻行从后台那次调用**抄下来**，主线程不重跑任何 C 接口。
+                 * 理由与 physWindowLastStatus 完全相同：那会在主线程、不经过
+                 * AutoTracker 串行队列的情况下 kread/kwrite。
+                 */
+                if precheck {
+                    DebugProcView.physMapPreNote = DebugProcView.physMapPreLine(DebugProcView.physMapLastStatus)
+                } else {
+                    DebugProcView.physMapBuildNote = DebugProcView.physMapBuildLine(DebugProcView.physMapBuildLastStatus)
+                }
+                s.table.reloadData()
+            }
+        }
+    }
+
+    /// 预检结论 → 一行文案。**只是翻译枚举**，不复算判据（判据全在 C 侧）。
+    private static func physMapPreLine(_ s: km_physmap_status) -> String {
+        switch s {
+        case KM_PM_READY: return "［表预检］ ✓ 输入齐备、窗口上还没有页表 —— 可以建"
+        case KM_PM_TABLE_ALREADY: return "［表预检］ 窗口上已有有效叶（自映射已生效，无需再建）"
+        case KM_PM_NOT_READY: return "［表预检］ 前置不成立（诊断见列表）"
+        case KM_PM_PMAP_UNRESOLVED: return "［表预检］ pmap 链路取不到（诊断见列表）"
+        case KM_PM_KEYS_MISSING: return "［表预检］ XPF 有键没取到（诊断里逐个列出）"
+        case KM_PM_BLOCK_MAPPING: return "［表预检］ 窗口落在大页里，本算法不适用"
+        case KM_PM_TRUNCATED: return "［表预检］ 诊断文本被截断（结论见列表）"
+        default: return "［表预检］ 未完成（诊断见列表）"
+        }
+    }
+
+    /// 执行结论 → 一行文案。措辞要能回答"这次到底写了没有"：
+    /// `KM_PM_BUILD_ALREADY` 是**成功且一个字节都没写**，显示成"又建了一次"
+    /// 会让人以为重复写是安全的。
+    private static func physMapBuildLine(_ s: km_physmap_build_status) -> String {
+        switch s {
+        case KM_PM_BUILD_OK: return "［建表］ ✓ 建表 + 自映射完成（每级回读核对过）"
+        case KM_PM_BUILD_ALREADY: return "［建表］ 已建过 —— 本次一个字节都没写"
+        case KM_PM_BUILD_NOT_READY: return "［建表］ 前置不成立 —— 本次一次内核写都没发"
+        case KM_PM_BUILD_EXPAND_FAILED: return "［建表］ ✗ 建表途中失败（诊断见列表）"
+        case KM_PM_BUILD_SELFMAP_FAILED: return "［建表］ ✗ 自映射写失败，已停在那一级"
+        case KM_PM_BUILD_SWASID_SKIPPED: return "［建表］ 前 3 步成功；sw_asid 那步跳过（不影响）"
+        case KM_PM_BUILD_SWASID_FAILED: return "［建表］ 前 3 步成功；sw_asid 那步失败"
+        case KM_PM_BUILD_TRUNCATED: return "［建表］ 文本被截断（已发生的写入不受影响）"
+        default: return "［建表］ 未完成（诊断见列表）"
+        }
+    }
+
+    /// 真正碰 C 接口的部分。**必须在主线程之外执行**（见 runPhysMap）。
+    ///
+    /// 两处都先调 `km_phystokv_ensure()`：换算表与 slide 是数据依赖、分不开
+    /// （读换算表要用"链接期 vmaddr + slide"算出的运行时地址），但那件事收在
+    /// ensure 里，面板侧因此**不必要求用户先点「Slide」**。
+    private static func physMapPreReport() -> String {
+        var lines: [String] = []
+        lines.append("== 表预检（KernelPhysMap 只读）==")
+        lines.append("本按钮不写内核内存：不经过任何 km_write / kwrite。")
+
+        let ensured = km_phystokv_ensure()
+        lines.append("km_phystokv_ensure() = " + (ensured ? "true" : "false")
+                     + "（需要时自己建换算表，首次几十秒）")
+
+        let status = km_physmap_precheck()
+        DebugProcView.physMapLastStatus = status
+
+        if let diagnostic = km_physmap_diagnostic() {
+            lines.append(contentsOf: diagnostic.split(separator: "\n").map(String.init))
+        }
+        lines.append("== 对外接口 ==")
+        lines.append("km_physmap_window_address() = 0x" + String(km_physmap_window_address(), radix: 16))
+        lines.append("km_physmap_magic_pt() = 0x" + String(km_physmap_magic_pt(), radix: 16))
+        lines.append("km_physmap_precheck() status = " + String(status.rawValue))
+        return lines.joined(separator: "\n")
+    }
+
+    private static func physMapBuildReport() -> String {
+        var lines: [String] = []
+        lines.append("== 建表 + 自映射（KernelPhysMap 写路径）==")
+        lines.append("**本按钮会写内核内存**：建页表页、写父级表项、写自映射。")
+        lines.append("任一步回读不符即停在该步且不回滚 —— 诊断里写明期望值与回读值。")
+
+        let ensured = km_phystokv_ensure()
+        lines.append("km_phystokv_ensure() = " + (ensured ? "true" : "false"))
+
+        let status = km_physmap_build()
+        DebugProcView.physMapBuildLastStatus = status
+
+        if let diagnostic = km_physmap_diagnostic() {
+            lines.append(contentsOf: diagnostic.split(separator: "\n").map(String.init))
+        }
+        lines.append("== 对外接口 ==")
+        lines.append("km_physmap_magic_pt() = 0x" + String(km_physmap_magic_pt(), radix: 16))
+        lines.append("km_physmap_build() status = " + String(status.rawValue))
         return lines.joined(separator: "\n")
     }
 
