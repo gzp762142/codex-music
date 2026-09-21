@@ -46,11 +46,20 @@ bool km_is_kernel_address(uint64_t addr);
  *   translate    走该进程 pmap 的页表，把 VA 翻成 PA
  *   readProcess  对外：读目标进程 VA
  *
- * PA -> 内核 VA 的补回依赖线性映射的两个基准（gVirtBase / gPhysBase）。
- * 那两个值在目标内核上的地址是逐版本变动的，所以不写死：
- * km_locate_linear_map() 用 kernel_proc 自己走一遍页表，反解出
- * 「内核 VA - PA」这个差值，再用内核自身的 pmap 自映射是否成立来验证。
- * 验证不过就返回失败，而不是给出一个猜的值。
+ * PA -> 内核 VA 的补回依赖线性映射的基准（内核 VA − PA 差值）。
+ * 它在目标内核上是逐版本变动的，所以不写死：km_locate_linear_map() 在
+ * kernel_pmap 上走一遍内核 VA（kernel_proc / current_proc），从「真实观测到的
+ * (VA, PA) 对」反解出这个差值 —— 与上游 perf.h 的 phystokv() 兜底支同源。
+ *
+ * 这里没有独立的自校验步骤（先前注释写"再用内核自身的 pmap 自映射验证"，
+ * 与代码不符）：采信条件就是那次 walk 成立、基线非 0、且差值形态合理。
+ * 反面同样要写明：pmap 的 tte − ttep 那条路**刻意不采信** —— 它只是顶层表
+ * 所在那一段的偏移，不是全地址恒定的差值（见 KernelMemory.m 里
+ * km_bootstrap_linear_delta 的注释与 bug_type 210 的 panic 证据）。
+ *
+ * 基准没验通时 km_linear_map_ready() 返回 false，三处读路径入口
+ * （km_translate / km_read_process / km_write_process）一律直接失败，不下探到
+ * kread / kwrite —— 读不出数据是预期状态，把无效地址送进内核解引用会彩屏。
  */
 
 /// 按 pid 找 struct proc 的内核地址。找不到返回 0。

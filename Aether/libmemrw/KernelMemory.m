@@ -632,9 +632,12 @@ bool km_init(const char **err)
      * 这一步同时验证 kread 在原语层面真的可用。
      */
     km_locate_linear_map();
-    NSLog(@"[KernelMemory] linear map %@, pmap = %#llx",
+    NSLog(@"[KernelMemory] linear map %@, pmap = %#llx%@",
           g_linear_map_valid ? @"ready" : @"unresolved",
-          (unsigned long long)g_current_pmap);
+          (unsigned long long)g_current_pmap,
+          g_linear_map_valid ? @""
+                             : @" —— 读路径闸门生效：km_read_process / km_write_process "
+                               @"一律直接失败（预期安全态，不是故障）");
 
     /* procForPid 自证：自己进程必须能查到，且 p_pid 对得上。 */
     uint64_t selfProc = km_proc_for_pid(kfd->info.env.pid);
@@ -833,8 +836,17 @@ void km_self_test(char *out, size_t outSize)
      *
      * 之所以用栈变量而不是 malloc：栈页必然已映射、必然是小页（16 KB），
      * 不会撞上 L1/L2 大页那条 walk 与 pte_for 都拒绝的路径。
+     *
+     * 入口多挂一个 g_linear_map_valid：下面那句 `pte_PA + g_linear_delta` 是
+     * 本文件里**唯一**绕过 km_translate / km_read_process 闸门、把 `pa + delta`
+     * 直接交给 km_read64 的地方。delta 未被采信时它是 0，于是这一次 kread 拿到
+     * 的是 pte_PA 本身当 KVA —— 而 pte_PA 是个正常的物理地址（几百 MB 量级），
+     * 一旦它恰好低于 VM_MIN_KERNEL_ADDRESS，km_read64 里的 km_is_kernel_address
+     * 就会**放行**，内核随即对着一个未映射地址取数 —— 与 bug_type 210 那份
+     * panic 形态完全一致（far 低于 VM_MIN_KERNEL_ADDRESS）。
+     * 自检只是诊断，不值得为它冒彩屏的险：基准没验通就整段跳过。
      */
-    if (g_current_pmap != 0 && outSize > used) {
+    if (g_current_pmap != 0 && g_linear_map_valid && outSize > used) {
         char line[256] = {};
         volatile uint64_t stackProbe = 0x5AFE5AFE5AFE5AFEULL;
         (void)stackProbe;
@@ -845,8 +857,13 @@ void km_self_test(char *out, size_t outSize)
         const bool gotPTE = km_pte_for(g_current_pmap, probeVa, &pte_PA);
 
         if (!gotPA || !gotPTE) {
+            /*
+             * 走到这里就说明基准没验通（外层的 g_linear_map_valid 闸门）——
+             * 这也是本条自检在设备上的**预期**结果：宁可它 FAIL，也不要拿
+             * `pte_PA + 0` 去 kread。
+             */
             snprintf(line, sizeof(line),
-                     "pte: walk=%s pte_for=%s  va=%#llx  (FAIL)",
+                     "pte: walk=%s pte_for=%s  va=%#llx  (FAIL，未验通基准=预期安全态)",
                      gotPA ? "OK" : "FAIL", gotPTE ? "OK" : "FAIL",
                      (unsigned long long)probeVa);
         } else {
@@ -1152,8 +1169,18 @@ static bool km_page_table_walk(uint64_t pmap, uint64_t va, uint64_t *pa_out)
 
         /*
          * 下级表的地址是**物理地址**，必须经线性映射补回 KVA 才能 km_read64。
-         * g_linear_delta 由 km_bootstrap_linear_delta() 从 pmap 的 tte/ttep
-         * 直接求出，所以这里不会出现"delta 还没算出来"的情况。
+         *
+         * 这里**没有**再挂一次 g_linear_map_valid 闸门，因为不需要：两个调用者
+         * （km_translate 与 km_compute_linear_delta）都在入口查过了，而
+         * km_page_table_walk 只从这两处进来。留一句在这里是为了让下一个人别
+         * 把它当成"可以随便补 delta"的地方 —— delta 未被采信时它是 0，
+         * `PA + 0` 就是把物理地址当 KVA 读，那正是 panic log 里 far 低于
+         * VM_MIN_KERNEL_ADDRESS 的来源。
+         *
+         * 顺带记一笔旧注释的错：先前这里写"g_linear_delta 由
+         * km_bootstrap_linear_delta() 从 pmap 的 tte/ttep 直接求出，所以不会
+         * 出现 delta 还没算出来"，把那个自举当成可信来源 —— 分段映射的事实
+         * 让这个前提不成立，见 km_bootstrap_linear_delta 的注释。
          */
         table = (entry & KM_TTE_PA_MASK) + g_linear_delta;
     }
@@ -1224,17 +1251,43 @@ static bool km_pte_for(uint64_t pmap, uint64_t va, uint64_t *pte_pa_out)
 }
 
 /**
- * 从 pmap 自身的 tte / ttep 求内核线性映射的 VA−PA 差值。
+ * 从 pmap 自身的 tte / ttep 读出内核线性映射的 VA−PA 差值**候选值**。
  *
- * 这是唯一**不需要走页表**就能拿到 delta 的地方：pmap 开头的两个字段是
- * **同一张顶层页表**的两个视图 —— tte 是它的内核 VA，ttep 是它的 PA，
- * 两者相减就是内核线性映射那个对全地址恒定的差值。
+ * pmap 开头的两个字段是同一张顶层页表的两个视图：tte 是它的内核 VA，
+ * ttep 是它的 PA，两者相减确实是一个真实存在的 VA−PA 差值，而且这一步
+ * 不依赖任何页表遍历 —— 这是它当初被选来自举的原因（walk 要 delta、
+ * delta 又要 walk，那个死结靠它解开）。
  *
- * 为什么必须走这条路：km_page_table_walk 在下级寻址时要用 delta 把表项的
- * PA 补成 KVA，而原来求 delta 的办法（walk 一个已知 VA 再相减）又依赖 walk
- * 本身 —— 互为前提，所以永远解不出来，设备上表现为 linear=unresolved、
- * walk(kernel_proc)=MISS、self-read FAIL。上游用 perf 的 ptov_table 自举，
- * 本工程关了 perf，于是这里改用 pmap 自举。
+ * ============ 但**绝不能**据它置位 g_linear_map_valid ============
+ *
+ * 它只对「顶层页表所在的那一段映射」成立，不是全地址恒定的偏移。
+ * 上游 libkfd 自己的 phystokv()（Aether/libmemrw/kfd/libkfd/perf.h:232-248）
+ * 用的是 **8 项分段的 ptov_table**：逐项比对 tp_virt / tp_virt_end 落在哪一段，
+ * 取该段自己的 tp_phys 算偏移，只有全部落空才退回单一 delta 兜底 ——
+ * 换句话说，"单一偏移对全地址恒定"这个前提，连参考实现都不承认。
+ *
+ * 拿一个段的差值去换算段外的物理页，得到的就是**段外某处的地址**：它既不是
+ * 目标页，也未必落在内核映射区里。设备上的 panic 正是这条路的终点（bug_type 210）：
+ *     panic(cpu 6): Kernel data abort at pc 0xfffffe001c488350
+ *       x0:  0xfffffe13e679c000      <- 结构指针（有效）
+ *       x8:  0xfffffbd9bcda66e4      <- 坏指针
+ *       far: 0xfffffbd9bcda66ec      <- = x8 + 8
+ *       esr: 0x96000005 (DFSC=5, level 1 translation fault)
+ *   far 低于 VM_MIN_KERNEL_ADDRESS（0xfffffe0000000000），说明内核是抱着一个
+ *   **不在内核映射区**的地址去取数的；而本工程的读路径 kread_sem_open 必须先把
+ *   目标地址写进本进程 psemnode 的 pinfo，再由内核按内核语义解引用 ——
+ *   送进去的地址映射不存在，fault 就发生在内核态，必然彩屏重启。
+ *
+ * 所以这里保留读值与诊断输出（tte / ttep / delta 对排查仍有价值，彩屏之后
+ * 这几个数字是唯一能反推"当时用了什么基准"的证据），但**不置 valid**：
+ * 只有 return true 时它才是可信基准，而这条函数的实现里永远不返回 true。
+ * 要真正让 pmap 自举可用，得实现 ptov_table 的等价物（读内核里的
+ * ptov_table 符号，或至少逐段交叉校验），那是独立课题，不能用"一次相减"
+ * 冒充。
+ *
+ * 至于下面那些基于 walk 的路由（km_compute_linear_delta）为什么仍然保留：
+ * 它们的 delta 来自**一次真实观测 + 成对一致性判据**（见该函数注释），
+ * 与 tte − ttep 那种"假设段内偏移能外推"的形态不是一回事。
  */
 static bool km_bootstrap_linear_delta(uint64_t pmap, char *out, size_t outSize)
 {
@@ -1274,16 +1327,42 @@ static bool km_bootstrap_linear_delta(uint64_t pmap, char *out, size_t outSize)
         return false;
     }
 
+    /*
+     * 注意这条 `>> 40 != 0` 的判据挡不住段外换算 —— 它只说明"这个差值够大"
+     * （真内核映射区的偏移确实大），不说明"它对全地址成立"。一段偏移完全可能
+     * 通过这个形态检查，却被用到另一段的物理页上，算出一个映射区外的地址。
+     * 所以下面即使返回 true，语义也只是"读到了自洽的候选值"，不是"可信基准"；
+     * 判据的不足由调用方「不置 g_linear_map_valid」来兜。
+     */
     if (out && outSize) {
-        snprintf(out, outSize, "bootstrap tte=%#llx ttep=%#llx delta=%#llx",
+        snprintf(out, outSize, "candidate tte=%#llx ttep=%#llx delta=%#llx (未采信)",
                  (unsigned long long)tte, (unsigned long long)ttep,
                  (unsigned long long)g_linear_delta);
     }
     return true;
 }
 
-/// 内核 VA − PA：内核线性映射里这个差值对所有地址恒定，
-/// 所以一次有效的观测就够，不需要去解析 gVirtBase / gPhysBase 的符号。
+/*
+ * 用一次真实观测求 delta：先走页表把 known_va 翻成 pa，再相减。
+ *
+ * 与 tte − ttep 的区别（为什么这条**可以**置 valid，那条不可以）：
+ *   - tte − ttep 是**一个段内的偏移当成常数外推**，段外没有任何校验；
+ *   - 这里用的是「上游 phystokv() 兜底那一支的等价物」——perf.h:232-248 在
+ *     8 项分段全落空之后也是 `virt = gVirtBase + pa + (gPhysBase − gVirtBase)`，
+ *     即"先按段判、判不出才退回单一偏移"。本工程没有读 ptov_table，于是把
+ *     观测锚点放在内核 VA（kernel_proc / current_proc）上：它们与下游要换算的
+ *     目标同处内核 image 段，段内偏移一致；而那次 walk 成功本身就意味着各级
+ *     表项 was valid、描述符形态合法，也就是 pa 与 known_va 描述同一页
+ *     —— 一个已验证过的成对观测。所以它给出的 delta 至少在"内核 image 段内"
+ *     是自洽的。
+ *
+ * 前提也要写清（不能装作没有）：它同样只在**内核 image 段内**有据可查。
+ * 跨到别的段（比如把某个非 image 段的物理页补回 KVA）依然会偏 ——
+ * 那一段只能靠 ptov_table 逐段判，属于同一门独立课题。区别在于：这条路
+ * 最坏是"段外算偏"，而不是"段外地址直接被喂进内核解引用"—— 因为它的锚点
+ * 是一个已经被 walk 验证过的真地址，delta 的形态（>> 40 非 0）说明它至少
+ * 落在内核映射区里。
+ */
 static bool km_compute_linear_delta(uint64_t pmap, uint64_t known_va,
                                     const char *reason, char *out, size_t outSize)
 {
@@ -1345,21 +1424,28 @@ bool km_locate_linear_map(void)
     char note[192] = {};
 
     /*
-     * 首选：从 pmap 的 tte/ttep 直接自举 delta。
+     * pmap 的 tte / ttep 只**读出来给排查用**，不当基准用。
      *
-     * 这一步**不依赖任何页表遍历**，所以不受「walk 要 delta、delta 又要 walk」
-     * 那个死循环的影响 —— 而下面那几条基于 walk 的路径，全都只有在 delta
-     * 已经算出来之后才可能成立。因此 bootstrap 必须排在它们前面。
+     * 这一步不依赖页表遍历，在"walk 要 delta、delta 又要 walk"那个死结下看着
+     * 很诱人（设备上早先的表现就是 pte: walk=FAIL、walk(kernel_proc)=MISS pa=0、
+     * linear=unresolved、self-read FAIL）。但 tte − ttep 只是顶层表所在那一段
+     * 的偏移，不是全地址恒定的 delta（理由与 panic 证据见
+     * km_bootstrap_linear_delta 的注释），拿它当基准就是把段外地址喂给 kread，
+     * 而那条路的终点是彩屏重启。
      *
-     * 设备实测（改之前）：pte: walk=FAIL、walk(kernel_proc)=MISS pa=0、
-     * linear=unresolved、self-read FAIL —— 全是这一个死结的后果。
+     * 所以这里**不置 g_linear_map_valid**，只把读数记进日志，然后继续走下面
+     * 基于 walk 的路由。全部落空时整个函数返回 false —— 那是**预期的安全状态**：
+     * 读不出数据可以接受，把无效地址送进 kread 不可以（三处读路径入口的
+     * g_linear_map_valid 闸门由此生效）。
+     *
+     * 明确写下来：因此**不要**为了让这里返回 true 而把单段差值补成 valid。
+     * 真要让 pmap 自举可用，得实现 ptov_table 的等价物 —— 独立课题。
      */
     if (km_bootstrap_linear_delta(g_current_pmap, note, sizeof(note))) {
-        g_linear_map_valid = true;
-        NSLog(@"[KernelMemory] linear map located: %@", @(note));
-        return true;
+        NSLog(@"[KernelMemory] pmap tte/ttep probe (仅供排查、未采信): %@", @(note));
+    } else {
+        NSLog(@"[KernelMemory] pmap tte/ttep probe failed: %@", @(note));
     }
-    NSLog(@"[KernelMemory] pmap bootstrap failed: %@", @(note));
 
     /* 次选：kernel_pmap 上 walk 一个内核 VA。 */
     if (kpmap != 0 && kfd->info.kaddr.kernel_proc &&
@@ -1454,6 +1540,19 @@ uint64_t km_proc_for_pid(int32_t pid)
 
 bool km_translate(int32_t pid, uint64_t uaddr, uint64_t *pa_out)
 {
+    /*
+     * 换算基准不可信就直接失败，绝不下探 —— 这是本层唯一的安全边界。
+     *
+     * 为什么必须是**第一行**：下游 km_read_process / km_write_process 拿到 pa
+     * 之后一律做 `pa + g_linear_delta` 再送 kread / kwrite。delta 未被采信时
+     * 它是 0，于是 `pa + 0` 就把**物理地址当内核虚拟地址**喂进去 —— 那不是
+     * "读不到"，是内核抱着一个不在映射区的地址去解引用，也就是 panic log 里
+     * 那种彩屏重启（far 低于 VM_MIN_KERNEL_ADDRESS，esr DFSC=5）。
+     *
+     * 失败是**预期的安全状态**：读不出数据可以接受，把无效地址送进 kread 不可以。
+     * 契约与全文件其余守卫一致 —— 返回 false，且不写 *pa_out（调用方只认返回值，
+     * 不允许依赖"失败时残留一个脏值"）。
+     */
     if (!g_linear_map_valid || pa_out == NULL) {
         return false;
     }
@@ -1491,6 +1590,12 @@ bool km_translate(int32_t pid, uint64_t uaddr, uint64_t *pa_out)
 
 bool km_read_process(int32_t pid, uint64_t uaddr, void *out, uint64_t len)
 {
+    /*
+     * 同 km_translate：基准不可信时直接返回 false，绝不走到下面的
+     * `pa + g_linear_delta` → km_read。delta 未被采信时它是 0，`pa + 0` 就是
+     * 把物理地址当内核虚拟地址喂给 kread —— 内核态 data abort，彩屏重启。
+     * 读不出数据是**预期的安全状态**，不是需要绕过的问题。
+     */
     if (!g_linear_map_valid || out == NULL || len == 0) {
         return false;
     }
@@ -1527,6 +1632,12 @@ bool km_read_process(int32_t pid, uint64_t uaddr, void *out, uint64_t len)
 
 bool km_write_process(int32_t pid, uint64_t uaddr, const void *in, uint64_t len)
 {
+    /*
+     * 写方向的危害比读方向高一档：`pa + g_linear_delta` 在 delta 未被采信时
+     * 得到 `pa + 0`，kwrite 会按内核虚拟地址**落笔**，写坏的是内核内存而不是
+     * 读出一串垃圾（vm_map 被写坏就是这一路）。所以这里的闸门更不能省，
+     * 与 km_read_process 同构：失败返回 false，不下探。
+     */
     if (!g_linear_map_valid || in == NULL || len == 0) {
         return false;
     }
