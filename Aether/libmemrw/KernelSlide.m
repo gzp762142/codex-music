@@ -1058,6 +1058,8 @@ static bool slide_run_find_slide(km_slide_run *run, km_slide_text *t)
 static bool slide_read_ptov_table(uint64_t slide, km_slide_ptov_entry *out,
                                   km_slide_run *run, km_slide_text *t)
 {
+    /* 定义在本函数之后：表判不合法时也要把独立锚点的校验结论写进诊断。 */
+    static void slide_check_ptov_against_anchor(const km_slide_run *run, km_slide_text *t);
     const uint64_t symbol = km_xpf_resolve_symbol(@"kernelSymbol.ptov_table");
     if (symbol == 0) {
         text_append(t, "  XPF 取不到 kernelSymbol.ptov_table\n");
@@ -1274,12 +1276,14 @@ static bool slide_read_ptov_table(uint64_t slide, km_slide_ptov_entry *out,
     if (valid == 0) {
         text_append(t, "  上面 %llu 项没有一项通过形态检查（表是空的，或全部不合法）\n",
                     (unsigned long long)shown);
+        slide_check_ptov_against_anchor(run, t);
         return slide_refuse(run, t, "⑥ ptov_table", "表是空的或全部不合法");
     }
     if (!allValid) {
         text_append(t, "  上面 %llu 项里有形态不合法的项，整表拒绝 —— "
                        "半张表比没有表更危险（段外换算）。\n",
                     (unsigned long long)shown);
+        slide_check_ptov_against_anchor(run, t);
         return slide_refuse(run, t, "⑥ ptov_table", "表项形态不合法");
     }
 
@@ -1287,7 +1291,61 @@ static bool slide_read_ptov_table(uint64_t slide, km_slide_ptov_entry *out,
     text_append(t, "⑥ ptov_table=%#llx（符号 %#llx + slide）有效项 %llu\n",
                 (unsigned long long)tableAddr, (unsigned long long)symbol,
                 (unsigned long long)valid);
+    slide_check_ptov_against_anchor(run, t);
     return true;
+}
+
+/*
+ * ── 用独立锚点验证这张表本身 ─────────────────────────────────────────────
+ *
+ * 判据：`gVirtBase` 是内核数据段自己的内核虚拟地址（由 XPF 走另一条推导链给出，
+ * 与 ptov_table 的 finder 互不依赖）。表里必须存在某一项，它的物理范围覆盖
+ * `gVirtBase` 所对应的物理地址 —— 即那一项应满足
+ *
+ *     va <= gVirtBase < va + len
+ *
+ * 成立就说明这张表确实描述着本机内核的映射；**一项都不覆盖，就说明表被定位错了**
+ * （或者布局读错），而不是"表项长得奇怪"。
+ *
+ * 这一步是纯算术、零 kread：只用已经读到的值和已解析的符号。
+ */
+static void slide_check_ptov_against_anchor(const km_slide_run *run, km_slide_text *t)
+{
+    if (run->virtBase == 0) {
+        text_append(t, "  [锚点校验] gVirtBase 未读到，无法校验表的位置\n");
+        return;
+    }
+    if (run->ptov[0].len == 0) {
+        text_append(t, "  [锚点校验] 表首项 len=0，无表可校\n");
+        return;
+    }
+
+    const uint64_t anchor = run->virtBase;
+    uint64_t covering = 0;
+    for (uint64_t i = 0; i < KM_SLIDE_PTOV_COUNT; i++) {
+        const uint64_t va = run->ptov[i].va;
+        const uint64_t len = run->ptov[i].len;
+        if (len == 0) break;
+        if (anchor >= va && anchor < (va + len)) {
+            covering++;
+            text_append(t, "  [锚点校验] gVirtBase=%#llx 落在 ptov[%llu]（va=%#llx len=%#llx）内\n",
+                        (unsigned long long)anchor, (unsigned long long)i,
+                        (unsigned long long)va, (unsigned long long)len);
+        }
+    }
+
+    if (covering == 0) {
+        text_append(t, "  [锚点校验] 没有任何一项覆盖 gVirtBase=%#llx —— "
+                       "这张表不是描述本机内核映射的（符号定位错了，或布局读错了）\n",
+                    (unsigned long long)anchor);
+    } else {
+        text_append(t, "  [锚点校验] 通过：%llu 项覆盖该锚点\n", (unsigned long long)covering);
+    }
+
+    text_append(t, "  [锚点校验] 三个基准的运行时地址：gVirtBase=%#llx gPhysBase=%#llx gPhysSize=%#llx\n",
+                (unsigned long long)run->virtBase,
+                (unsigned long long)run->physBase,
+                (unsigned long long)run->physSize);
 }
 
 /*
@@ -1428,8 +1486,23 @@ static void slide_report_phystokv_probe(const km_slide_run *run, km_slide_text *
 
 static bool slide_run_load_tables(km_slide_run *run, km_slide_text *t)
 {
+    /*
+     * 顺序是刻意的：**先读 gVirtBase/gPhysBase/gPhysSize，再读 ptov_table**。
+     *
+     * 为什么不能反过来（这曾经是反的）：ptov_table 失败就 return，于是那三个值
+     * 永远读不到 —— 而它们在 XPF 里走的是**另一条独立且更稳的推导**
+     * （xpf_find_arm_vm_init_reference(n)：从 arm_vm_init 里找第 n 个 STR），
+     * 不依赖 phystokv。而 ptov_table 的 finder 恰恰依赖 phystokv
+     * （xpf_find_ptov_table 从 phystokv 的反汇编里找第 2 个 LDR），
+     * phystokv 本身又是靠"arm_vm_init 里第几个 bl"推的（上游为 ARM_LARGE_MEMORY
+     * 加过 n=2 特判，说明这个假设在不同内核布局上变过）。
+     *
+     * 两层脆弱推导叠在一起，`ptov_table` 的符号地址就有可能是错的。那三个值读得
+     * 到的话，就有一个独立的锚去判断表对不对 —— 读不到它们，连判断的余地都没有。
+     */
+    slide_read_bases(run->slide, run, t);
     if (!slide_read_ptov_table(run->slide, run->ptov, run, t)) return false;
-    if (!slide_read_bases(run->slide, run, t)) return false;
+    if (run->virtBase == 0 || run->physBase == 0 || run->physSize == 0) return false;
 
     /*
      * 全部到位才提交：避免下游读到"slide 有了、表只读了一半"的中间状态。
