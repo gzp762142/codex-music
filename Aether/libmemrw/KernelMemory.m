@@ -48,6 +48,21 @@ static uint64_t g_handle = 0;
  * 后者只在 km_init 全程走完之后才置位。
  */
 static bool g_kernel_ready = false;
+
+/*
+ * km_init 是否已经**尝试过**（成功与失败都算）。
+ *
+ * 为什么不能拿 g_handle 当这个守卫：PUAFF 失败时 km_init 在 g_handle 上留下 0，
+ * 于是下一次调用会认为"还没跑过"，把整轮 PUAFF 在**已经不一致的 vm_map**
+ * 上再跑一遍。这正是 kfd_try_open 里刚拆掉的那个放大器（见本文件
+ * "只清用户态的 posix semaphore 对象，然后直接放弃，不重试"那段注释）——
+ * 拆掉 kopen 层的重试、却让更高一层的 km_init 把同样的事再做一次，等于没拆。
+ *
+ * 所以单独记一个"跑过没有"：失败也置位，之后一律走 no-op。要重试就交给
+ * 下一次进程启动，那时 vm_map 是干净的（与 kfd_try_open 是同一条理由）。
+ */
+static bool g_init_attempted = false;
+
 /// 扫描得到的 kernel base（kernelcache 的 MH_MAGIC_64 所在地址）。
 static uint64_t g_kernel_base = 0;
 
@@ -294,14 +309,42 @@ static BOOL km_version_is_supported(const char **why)
      * 下界：Darwin 21（iOS 15.x）起才有可用 PUAFF。
      *
      * 但这里刻意把门槛抬到 Darwin 22（iOS 16.0）：iOS 15 虽然 PUAFF 存在，
-     * 本工程却走不通它 —— iOS < 16 会被分派到 kread_IOSurface 后端
-     * （见下方 readMethod 的 @available），而 dynamic_info.h 里 Darwin 21
-     * 那条的 ios__* 五个偏移全是 0（IndexedTimestampPtr / AllocSize /
-     * PixelFormat / UseCountPtr / ReadDisplacement），该后端完全依赖它们。
-     * 换句话说 iOS 15 会在拿全 0 偏移去操作 IOSurface 对象时失败或写坏内核。
+     * 本工程却走不通它 —— iOS < 16 会被 @available(iOS 16.0, *) 分派到
+     * kread_IOSurface / kwrite_IOSurface 后端（见下方 readMethod 与
+     * writeMethod 的成对选择），而**这个后端在本工程没有任何真机验证**。
      *
-     * 与其让客户在 iOS 15 上撞莫名其妙的失败，不如在这里明确拒绝：
-     * 补齐 iOS 15 偏移需要有真机实测数据，目前没有。
+     * 不是 0 偏移的问题，别再把理由写错：dynamic_info.h 里 Darwin 21 那条的
+     * ios__* 五个偏移已经填了真值（0x360 / 0xac / 0xa4 / 0xc0 / 0x14，来自
+     * opa334/kfd 的 IOSurface.h）。缺的是读原语本身的落实验证 ——
+     * 那条后端依赖的 IOSurface kext 通道在 iOS 16 上被改过（见下方
+     * "为什么 iOS 16 不能用 IOSurface"），而 iOS 15 侧的行为我们一次都没在
+     * 设备上跑通：偏移表与读原语都只过了静态检查，没有端到端证据。
+     *
+     * 写侧同理：kwrite_IOSurface 必须与 kread_IOSurface 成对（见下方注释）。
+     * 而且 iOS 15 这条组合**连 kopen 入口都过不去**，不必等到真机上才知道
+     * —— 这一点先前写反了，按代码事实改正：
+     *
+     *   kwrite_IOSurface 是本工程给上游加的第三个写后端（libkfd.h:36），
+     *   枚举值 = 2（kwrite_dup = 0 / kwrite_sem_open = 1，libkfd.h:33-37），
+     *   而 kopen 入口那句范围断言是**从上游继承的 `<= kwrite_sem_open`**
+     *   （libkfd.h:179），没有为新后端放宽。紧邻的上一行 libkfd.h:178 读侧
+     *   已经是 `<= kread_IOSurface`（那个后端随样本一起进来，见 libkfd.h:30），
+     *   写侧对不上 —— 两侧不对称，问题就出在这。
+     *
+     *   于是本工程在 KernelMemory.m:537 分派出的 writeMethod = kwrite_IOSurface
+     *   落在断言外面：2 <= 1 为假，断言必挂。挂的形态不是崩溃而是可诊断的失败：
+     *   common.h:139 的 assert 宏先打印
+     *   "assertion failed: (kwrite_method <= kwrite_sem_open)"，再调用
+     *   kfd_assert_handler —— 本工程已把它注册成 km_assert_fallback，
+     *   于是 longjmp 回 kfd_try_open 的调用点，kopen 以返回 0 告终。
+     *
+     * 所以这一档的问题是双重的：原语没做过真机验证，**且结构上就走不通**。
+     * 将来要放开 iOS 15，第一步是放宽 libkfd.h:179（或重排 537 那处 writeMethod
+     * 的分派），否则任何 iOS 15 设备一进 kopen 就终止。
+     *
+     * 与其让客户在 iOS 15 上撞莫名其妙的失败、或者被半成品的 IOSurface
+     * 写原语写坏内核，不如在这里明确拒绝：要放开这一档，先把 iOS 15 真机上的
+     * kread/kwrite 跑通，目前没有这个证据。
      */
     if (major < 21) {
         if (why) {
@@ -311,8 +354,8 @@ static BOOL km_version_is_supported(const char **why)
     }
     if (major == 21) {
         if (why) {
-            *why = "iOS 15.x 暂不支持：本工程在 iOS 16 以下会走 IOSurface 后端，"
-                   "而该后端的偏移尚未取到实测数据（需要 iOS 16.0 及以上）";
+            *why = "iOS 15.x 暂不支持：本工程在 iOS 16 以下会走 IOSurface 读写后端，"
+                   "而该后端尚未在本工程做过真机验证（需要 iOS 16.0 及以上）";
         }
         return NO;
     }
@@ -372,9 +415,22 @@ bool km_init(const char **err)
     if (err) {
         *err = NULL;
     }
-    if (g_handle != 0) {
-        return true;
+    /*
+     * 幂等守卫看"尝试过没有"，不看 g_handle。
+     *
+     * 原来的写法是 `if (g_handle != 0) return true;`，而 PUAFF 失败时那个值
+     * **就是** 0 —— 于是第二遍调用不认为跑过，会把整轮 PUAFF 在已经不一致的
+     * vm_map 上再跑一次（成因与后果见 g_init_attempted 的声明处）。
+     *
+     * 置位放在最前面，是为了让失败路径和提前 return 的路径（版本门、
+     * kopen 返回 0）也一并覆盖 —— 只覆盖成功路径等于没修。
+     * 更早跑过的调用返回的是"当前句柄是否有效"，不再假装成功：老写法在
+     * km_deinit 之后再调 km_init 也会返回 true，而那时 g_handle 已经是 0。
+     */
+    if (g_init_attempted) {
+        return g_handle != 0;
     }
+    g_init_attempted = true;
 
     NSString *kernVersion = km_read_kern_version();
     NSLog(@"[KernelMemory] kern.version = %@", kernVersion ?: @"(unreadable)");
@@ -900,19 +956,114 @@ void km_self_test(char *out, size_t outSize)
 #define KM_L1_SHIFT 36ULL
 #define KM_L2_SHIFT 25ULL
 #define KM_L3_SHIFT 14ULL
-#define KM_L1_MASK 0x0000000ff0000000ULL /* 11 bits at 36 */
+/*
+ * L1 索引：bits 36..46，共 11 位。
+ *
+ * 原值 0x0000000ff0000000 只覆盖 bits 28..35（8 位），配 KM_L1_SHIFT=36 之后
+ * (va & mask) >> 36 恒为 0 —— 对用户 VA 恰好蒙对（它们的 L1 索引本来就是 0），
+ * 对内核 VA 必错。同仓库的 static_info.h 就有正确常量：
+ *     #define ARM_16K_TT_L1_INDEX_MASK 0x00007ff000000000
+ */
+#define KM_L1_MASK 0x00007ff000000000ULL /* 11 bits at 36 */
 #define KM_L2_MASK 0x0000000ffe000000ULL /* 11 bits at 25 */
 #define KM_L3_MASK 0x0000000001ffc000ULL /* 11 bits at 14 */
 #define KM_TTE_TYPE_BLOCK 0x0000000000000000ULL
 #define KM_TTE_TYPE_TABLE 0x0000000000000002ULL
 #define KM_TTE_TYPE_MASK 0x0000000000000002ULL
+#define KM_TTE_VALID 0x0000000000000001ULL
 #define KM_TTE_PA_MASK 0x0000fffffffff000ULL
 
-/// 用页表项算出下一级表的物理地址。
-static uint64_t km_next_table_pa(uint64_t tte)
-{
-    return tte & KM_TTE_PA_MASK;
-}
+/*
+ * ============ 最后一级（L3）的描述符判据与 L1/L2 不同 ============
+ *
+ * arm64 用 bit1 区分描述符形态，但**同一形态在不同级别的含义相反**：
+ *   L1 / L2：bit1 = 0 → 块描述符（大页），bit1 = 1 → 表描述符（下一级表）
+ *   L3     ：bit1 = 0 → 不是叶子（L3 之下无处可去），bit1 = 1 → 页描述符
+ * 所以「是叶子」的判据是 (entry & 2) == 0（L1/L2）与 (entry & 2) == 2（L3），
+ * 两者互为反相。**三级共用一套判据必然错**：L3 页描述符的 bit1 恒为 1，
+ * (entry & 2) == 0 永不成立，于是每一处下钻到 L3 的翻译都以失败收场
+ * —— 这正是设备上 pte: walk=FAIL / walk(kernel_proc)=MISS pa=0 的主因。
+ *
+ * 上游 perf.h 的 vtophys 就是逐级换判据的（L1/L2 见 :270-287，L3 见 :288-296）：
+ *     L1/L2：valid_mask = ARM_TTE_VALID (0x1)，type_mask = ARM_TTE_TYPE_MASK (0x2)，
+ *            type_block = ARM_TTE_TYPE_BLOCK (0x0)
+ *     L3   ：valid_mask = ARM_PTE_TYPE_VALID (0x3)，type_mask = ARM_PTE_TYPE_MASK (0x2)，
+ *            type_block = ARM_TTE_TYPE_L3BLOCK (0x2)
+ * 常量出处 Aether/libmemrw/kfd/libkfd/info/static_info.h:30 / :31 / :32，以及
+ * :50 / :51 / :53；本组宏与其同值，改名只是为了不与 libkfd 的命名混在一起。
+ *
+ * valid 也一并随级变化：L3 要求 bit0、bit1 **都**为 1（0x3）。只查 bit0 会放过
+ * (entry & 3) == 1 这种既不是页描述符、也不是有效表项的形态，之后拿它算 PA
+ * 就是凭垃圾位输出一个地址。上游 perf.h:308 同样是 `& valid_mask`，不是 `& 1`。
+ *
+ * 一个已知缺口，刻意与上游保持一致：ARM_PTE_COMPRESSED / _ALT（bit63 / bit62，
+ * static_info.h:47-48）这类压缩表项没有专门排除 —— 上游 perf.h 也没排除。
+ * 也就是说撞上它时两边都会按朴素页描述符算出一个不可信的 PA。本工程没在设备上
+ * 验证过压缩页，所以按上游行为对齐（宁可和参考实现错得一样，也不自作聪明）。
+ */
+#define KM_PTE_TYPE_VALID 0x0000000000000003ULL
+#define KM_PTE_TYPE_MASK 0x0000000000000002ULL
+#define KM_TTE_TYPE_L3BLOCK 0x0000000000000002ULL
+
+/*
+ * 各级的级内偏移掩码（offmask）与对应的 PA 掩码。
+ *
+ * 上游 perf.h:313 落块/页描述符时是一行：
+ *     pa = ((tte & ARM_TTE_PA_MASK & ~offmask) | (va & offmask));
+ * 这里的 offmask 是**当前这一级**的（perf.h:262 / :271 / :280 / :289 逐级取），
+ * 不是固定值 —— 因为块描述符描述的是「一整块」，它只存块首，块内偏移只能从
+ * VA 取回：
+ *     L1 块 = 2^36 = 64GiB（static_info.h:62 ARM_16K_TT_L1_SIZE），
+ *             掩掉低 36 位 → static_info.h:63 ARM_16K_TT_L1_OFFMASK
+ *     L2 块 = 2^25 = 32MiB（static_info.h:67），
+ *             掩掉低 25 位 → static_info.h:68 ARM_16K_TT_L2_OFFMASK
+ *     L3 页 = 2^14 = 16KiB（static_info.h:72），
+ *             掩掉低 14 位 → static_info.h:73 ARM_16K_TT_L3_OFFMASK
+ *
+ * 原先三级共用 KM_PAGE_MASK（14 位），后果分两头：
+ *   1. 往下走：L1 / L2 大页丢掉 VA 的级内偏移，PA 指向块首而不是目标页。
+ *      内核线性映射区常用大页，所以这条不是理论问题，是真会生效的错。
+ *   2. 往上看：见下面的 PA 掩码。
+ */
+#define KM_L1_OFFMASK 0x0000000fffffffffULL /* 36 bits，与 static_info.h:63 同值 */
+#define KM_L2_OFFMASK 0x0000000001ffffffULL /* 25 bits，与 static_info.h:68 同值 */
+#define KM_L3_OFFMASK 0x0000000000003fffULL /* 14 bits，与 static_info.h:73 同值 */
+
+/*
+ * 落块 / 页描述符算最终 PA 用的掩码 = ARM_TTE_PA_MASK 再剔掉本级偏移位。
+ *
+ * 为什么必须 `& ~offmask`（perf.h:313）而不是直接用 ARM_TTE_PA_MASK：
+ * 16KiB 页的 L3 页描述符里 bits 12–13 是**属性位**（AP 等），不是输出地址的
+ * 高位；而 KM_TTE_PA_MASK（= static_info.h:55 ARM_TTE_PA_MASK）的 bit12–13
+ * **恰好是 1**，直接与就把这两位当成地址拼进去，得到偏高 0x1000 / 0x2000 的
+ * 错地址。KM_TTE_PA_MASK & ~0x3fff = 0x0000ffffffffc000，正好把它们剔除。
+ *
+ * 注意别改错地方：**表项** → 下一级表的地址用的是 ARM_TTE_TABLE_MASK
+ * （bits 12..47，perf.h:317 就是这么用的），它与 KM_TTE_PA_MASK 同值，所以
+ * 本工程写的 (entry & KM_TTE_PA_MASK) + g_linear_delta 是对的，不要动。
+ * 只有**块 / 页描述符** → 最终 PA 这一处才需要 `& ~offmask`。
+ */
+#define KM_L1_PA_MASK (KM_TTE_PA_MASK & ~KM_L1_OFFMASK) /* = 0x0000fff000000000 */
+#define KM_L2_PA_MASK (KM_TTE_PA_MASK & ~KM_L2_OFFMASK) /* = 0x0000fffffe000000 */
+#define KM_L3_PA_MASK (KM_TTE_PA_MASK & ~KM_L3_OFFMASK) /* = 0x0000ffffffffc000 */
+
+/*
+ * pmap 开头就是 tte / ttep 两个指针：同一张顶层页表的 VA 与 PA 两个视图。
+ *
+ * 这给了 delta 一个不依赖页表遍历的来源，正是解开死结的关键 ——
+ * 原来的 km_compute_linear_delta 要靠 walk 求 delta，而 walk 又要用 delta
+ * 把下级表的 PA 补成 KVA，两者互为前提，所以永远解不出来（linear=unresolved）。
+ * 直接拿 tte 减 ttep 就得到内核线性映射的 VA−PA 差值，一次 walk 都不需要。
+ *
+ * 这里**只定义 TTEP**，不再重复定义 TTE：KM_PMAP_TTE_OFFSET 在文件前部
+ * 已经有一处定义（带 "/// struct pmap 的 tte 字段偏移" 注释那一行），先前
+ * 在这里又写了一遍同值定义。同值宏当下合法、也不触发任何警告（C 允许替换
+ * 列表完全相同的重复定义），但**同一个常量在文件里有两个定义点本身就是误导**：
+ * 读的人分不清哪一处是真源，将来有人只改一处，轻则"改了没生效"，
+ * 重则两处值不同变成真正的冲突重定义（那种错在编译期才炸，而且炸在
+ * 引用它的行上，不是定义它的行上，很难查）。所以这里只补它缺的那个伙伴。
+ */
+#define KM_PMAP_TTEP_OFFSET 0x08
 
 /// 内部：按 pmap 走页表，把 VA 翻成 PA。
 static bool km_page_table_walk(uint64_t pmap, uint64_t va, uint64_t *pa_out)
@@ -926,7 +1077,18 @@ static bool km_page_table_walk(uint64_t pmap, uint64_t va, uint64_t *pa_out)
     if (!ok || tte == 0) {
         return false;
     }
-    uint64_t table = km_next_table_pa(tte);
+    /*
+     * 顶层表地址直接用 tte —— 它本身就是 KVA，而 km_read64 要的正是 KVA。
+     *
+     * 不能按 PA 字段掩码（KM_TTE_PA_MASK = 0x0000fffffffff000）截断：那个掩码
+     * 是给**表项里的 PA 字段**用的，套到 KVA 上会把高 16 位清零，得到
+     * 0x0000fe… 这种非内核地址，km_read64 的 km_is_kernel_address 立刻拒绝
+     * —— 这就是原先 "pte: walk=FAIL" / "walk(kernel_proc)=MISS" 的直接原因。
+     * （原先有一个 km_next_table_pa() 专门表达这一步掩码；顶层改成直写 tte、
+     * 下级改成显式补 delta 之后它没有调用者了，定义已删 —— 留着只会触发
+     * -Wunused-function。这段推理本身仍然成立，所以留着。）
+     */
+    uint64_t table = tte;
 
     /*
      * L1 / L2 允许块描述符直接落地；L3 只认页描述符。
@@ -935,28 +1097,65 @@ static bool km_page_table_walk(uint64_t pmap, uint64_t va, uint64_t *pa_out)
      * 必须在这里收尾。**不能依赖"L3 一定是块描述符"这个形态巧合**——
      * 一旦 L3 表项的 bit1 为 1（表描述符形态），旧写法会继续下一轮，
      * 读到 masks[3] / shifts[3]（越界读栈内存），再拿垃圾索引去 km_read64。
+     * 所以这个上界、以及循环体末尾那句 level == 2 的提前返回，都动不得。
      */
     const uint64_t shifts[3] = { KM_L1_SHIFT, KM_L2_SHIFT, KM_L3_SHIFT };
     const uint64_t masks[3] = { KM_L1_MASK, KM_L2_MASK, KM_L3_MASK };
+    /*
+     * 判据与掩码一律按级别取 —— 这是本层最关键的一处，理由见这些宏的定义处：
+     * L3 的「是叶子」判据与 L1/L2 反相（bit1 = 1 才是叶），valid 也要求两位全 1；
+     * offmask / PA 掩码同样逐级不同（大页偏移 + L3 属性位两个坑都在这）。
+     */
+    const uint64_t valid_masks[3] = { KM_TTE_VALID, KM_TTE_VALID, KM_PTE_TYPE_VALID };
+    const uint64_t type_masks[3] = { KM_TTE_TYPE_MASK, KM_TTE_TYPE_MASK, KM_PTE_TYPE_MASK };
+    const uint64_t type_blocks[3] = { KM_TTE_TYPE_BLOCK, KM_TTE_TYPE_BLOCK, KM_TTE_TYPE_L3BLOCK };
+    const uint64_t pa_masks[3] = { KM_L1_PA_MASK, KM_L2_PA_MASK, KM_L3_PA_MASK };
+    const uint64_t offmasks[3] = { KM_L1_OFFMASK, KM_L2_OFFMASK, KM_L3_OFFMASK };
 
     for (int level = 0; level <= 2; level++) {
         uint64_t index = (va & masks[level]) >> shifts[level];
         uint64_t entry = km_read64(table + index * sizeof(uint64_t), &ok);
-        if (!ok || (entry & 1) == 0) {
+        if (!ok || (entry & valid_masks[level]) != valid_masks[level]) {
             return false;
         }
 
-        if ((entry & KM_TTE_TYPE_MASK) == KM_TTE_TYPE_BLOCK) {
-            *pa_out = (entry & KM_TTE_PA_MASK) | (va & KM_PAGE_MASK);
+        /*
+         * 块 / 页描述符命中即为叶子，剩下的就是算术，与上游 perf.h:312-314
+         * 逐字对应：
+         *     pa = ((tte & ARM_TTE_PA_MASK & ~offmask) | (va & offmask));
+         * 两半都不能省，各自对应一个真实的坑：
+         *   `& pa_masks[level]`：先把该级的级内偏移位剔掉。L3 的 bits 12–13
+         *       是属性位，被 KM_TTE_PA_MASK 当成地址高位就会算高 0x1000/0x2000；
+         *   `| (va & offmasks[level])`：级内偏移只能从 VA 取 —— 块 / 页描述符
+         *       里存的是块首 / 页首，本来就不含这部分。L1 / L2 大页（64GiB /
+         *       32MiB）丢掉的正是它，内核线性映射区常用大页，所以真会算错。
+         * 旧写法三级共用 KM_TTE_PA_MASK + KM_PAGE_MASK，上两坑各中一个。
+         */
+        if ((entry & type_masks[level]) == type_blocks[level]) {
+            *pa_out = (entry & pa_masks[level]) | (va & offmasks[level]);
             return true;
         }
 
-        /* L3 只认页描述符：到这一级还带 bit1 就说明表项形态不对，不继续往下走 */
+        /*
+         * 走到最后一级还不是叶子：L3 的 bit1 = 0 既不是页描述符，也不允许再
+         * 开表（L3 之下无处可去），判失败。
+         *
+         * 注意这句已经**不再是** L3 的收尾逻辑 —— L3 的页描述符在上面那条
+         * 类型判据里就被认下来并 return true 了。先前写反了判据，L3 叶子
+         * 永远落到这里返回 false，才表现为"任何下钻到 L3 的翻译都失败"。
+         * 现在它只剩边界保护这一个职责：masks / shifts / 各掩码都只有 3 个
+         * 元素，不在这里收手，下一轮就会读 masks[3] / shifts[3]（越界读栈）。
+         */
         if (level == 2) {
             return false;
         }
 
-        table = km_next_table_pa(entry);
+        /*
+         * 下级表的地址是**物理地址**，必须经线性映射补回 KVA 才能 km_read64。
+         * g_linear_delta 由 km_bootstrap_linear_delta() 从 pmap 的 tte/ttep
+         * 直接求出，所以这里不会出现"delta 还没算出来"的情况。
+         */
+        table = (entry & KM_TTE_PA_MASK) + g_linear_delta;
     }
 
     return false;
@@ -972,8 +1171,11 @@ static bool km_page_table_walk(uint64_t pmap, uint64_t va, uint64_t *pa_out)
  * 两个函数刻意分开：walk 是热路径（每次 km_read_process 都要走），
  * 多算一个 PTE 地址是白费；这个函数每次改写才用一次。
  *
- * 与 walk 一致的约定：L1 / L2 遇到块描述符（1GB / 32MB 大页）就返回 false
+ * 与 walk 一致的约定：L1 / L2 遇到块描述符就返回 false
  * —— 那种情况下没有独立的 L3 表项可改。
+ * （块大小别按 4 KB 粒度记：16 KB 粒度下 L1 块是 2^36 = 64 GiB、
+ *   L2 块是 2^25 = 32 MiB，见 static_info.h:62 / :67 的 ARM_16K_TT_L*_SIZE。
+ *   这里原先写的是 "1GB / 32MB"，1 GB 是 4 KB 粒度下的 L1 块，不是本工程的几何。）
  */
 static bool km_pte_for(uint64_t pmap, uint64_t va, uint64_t *pte_pa_out)
 {
@@ -986,7 +1188,8 @@ static bool km_pte_for(uint64_t pmap, uint64_t va, uint64_t *pte_pa_out)
     if (!ok || tte == 0) {
         return false;
     }
-    uint64_t table = km_next_table_pa(tte);
+    /* 顶层同 km_page_table_walk：tte 是 KVA，不能按 PA 掩码截断 */
+    uint64_t table = tte;
 
     const uint64_t shifts[3] = { KM_L1_SHIFT, KM_L2_SHIFT, KM_L3_SHIFT };
     const uint64_t masks[3] = { KM_L1_MASK, KM_L2_MASK, KM_L3_MASK };
@@ -1013,10 +1216,70 @@ static bool km_pte_for(uint64_t pmap, uint64_t va, uint64_t *pte_pa_out)
             /* 大页没有独立 L3 表项，physrw 这条路对它无效 */
             return false;
         }
-        table = km_next_table_pa(entry);
+        /* 下级表地址是 PA，补回 KVA */
+        table = (entry & KM_TTE_PA_MASK) + g_linear_delta;
     }
 
     return false;
+}
+
+/**
+ * 从 pmap 自身的 tte / ttep 求内核线性映射的 VA−PA 差值。
+ *
+ * 这是唯一**不需要走页表**就能拿到 delta 的地方：pmap 开头的两个字段是
+ * **同一张顶层页表**的两个视图 —— tte 是它的内核 VA，ttep 是它的 PA，
+ * 两者相减就是内核线性映射那个对全地址恒定的差值。
+ *
+ * 为什么必须走这条路：km_page_table_walk 在下级寻址时要用 delta 把表项的
+ * PA 补成 KVA，而原来求 delta 的办法（walk 一个已知 VA 再相减）又依赖 walk
+ * 本身 —— 互为前提，所以永远解不出来，设备上表现为 linear=unresolved、
+ * walk(kernel_proc)=MISS、self-read FAIL。上游用 perf 的 ptov_table 自举，
+ * 本工程关了 perf，于是这里改用 pmap 自举。
+ */
+static bool km_bootstrap_linear_delta(uint64_t pmap, char *out, size_t outSize)
+{
+    if (pmap == 0) {
+        if (out && outSize) {
+            snprintf(out, outSize, "pmap is 0");
+        }
+        return false;
+    }
+
+    bool ok_tte = false;
+    bool ok_ttep = false;
+    const uint64_t tte  = km_read64(pmap + KM_PMAP_TTE_OFFSET,  &ok_tte);
+    const uint64_t ttep = km_read64(pmap + KM_PMAP_TTEP_OFFSET, &ok_ttep);
+
+    if (!ok_tte || !ok_ttep || tte == 0 || ttep == 0) {
+        if (out && outSize) {
+            snprintf(out, outSize, "pmap tte/ttep unreadable (tte=%#llx ttep=%#llx)",
+                     (unsigned long long)tte, (unsigned long long)ttep);
+        }
+        return false;
+    }
+    if (tte <= ttep) {
+        if (out && outSize) {
+            snprintf(out, outSize, "implausible tte<=ttep (%#llx <= %#llx)",
+                     (unsigned long long)tte, (unsigned long long)ttep);
+        }
+        return false;
+    }
+
+    g_linear_delta = tte - ttep;
+    if ((g_linear_delta >> 40) == 0) {
+        if (out && outSize) {
+            snprintf(out, outSize, "implausible delta %#llx",
+                     (unsigned long long)g_linear_delta);
+        }
+        return false;
+    }
+
+    if (out && outSize) {
+        snprintf(out, outSize, "bootstrap tte=%#llx ttep=%#llx delta=%#llx",
+                 (unsigned long long)tte, (unsigned long long)ttep,
+                 (unsigned long long)g_linear_delta);
+    }
+    return true;
 }
 
 /// 内核 VA − PA：内核线性映射里这个差值对所有地址恒定，
@@ -1080,6 +1343,25 @@ bool km_locate_linear_map(void)
     const uint64_t kpmap = kfd->info.kaddr.kernel_pmap;
 
     char note[192] = {};
+
+    /*
+     * 首选：从 pmap 的 tte/ttep 直接自举 delta。
+     *
+     * 这一步**不依赖任何页表遍历**，所以不受「walk 要 delta、delta 又要 walk」
+     * 那个死循环的影响 —— 而下面那几条基于 walk 的路径，全都只有在 delta
+     * 已经算出来之后才可能成立。因此 bootstrap 必须排在它们前面。
+     *
+     * 设备实测（改之前）：pte: walk=FAIL、walk(kernel_proc)=MISS pa=0、
+     * linear=unresolved、self-read FAIL —— 全是这一个死结的后果。
+     */
+    if (km_bootstrap_linear_delta(g_current_pmap, note, sizeof(note))) {
+        g_linear_map_valid = true;
+        NSLog(@"[KernelMemory] linear map located: %@", @(note));
+        return true;
+    }
+    NSLog(@"[KernelMemory] pmap bootstrap failed: %@", @(note));
+
+    /* 次选：kernel_pmap 上 walk 一个内核 VA。 */
     if (kpmap != 0 && kfd->info.kaddr.kernel_proc &&
         km_compute_linear_delta(kpmap, kfd->info.kaddr.kernel_proc,
                                 "kernel_pmap+kernel_proc", note, sizeof(note))) {
