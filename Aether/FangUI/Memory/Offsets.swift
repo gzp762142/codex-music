@@ -32,21 +32,17 @@ struct Offsets {
     var gNames: UInt64
     /// UWorld**
     var gWorld: UInt64
-    /// 模块名（用来在进程内定位真实基址）
-    var moduleName: String
 
     static let defaultModuleBase: UInt64 = 0x1047D0000
     static let defaultGObjects: UInt64   = 0x111251B00
     static let defaultGNames: UInt64     = 0x111FBA198
     static let defaultGWorld: UInt64     = 0x11148B608
-    static let defaultModuleName         = "ShadowTrackerExtra"
 
     static func load() -> Offsets {
         var o = Offsets(moduleBase: defaultModuleBase,
                         gObjects: defaultGObjects,
                         gNames: defaultGNames,
-                        gWorld: defaultGWorld,
-                        moduleName: defaultModuleName)
+                        gWorld: defaultGWorld)
 
         let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
         guard let url = dir?.appendingPathComponent("offsets.txt"),
@@ -63,7 +59,6 @@ struct Offsets {
             case "GObjects": if let v = parseHex(val) { o.gObjects = v }
             case "GNames": if let v = parseHex(val) { o.gNames = v }
             case "GWorld": if let v = parseHex(val) { o.gWorld = v }
-            case "模块名", "moduleName": o.moduleName = val
             default: break
             }
         }

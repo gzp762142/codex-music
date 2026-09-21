@@ -16,9 +16,6 @@
 /// 建立内核读写能力。成功返回 true；失败时 *err 写入可读原因（失败不崩）。
 bool km_init(const char **err);
 
-/// 释放内核读写能力与所有内核侧状态。
-void km_deinit(void);
-
 /// 当前是否已就绪。
 bool km_ready(void);
 
@@ -59,11 +56,6 @@ uint64_t km_current_proc(void);
 /// `struct proc` 内 `p_fd->fd_ofiles` 的偏移（取自 libkfd 的版本表）。
 /// 内核层未就绪、或当前内核版本不匹配任何表项时返回 0。
 uint64_t km_proc_fd_ofiles_offset(void);
-
-/// `struct proc` 内 `p_list.le_prev` 的偏移（取自 libkfd 的版本表，目标机为 8）。
-/// 给 KernelSlide 的 allproc 锚点用：沿 le_prev 从 current_proc 走到 allproc 链头。
-/// 内核层未就绪、或当前内核版本不匹配任何表项时返回 0。
-uint64_t km_proc_p_list_le_prev_offset(void);
 
 #pragma mark - 给 KernelPhysWindow 的四个只读接线
 /*
@@ -134,9 +126,8 @@ uint64_t km_kernel_page_size(void);
  * 所在那一段的偏移，不是全地址恒定的差值（见 KernelMemory.m 里
  * km_bootstrap_linear_delta 的注释与 bug_type 210 的 panic 证据）。
  *
- * 基准没验通时 km_linear_map_ready() 返回 false，三处读路径入口
- * （km_translate / km_read_process / km_write_process）一律直接失败，不下探到
- * kread / kwrite —— 读不出数据是预期状态，把无效地址送进内核解引用会彩屏。
+ * 基准没验通时读路径入口一律直接失败，不下探到 kread / kwrite ——
+ * 读不出数据是预期状态，把无效地址送进内核解引用会彩屏。
  *
  * 止损补上的四件事（1-3 条是第二轮，第 4 条是紧接着的第三轮；只补闸门是不够的，
  * 闸门挡被检查的那一处、挡不住数据流；细节与两次 panic 的第一手证据见 KernelMemory.m）：
@@ -146,7 +137,7 @@ uint64_t km_kernel_page_size(void);
  *   2. 闸门下沉到**使用点**：km_page_table_walk / km_pte_for 在下钻
  *      （拼 `PA + g_linear_delta`）之前自己检查 g_linear_map_valid。
  *      由此全局不变式成立：!g_linear_map_valid ⟹ g_linear_delta == 0。
- *   3. 内核 base 反向扫描停用（KM_ENABLE_KBASE_SCAN = 0）：它是唯一一处
+ *   3. 内核 base 反向扫描整段删除：它是唯一一处
  *      "在未验证地址上**连续盲扫**"的内核访问，且不使用 delta —— delta 闸门拦不住它。
  *      代价是 g_kernel_base 恒为 0（只有诊断消费者）。
  *   4. p_list 链表遍历停用（KM_ENABLE_PLIST_WALK = 0）：它同样**不使用 delta**
@@ -168,8 +159,8 @@ uint64_t km_kernel_page_size(void);
 /// 区分办法：km_proc_lookup_blocker() 非 NULL 时，除 self pid 外的一切查询
 /// 都必然返回 0，与目标进程的状态无关；它为 NULL 时，0 才是"真的没找到"。
 ///
-/// 注意上层现状（本轮不动 MemoryProbe.swift / SilentProbe.swift）：
-/// 它们把 0 一律渲染成「内核里找不到 pid 的 proc」，在当前配置下那是误报。
+/// 注意上层现状（`MemoryProbe.attachPort` 这一处文案本轮未改）：
+/// 它把 0 一律渲染成「内核里找不到 pid 的 proc」，在当前配置下那是误报。
 /// 面板还有一条独立的出口 —— km_self_test 报告里的 procForPid 行常驻首行，
 /// 那里写的是真实原因。
 uint64_t km_proc_for_pid(int32_t pid);
@@ -183,14 +174,8 @@ const char *km_proc_lookup_blocker(void);
 /// out 直接传缓冲指针 —— Swift 侧用 withUnsafeMutableBytes 传入 [UInt8] 即可。
 bool km_read_process(int32_t pid, uint64_t uaddr, void *out, uint64_t len);
 
-/// 写目标进程一个用户态虚拟地址。len 必须是 8 的倍数（写原语逐 64 位落笔）。
-bool km_write_process(int32_t pid, uint64_t uaddr, const void *in, uint64_t len);
-
 /// 把目标进程的 VA 翻译成 PA。失败返回 false（该页未映射）。
 bool km_translate(int32_t pid, uint64_t uaddr, uint64_t *pa_out);
-
-/// 线性映射基准是否已定位并通过自校验。
-bool km_linear_map_ready(void);
 
 /// 定位并校验线性映射基准。需要在 km_init 成功之后调用。
 bool km_locate_linear_map(void);

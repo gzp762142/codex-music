@@ -32,23 +32,6 @@ final class MemoryProbe {
     /// mach_port_deallocate：释放我们自己持有的 port right。
     private typealias PortDeallocateFn = @convention(c) (MachPort, MachPort) -> KernReturn
     private static let portDeallocateFn = symbol("mach_port_deallocate", as: PortDeallocateFn.self)
-    /// vm_region_recurse_64：枚举目标地址空间里的 region（**不读内存内容**）。
-    ///
-    /// 比 mach_vm_region 少一个 flavor 参数、多一个 nesting_depth，
-    /// info 是 vm_region_submap_info_64（19 个字）。
-    /// 注意：mach_vm_region 因为在它上面配错过参数（count=0 / info 指针类型），
-    /// 连崩两次，所以这里在真正枚举目标之前**先对自己进程枚举一次**做参数自检。
-    private typealias VmRegionRecurseFn = @convention(c) (
-        UInt32,                              // task
-        UnsafeMutablePointer<UInt64>,        // &address (in/out)
-        UnsafeMutablePointer<UInt64>,        // &size
-        UnsafeMutablePointer<UInt32>,        // &nesting_depth
-        UnsafeMutableRawPointer,             // info
-        UnsafeMutablePointer<UInt32>         // &infoCnt（字数）
-    ) -> Int32
-
-    private static let vmRegionRecurseFn = symbol("vm_region_recurse_64", as: VmRegionRecurseFn.self)
-
     /// proc_regionfilename：问「这个地址属于哪个文件」。
     /// 只要 pid + 地址，不需要 mach_vm_region —— 正好绕开那个我连错两次的调用。
     /// iOS 无 <libproc.h>，符号同样只能 dlsym 取。
@@ -78,19 +61,6 @@ final class MemoryProbe {
     private static let machVmAllocateFn = symbol("mach_vm_allocate", as: MachVmAllocateFn.self)
 
 
-    /// 符号自检。读取路径已切到内核，这里只关心仍在用的 Mach 符号。
-    ///
-    /// `vm_alloc` / `mlock` 两项是为**窗口层**加的：窗口建不起来时第一件事就是看这四个
-    /// 符号里缺了哪个 —— 缺符号和调用失败是两种完全不同的病，报告里必须能分开。
-    static var symbolSummary: String {
-        let a = vmRegionRecurseFn != nil ? "vm_region=OK" : "vm_region=nil"
-        let b = procRegionFileNameFn != nil ? "regionfile=OK" : "regionfile=nil"
-        let c = vmDeallocateFn != nil ? "vm_dealloc=OK" : "vm_dealloc=nil"
-        let d = machVmAllocateFn != nil ? "vm_alloc=OK" : "vm_alloc=nil"
-        let e = mlockFn != nil ? "mlock=OK" : "mlock=nil"
-        return "\(a) \(b) \(c) \(d) \(e)"
-    }
-
     /// 把 kern_return_t 翻成人和自己能读懂的话。
     ///
     /// **数值按 XNU 的 mach/kern_return.h 来，别照印象写**：
@@ -108,27 +78,6 @@ final class MemoryProbe {
         case 16: return "KERN_INVALID_TASK"
         default: return "ret=\(kr)"
         }
-    }
-
-    // MARK: - 单步动作
-
-    /// 第 1 步：只解析符号，不调用任何东西。
-    /// 只取端口并返回它（**不读任何内存**），供静默测试用。
-    /// 返回 nil 表示符号缺失或取端口失败。
-    ///
-    /// 注意返回值写 UInt32 而不是私有别名 MachPort：
-    /// internal 函数的签名不能暴露 private typealias，否则编译报
-    /// "method must be declared private because its parameter uses a private type"。
-    // acquirePort 已移除：内核路径不产生 port，目标进程由 km_proc_for_pid 定位。
-
-    /// 第 1 步：只报告符号解析情况，不调用任何东西。
-    static func stepSymbols() -> String { symbolSummary }
-
-    /// 第 2 步：确认内核读路径对目标 pid 可用（等价于原先的「取到端口」）。
-    static func stepDlsym(pid: Int32) -> String {
-        let proc = km_proc_for_pid(pid)
-        guard proc != 0 else { return "内核: 找不到 pid=\(pid) 的 proc" }
-        return "内核: proc=0x\(String(proc, radix: 16))"
     }
 
     // MARK: - 读（全部 static：纯函数，不需要实例）
@@ -325,7 +274,7 @@ final class MemoryProbe {
 
     /// 已经建立起来的映射：游戏地址 → 我们的本地地址。
     private static var mappedRanges: [(gameBase: UInt64, size: UInt64, localBase: UInt64)] = []
-    /// mappedRanges 是否已按 gameBase 排好序 —— localAddress 走二分，靠这个标志决定先不先排。
+    /// mappedRanges 是否已按 gameBase 排好序 —— mappedRecord 走二分，靠这个标志决定先不先排。
     private static var rangesSorted = true
 
     /// 释放本进程地址空间里**所有**已建立的映射。
@@ -374,7 +323,7 @@ final class MemoryProbe {
     /// 样本里它是 `__DATA_CONST,__got+0x468`（54 个函数共用，包括全部窗口函数），
     /// 由外挂自己拿到后一直持有。本工程在内核路径下不产生 port（见 attachPort 的注释），
     /// 所以这条路要等**第二步**和「窗口页指向目标物理页」一起接回来 —— 接的时候
-    /// `downgradeToReadOnly` 是现成的（它还在，只是第一步暂时没有调用者）。
+    /// 降权失败信息的写入点（详情见 `loadWindow` 类路径里那次 mach_vm_protect 复查）。
     ///
     /// 现在唯一成立的路径是「本地窗口 + 本地读」：见下面的窗口层
     /// （buildWindow / stepWindowProbe）。这不是两套并行实现 —— 跨进程这条路
@@ -411,11 +360,6 @@ final class MemoryProbe {
             }
         }
         return nil
-    }
-
-    /// 只要本地地址的薄封装 —— 判定逻辑只有上面那一处，避免两套二分各自演化。
-    static func localAddress(for gameAddress: UInt64) -> UInt64? {
-        mappedRecord(for: gameAddress)?.localBase
     }
 
     /// 当前会话的 pid —— 按需映射时要用它取端口。
@@ -798,7 +742,7 @@ final class MemoryProbe {
          *
          * `set_maximum = 1` 是刻意的：只降 current 的话"上限"里还留着写权限，
          * 之后一句 mach_vm_protect 就能把 W 提回来。把上限本身压掉，写权限才真拿不回来
-         * —— 与 downgradeToReadOnly 里的取舍一致。
+         * —— 与建窗收尾压只读那里的取舍一致。
          *
          * 压完之后**复查**一次实际权限：返回成功不等于区域里每一页都成了只读，
          * 报告里那个 0x1 必须是查出来的，不能是"调用返回 0 所以应该是"。
@@ -1163,24 +1107,6 @@ final class MemoryProbe {
         readSmart(pid: pid, address: address, count: count)
     }
 
-    /// 已建立映射的摘要 —— 第一步**没有调用者**：跨进程映射停用后 `mappedRanges` 恒为空，
-    /// 面板上现在显示窗口状态（见 windowLine / windowProtectionLine）。
-    /// 留着是因为第二步接回映射后，所有报告行又要用它。
-    static var mappedSummary: String {
-        mappedRanges.isEmpty ? "无映射" : "\(mappedRanges.count) 块"
-    }
-
-    /// 从已映射的本地内存读，**零内核调用**。
-    /// 只有确认过地址落在映射区间内才允许调用 —— 传错地址会直接让我们自己 SIGSEGV。
-    ///
-    /// 第一步也没有调用者：窗口层的读走 verifyWindowLocked（它要按页整页比对，
-    /// 这里这种"读一小段"的形状对不上）。第二步从窗口读任意字段时，用的就是它。
-    private static func readMapped(_ localAddr: UInt64, _ count: Int) -> [UInt8] {
-        guard count > 0, count <= 4096 else { return [] }
-        guard let base = UnsafeRawPointer(bitPattern: UInt(localAddr)) else { return [] }
-        return Array(UnsafeRawBufferPointer(start: base, count: count))
-    }
-
     /// 每次动作开头清零。
     private static func resetCounters() {
         probeCalls = 0
@@ -1212,24 +1138,6 @@ final class MemoryProbe {
             .appendingPathComponent(stageLatestName)
     }
 
-    /// 当前阶段：后台线程写、UI 轮询读 —— 面板上能实时看到走到哪一步。
-    /// 加锁是因为它跨线程：`String` 是值类型，无锁并发读写可能读到撕裂的值。
-    private static let stageLock = NSLock()
-    private static var _currentStage = ""
-
-    static var currentStage: String {
-        stageLock.lock()
-        defer { stageLock.unlock() }
-        return _currentStage
-    }
-
-    /// 标记当前步骤：一份进内存（UI 实时看），一份**异步**落盘。
-    ///
-    /// 落盘必须异步 —— 它是给"崩了之后回查"用的，绝不能反过来拖住调用它的读取线程。
-    /// 一旦文件 I/O 卡住，整个读取链就停在原地，而面板上只会看到进度停在第一步
-    /// （实测就是这样：状态停在 "映射: 建立中…"，后台却一步都没往下走）。
-    private static let stageQueue = DispatchQueue(label: "aether.stage", qos: .userInitiated)
-
     /// 进度回调：由调用方（UI）挂上来。
     ///
     /// 为什么要这条线：进度原本是"写内存 + 主线程 Timer 轮询显示"。
@@ -1239,10 +1147,10 @@ final class MemoryProbe {
     /// 不依赖 Timer，也不依赖主线程还在正常跑。
     static var onStage: ((String) -> Void)?
 
-    /// 标记当前步骤。**只写内存 + 推 UI，一个文件系统调用都不做。**
+    /// 标记当前步骤。**只做一件事：把这一步推给 UI。**
     ///
     /// 这里原来还有一份同步落盘（给"崩溃后回查"用）。实测它把整条链卡死了：
-    /// 面板停在 `枚举 · A 函数已进入` 再也不动 —— `_currentStage` 在函数开头就写好了
+    /// 面板停在 `枚举 · A 函数已进入` 再也不动 —— 那一行在函数开头就发出去了
     /// （所以面板显示得出来），然后函数卡死在后面的文件写入里没返回，
     /// 于是它之后的 `lines.append` / `resetCounters()` 一行都没执行。
     ///
@@ -1254,10 +1162,6 @@ final class MemoryProbe {
     /// 结论：观测工具不能长在被观测的路径上，尤其是带 I/O 的那种。
     /// 落盘可以去，实时进度看面板（onStage 推的那条线，不碰文件系统）。
     static func stageMark(_ stage: String) {
-        stageLock.lock()
-        _currentStage = stage
-        stageLock.unlock()
-
         if let cb = onStage {
             DispatchQueue.main.async { cb(stage) }
         }
@@ -1419,7 +1323,6 @@ final class MemoryProbe {
     /// 而 `readSmart` 的快路径用的是 `activePid`，读的其实是另一个进程。
     /// 现在只有一个真相来源。
     static var isAttached: Bool { activePid != 0 }
-    static var attachedPid: Int32 { activePid }
 
     /// 挂载目标进程。**同一个 pid 重复调用直接复用。**
     ///
@@ -1785,8 +1688,7 @@ final class MemoryProbe {
     /// 取端口的地方一律用 `defer { dropPort(p) }` 配对。
     // dropPort 已移除：不再持有 task port，没有 right 需要释放。
 
-    /// 给面板调用方用的释放入口（SilentProbe 这类需要跨回调持有端口的场景）。
-    // releasePort 已移除：内核路径不产生 port。
+    // 内核路径不产生 port，也就没有任何 right 需要跨回调持有或释放。
 
     // MARK: - 地址换算（唯一入口）
 
@@ -1831,93 +1733,6 @@ final class MemoryProbe {
         guard rk2 == KERN_SUCCESS else { return (false, "filetype读失败/\(rk2)") }
         guard filetype == 2 else { return (false, "filetype=\(filetype)") }
         return (true, "MH_EXECUTE")
-    }
-
-    // MARK: - 面板动作
-
-    /// 读证：在 dump 记录的模块基址处读 Mach-O 头。
-    /// 一次读取，不扫描 —— 扫大范围是之前出问题的来源。
-    static func stepReadProof(pid: Int32) -> String {
-        let off = Offsets.load()
-
-        let (rk, magic) = readAt(pid: pid, address: MachVmAddress(off.moduleBase))
-        guard rk == KERN_SUCCESS else {
-            return "读证: 读 0x\(String(off.moduleBase, radix: 16)) 失败 \(describe(rk))"
-        }
-        let isMachO = (magic == 0xFEEDFACF)
-        return "读证: 0x\(String(off.moduleBase, radix: 16)) magic=0x\(String(magic, radix: 16)) "
-            + (isMachO ? "是Mach-O(基址正确,读通)" : "不是Mach-O(基址被ASLR搬了)")
-    }
-
-    /// 定点读：**第一次真实点读**，全部加起来约 20 字节，不写循环、不做扫描。
-    ///
-    /// ```
-    /// slot = runtime(OFFSET_GOBJECTS)     // FUObjectArray
-    /// slot + 0x118 → NumElements (UInt32)
-    /// slot + 0xE0  → chunk0      (UInt64)
-    /// chunk0       → 第一个 FUObjectItem 的 Object (UInt64, FUObjectItem::Object = 0)
-    /// ```
-    ///
-    /// 验收：NumElements 是六位数（10 万 ~ 200 万）即表示 image base 与换算公式同时正确。
-    /// 前提：先点过「找村口」—— base/slide 存在这份 static 状态里，不跨进程启动保留。
-    static func stepFixedRead(pid: Int32) -> String {
-        resetCounters()
-        stageMark("定点读")
-        guard baseReady(for: pid) else {
-            return "定点读: 没有当前进程的基址 —— 先点「跑一次」（它会自动完成找基址）"
-        }
-
-        let s = imageSlide
-        let off = Offsets.load()
-        let slot = runtime(off.gObjects, slide: s)
-
-        // ① NumElements（UInt32）—— 唯一的验收数字
-        let (rkNum, num) = readAt(pid: pid, address: MachVmAddress(slot &+ 0x118))
-        guard rkNum == KERN_SUCCESS else {
-            return "定点读: NumElements 读失败 \(describe(rkNum)) @0x\(String(slot &+ 0x118, radix: 16))"
-        }
-        // ② chunk0 指针（UInt64）
-        let (rkChunk, chunk0) = readRaw(pid: pid, address: MachVmAddress(slot &+ 0xE0))
-        // ③ 第一个 FUObjectItem 的 Object（UInt64）
-        var obj0: UInt64 = 0
-        var objNote = ""
-        if rkChunk == KERN_SUCCESS, chunk0 != 0 {
-            let (rkObj, v) = readRaw(pid: pid, address: MachVmAddress(chunk0))
-            if rkObj == KERN_SUCCESS {
-                obj0 = v
-            } else {
-                objNote = "obj0 读失败 \(describe(rkObj))"
-            }
-        } else {
-            objNote = "chunk0 读失败 \(describe(rkChunk))"
-        }
-
-        let n = Int(num)
-        let hit = (n >= 100_000 && n <= 2_000_000)
-        var lines: [String] = []
-        lines.append("定点读: NumElements=\(n) " + (hit ? "✓ 命中（六位数）" : "✗ 数量异常"))
-        lines.append("base=0x\(String(imageBase, radix: 16)) slide=0x\(String(s, radix: 16))")
-        lines.append("slot=0x\(String(slot, radix: 16)) = slide + OFFSET_GOBJECTS")
-        lines.append(rkChunk == KERN_SUCCESS
-            ? "chunk0=0x\(String(chunk0, radix: 16))"
-            : "chunk0 读失败 \(describe(rkChunk))")
-        lines.append(objNote.isEmpty
-            ? "obj0=0x\(String(obj0, radix: 16))" + (obj0 == 0 ? "（空槽）" : "")
-            : objNote)
-        if !hit {
-            // 数值异常时把两种病因分开：base/slide 错，还是字段偏移错。
-            let hi = imageBase &+ 0x13000000
-            let slotInRange = (slot >= imageBase && slot < hi)
-            let chunkLooksHeap = (chunk0 >= 0x120000000 && chunk0 < 0x140000000)
-            lines.append("诊断: slot" + (slotInRange
-                ? " 在映像区间内 → base/slide 对得上，可疑点转到字段偏移 0x118/0xE0"
-                : " 不在映像区间 → base 或换算公式错"))
-            lines.append("诊断: chunk0" + (chunkLooksHeap
-                ? " 像堆指针（0x12xxxxxxx 段）"
-                : " 不像堆指针（不落在 0x120000000~0x140000000）"))
-        }
-        lines.append(costLine())
-        return lines.joined(separator: "\n")
     }
 
     // MARK: - GNames（名字表）
@@ -3149,37 +2964,6 @@ final class MemoryProbe {
         return String(format: "%.1f", v)
     }
 
-    /// 单点区域归属：对 dump 基址问一次「这属于哪个文件」。
-
-    /// 单点区域归属：对 dump 基址问一次「这属于哪个文件」。    ///
-    /// 零风险探测：一次调用、不遍历、不写。
-    /// 收益却很大 ——
-    ///   返回 ShadowTrackerExtra 路径 → 该地址在游戏映像内，且符号可用
-    ///   返回别的路径               → 那个地址属于别的映射
-    ///   返回 0 / 符号缺失          → 这条路不通，及早知道
-    static func stepRegionName(pid: Int32) -> String {
-        let off = Offsets.load()
-        guard let fn = procRegionFileNameFn else {
-            return "区域归属: proc_regionfilename 符号缺失"
-        }
-        var buf = [UInt8](repeating: 0, count: 1024)
-        // buf.count 必须在闭包外取：withUnsafeMutableBytes 已对 buf 取独占访问，
-        // 闭包内再读 buf.count 会触发 "overlapping accesses" 编译错误。
-        let cap = UInt32(buf.count)
-        let addr = off.moduleBase
-        let n = buf.withUnsafeMutableBytes { raw -> Int32 in
-            guard let base = raw.baseAddress else { return 0 }
-            return fn(pid, addr, base, cap)
-        }
-        guard n > 0 else {
-            return "区域归属: 0x\(String(addr, radix: 16)) → 返回 \(n)（该地址不在任何区域?)"
-        }
-        let path = String(decoding: buf.prefix { $0 != 0 }, as: UTF8.self)
-        let short = path.split(separator: "/").last.map(String.init) ?? path
-        let isGame = path.lowercased().contains("shadowtracker")
-        return "区域归属: 0x\(String(addr, radix: 16)) → \(short) \(isGame ? "是游戏映像" : "不是游戏")"
-    }
-
     // MARK: - 找基址（枚举 region，零内存读取）
 
     /// **vm_region_64** —— 样本用的就是这个，不是 `vm_region_recurse_64`。
@@ -3223,22 +3007,6 @@ final class MemoryProbe {
         }
         guard kr == KERN_SUCCESS, size > 0 else { return (false, 0, 0, 0) }
         return (true, size, info[0], UInt32(bitPattern: info[5]))
-    }
-
-    /// 问某地址属于哪个文件（proc_regionfilename 封装）
-    private static func regionFile(pid: Int32, addr: UInt64) -> String? {
-        guard let fn = procRegionFileNameFn else { return nil }
-        var buf = [UInt8](repeating: 0, count: 1024)
-        let cap = UInt32(buf.count)
-        let n = buf.withUnsafeMutableBytes { raw -> Int32 in
-            guard let base = raw.baseAddress else { return 0 }
-            return fn(pid, addr, base, cap)
-        }
-        guard n > 0 else { return nil }
-        // 不假定内核一定写 NUL 终止符：按 0 截断再解码。
-        // 用 String(cString:) 的话，缓冲区被写满时它会一路读到越界。
-        let s = String(decoding: buf.prefix { $0 != 0 }, as: UTF8.self)
-        return s.isEmpty ? nil : s
     }
 
     /// 找基址（主二进制）。**只用 vm_region_recurse_64 枚举 + 两次 Mach-O 小读。**

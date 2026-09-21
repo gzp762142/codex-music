@@ -10,9 +10,6 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     static let rowHeight: CGFloat = 22
 
     private let scanner = ProcessScanner()
-    private let probe = MemoryProbe()
-    /// 静默测试：只持端口、零读取，看目标是否自己死
-    private let silent = SilentProbe()
     private var entries: [ProcessScanner.ProcEntry] = []
     /// 非空时表格显示这些文本行（Jetsam 报告等），否则显示进程列表
     private var extraRows: [String] = []
@@ -54,14 +51,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     /// 跑一次：刷新 → 找村口 → 世界 → 名字池，一条链自动走完
     private let btnAuto = UIButton(type: .system)
     private let btnRefresh = UIButton(type: .system)
-    private let btnSym = UIButton(type: .system)
-    private let btnDlsym = UIButton(type: .system)
     private let btnProof = UIButton(type: .system)
     private let btnCrashFile = UIButton(type: .system)
-    /// 定点读：用「找村口」存下的 base/slide 换算后点读 GObjects 链
-    private let btnFixed = UIButton(type: .system)
-    /// GNames：把 FName 索引解成字符串（验收：0/1/2 → None/ByteProperty/IntProperty）
-    private let btnNames = UIButton(type: .system)
     /// 对象：从对象表取前 16 个，解出「类名 + 对象名」
     private let btnObjects = UIButton(type: .system)
     /// 世界：GWorld → PersistentLevel → Actors（三次小读，走热页）
@@ -80,15 +71,6 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     private let btnWindow = UIButton(type: .system)
     /// 枚举：只枚举几个 region 打原始字段，验证 vm_region_64 这个调用本身
     private let btnEnum = UIButton(type: .system)
-    /// 读模块头：dump 基址处读 Mach-O，判断 ASLR 是否搬过基址
-    /// 扫基址：128MB 内找 Mach-O magic（比上一版范围小）
-    private let btnScan = UIButton(type: .system)
-    /// 区域归属：问「这个地址属于哪个文件」（零风险探测）
-    private let btnRegion = UIButton(type: .system)
-    /// 静默测试：只持端口零读取（切掉"端口本身是否致命"这一类假设）
-    private let btnSilent = UIButton(type: .system)
-    /// Jetsam 日志：文件名不带进程名，必须按 JetsamEvent 前缀扫
-    private let btnJetsam = UIButton(type: .system)
     /// XPF：读设备的 kernelcache 并解析 physrw 要用的那批内核符号。
     /// 与「窗口」同类 —— 不要求 pid、不依赖内核读写层，可单独跑。
     private let btnXpf = UIButton(type: .system)
@@ -253,8 +235,6 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     private var probeBusy = false
     /// 上一次读取的发起时刻 —— 用来判断它是不是已经被内核永久堵住了。
     private var probeStarted = Date.distantPast
-    /// 轮询后台进度的定时器：面板上实时显示走到哪一步。
-    private var stageTimer: Timer?
     /// 状态机每拍都会回调，但列表没必要跟着 20Hz 重刷 —— 节流到 4Hz。
     private var lastTrackerUI = Date.distantPast
     /// 冷启动只自动开启一次。
@@ -330,8 +310,6 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
                 guard let s = self else { return }
                 MemoryProbe.onStage = nil
                 s.probeBusy = false
-                s.stageTimer?.invalidate()
-                s.stageTimer = nil
                 if bgTask != .invalid {
                     UIApplication.shared.endBackgroundTask(bgTask)
                     bgTask = .invalid
@@ -662,83 +640,11 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         probeLabel.textColor = gpid != 0 ? accent : warnText
     }
 
-    @objc private func onSym() {
-        probeLabel.text = "符号 " + MemoryProbe.stepSymbols()
-        probeLabel.textColor = idleText
-    }
-
-    @objc private func onDlsym() {
-        guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
-        runProbe("dlsym: 读取中…") { MemoryProbe.stepDlsym(pid: $0) }
-    }
-
-    @objc private func onProof() {
-        guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
-        runProbe("读证: 读取中…") { MemoryProbe.stepReadProof(pid: $0) }
-    }
-
-    /// 定点读：用「找村口」存下的 base/slide 换算后点读 GObjects 链（约 20 字节）。
-    @objc private func onFixedRead() {
-        guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
-        runProbe("定点读: 读取中…") { MemoryProbe.stepFixedRead(pid: $0) }
-    }
-
-    /// 静默测试：拿到端口后什么都不读，看目标会不会自己死。
-    /// 再点一次 = 手动停止。
-    @objc private func onSilent() {
-        guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
-        if silent.isRunning { silent.stop(); probeLabel.text = "静默测试: 手动停止"; return }
-
-        silent.onTick = { [weak self] sec, alive in
-            guard let s = self else { return }
-            s.probeLabel.text = "静默 \(sec)s · \(alive ? "存活" : "已消失")"
-            s.probeLabel.textColor = alive ? s.idleText : s.warnText
-        }
-        silent.onFinish = { [weak self] sec, aliveAtEnd, gotPort in
-            guard let s = self else { return }
-            let note = gotPort ? "端口已持有" : "端口未拿到"
-            s.probeLabel.text = aliveAtEnd
-                ? "静默\(sec)s 全程存活 → 端口本身不致命[\(note)]"
-                : "静默\(sec)s 时游戏消失 → 病根在端口/进程状态，不在读取[\(note)]"
-            s.probeLabel.textColor = aliveAtEnd ? s.accent : s.warnText
-        }
-        probeLabel.text = "静默测试启动：只持端口，零读取，120s"
-        probeLabel.textColor = idleText
-        silent.start(pid: gpid, seconds: 120)
-    }
-
-    /// Jetsam 日志：完整报告填进表格（可滚动）；再点一次返回进程列表
-    @objc private func onJetsam() {
-        if !extraRows.isEmpty {
-            extraRows = []
-            table.reloadData()
-            probeLabel.text = "已返回进程列表"
-            probeLabel.textColor = idleText
-            return
-        }
-        extraRows = JetsamLogReader.report()
-        table.reloadData()
-        probeLabel.text = "Jetsam 报告 \(extraRows.count) 行已填入列表（可滚动）"
-        probeLabel.textColor = accent
-    }
-
-    /// 区域归属：一次调用问「dump 基址属于哪个文件」。
-    @objc private func onRegionName() {
-        guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
-        runProbe("区域归属: 读取中…") { MemoryProbe.stepRegionName(pid: $0) }
-    }
-
     /// 找村口：枚举 region（三条件）+ Mach-O 头校验；命中后记下 base/slide。
     /// 报告多行：第一行进状态行，全部行进可滚动列表。
     @objc private func onFindBase() {
         guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
         runProbe("找村口: 读取中…") { MemoryProbe.stepFindBase(pid: $0) }
-    }
-
-    /// 名字：解 FName 索引（验收点：0/1/2 → None / ByteProperty / IntProperty）。
-    @objc private func onNames() {
-        guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
-        runProbe("名字: 读取中…") { MemoryProbe.stepGNames(pid: $0) }
     }
 
     /// 对象：对象表前 16 个的「类名 + 对象名」（验证 Class/Name 这条链）。

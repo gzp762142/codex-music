@@ -34,10 +34,10 @@ static uint64_t g_handle = 0;
 /*
  * 对外就绪标志，与 g_handle 分开。
  *
- * g_handle 一赋上，内部那几个步骤（扫 kernel base、定位线性映射）就都跑得动
- * 了，所以它必须尽早发布；但"内部能跑"不等于"对外可用"。
+ * g_handle 一赋上，内部那几个步骤（定位线性映射）就都跑得动了，
+ * 所以它必须尽早发布；但"内部能跑"不等于"对外可用"。
  * km_ready() 若直接返回 g_handle != 0，则 km_init 还在同一个线程里跑
- * km_scan_kernel_base（最多几千次 kread）的时候，别的线程就能从
+ * km_locate_linear_map（内部有页表 walk）的时候，别的线程就能从
  * km_ready() 拿到 true 并开始并发 kread。
  *
  * 而 libkfd 的后端不是线程安全的：kread_sem_open 每次读都要改写自己
@@ -236,9 +236,6 @@ static bool g_linear_map_valid = false;
 /// 成功率。kopen 自身断言范围为 16 ... 3072（实测），2048 位于其中。
 static const u64 kfd_puaf_pages = 2048;
 
-/// kernel base 反向扫描上限，防止踩到未映射区域形成死循环。
-static const uint64_t kfd_kbase_scan_max = 0x4000000; /* 64 MB */
-
 #pragma mark - 工具
 
 bool km_is_kernel_address(uint64_t addr)
@@ -405,98 +402,6 @@ static BOOL km_version_is_supported(const char **why)
 static bool km_page_table_walk(uint64_t pmap, uint64_t va, uint64_t *pa_out);
 static bool km_pte_for(uint64_t pmap, uint64_t va, uint64_t *pte_pa_out);
 
-/*
- * ── kernel base 反向扫描：**默认停用**（KM_ENABLE_KBASE_SCAN = 0）──
- *
- * 为什么停用它（本次止损的第三处改动，与 delta 无关，必须单独堵）：
- *
- * 这条扫描是全文件唯一一处「**在未经任何验证的地址上连续盲扫**」的内核访问。
- * 它从 kernel_proc 逐页（0x4000）下退，每步做一次裸 kread()，直到读到
- * 0xFEEDFACF 或跑满 kfd_kbase_scan_max（64 MB = 4096 次）。
- * （另一类风险不是"扫一段地址"，而是"顺着内核写下的指针逐跳解引用" ——
- *  km_proc_for_pid 的 p_list 遍历。它有独立的开关，见 KM_ENABLE_PLIST_WALK：
- *  两者成因不同，一个开关管不住另一个。）
- * 它唯一的守卫是 `km_is_kernel_address(cursor)`，而那个函数只查
- * `(addr >> 48) == 0xFFFF` —— 对**地址空间里的空洞一律放行**（第二次彩屏
- * 的 far 就是落在这个"看起来合法"的区间里）。而 kread_sem_open 的工作方式
- * 是把目标地址交给内核去解引用，**目标页没映射就一定是内核态 data abort**，
- * 也就是彩屏重启：扫到空洞即死，没有"读到垃圾"这个中间态。
- *
- * 关键在于它的安全与否**不取决于 delta** —— 本次给 delta 补的闸门对它
- * 完全没有作用。它的安全性押在一个对具体内核布局的经验假设上：
- * "kernelcache 的 Mach-O 头恰好在 kernel_proc 之前 64 MB 以内，且这段区间
- * 连续映射、中间没有洞"。这个假设在常见机型上多半成立，但它**不可验证**，
- * 而且一旦不成立，后果是一块砖头（彩屏重启），不是一次失败。
- * 本工程当前的取舍是"再也经不起一次内核 panic"，所以不把彩屏押在布局假设上。
- *
- * 代价（刻意接受）：g_kernel_base 恒为 0。它在全工程只有两个消费者，
- * 都是纯诊断 —— AppDelegate.swift 打印 "kbase=0x..."，以及 km_self_test
- * 里那行 magic 检查会变成 "skipped (no kernel base)"。
- * 没有任何功能依赖它（地址翻译走的是 pmap 与页表，不经过 kernel base）。
- *
- * 恢复前提（两条都不满足，所以先停用）：
- *   ① 先有一条**可信**的线性映射基准 —— 本例里即 ptov_table 的等价物，
- *      能对任意 PA 证明它补回后的 KVA 落在映射区内；或
- *   ② 直接用页表 walk 逐级验证 cursor 已映射 —— 但下钻那一步现在被 delta
- *      闸门挡死（见 km_page_table_walk 下钻处的注释），在基准验通之前走不通。
- * 也就是说：恢复扫描与恢复线性映射基准是同一件事的两个面。
- * 现在把它留成编译期开关而不是删掉，是为了让这条推理和样本做法都还在原处，
- * 将来真的拿到 ① 或 ② 时改一个数字就能重新打开。
- */
-#define KM_ENABLE_KBASE_SCAN 0
-
-/// 从 kernel_proc 向下找到 kernelcache 的 Mach-O 头。
-///
-/// 样本做法：拿一个内核 VA、页对齐、每步退 16 KB、读 4 字节比 0xFEEDFACF。
-/// 样本用的是编译期写死的锚点常量；这里改用它已经掌握的真实内核地址
-/// （info_run 反查出来的 kernel_proc），省掉那张必须逐版本重取的常量表。
-///
-/// **本函数当前被 KM_ENABLE_KBASE_SCAN 停用**，理由见上方的长注释。
-/// 保留函数体而不是删掉：它是"扫描拿 kernel base"这条路线的唯一实现，
-/// 删了之后恢复的人还得从头写一遍；留着更有价值。
-static uint64_t km_scan_kernel_base(uint64_t anchor)
-{
-    if (!KM_ENABLE_KBASE_SCAN) {
-        /*
-         * 停用态：直接返回 0（= 未扫到）。调用方 km_init 对此已有降级处理
-         * （"kernel base scan missed; kread/kwrite still usable"），
-         * 所以这里返回 0 不会把初始化判失败。
-         */
-        (void)anchor;
-        return 0;
-    }
-
-    if (anchor == 0) {
-        return 0;
-    }
-
-    const uint64_t page = 0x4000; /* arm64 16 KB 内核页 */
-    uint64_t cursor = anchor & ~(page - 1);
-
-    for (uint64_t walked = 0; walked < kfd_kbase_scan_max; walked += page) {
-        if (cursor < page || !km_is_kernel_address(cursor)) {
-            break;
-        }
-
-        /*
-         * 用公共 kread()：它按 krkw_init 选定的后端分发，
-         * 所以这里不能写死某个后端（早先写的是 kread_sem_open_kread_u32）。
-         *
-         * 注意这一句就是上面说的"盲扫"：cursor 只过了形态检查，
-         * 没做过任何映射验证。重新打开这个开关之前，先解决那个问题。
-         */
-        uint32_t magic = 0;
-        kread((u64)g_handle, cursor, &magic, sizeof(magic));
-        if (magic == 0xFEEDFACF) {
-            return cursor;
-        }
-
-        cursor -= page;
-    }
-
-    return 0;
-}
-
 #pragma mark - 对外接口
 
 bool km_init(const char **err)
@@ -514,7 +419,7 @@ bool km_init(const char **err)
      * 置位放在最前面，是为了让失败路径和提前 return 的路径（版本门、
      * kopen 返回 0）也一并覆盖 —— 只覆盖成功路径等于没修。
      * 更早跑过的调用返回的是"当前句柄是否有效"，不再假装成功：老写法在
-     * km_deinit 之后再调 km_init 也会返回 true，而那时 g_handle 已经是 0。
+     * 句柄已被关掉之后再调 km_init 也会返回 true，而那时 g_handle 已经是 0。
      */
     if (g_init_attempted) {
         return g_handle != 0;
@@ -707,18 +612,11 @@ bool km_init(const char **err)
      *
      * ① 紧接着的那两行 NSLog 读 kfd->info.kaddr.* —— **不是内核访问**。
      *    kfd 是用户态结构，那些字段是 info_run 用 kread 填进去的缓存值。
+     *    那之后 kernel base 只是一次纯用户态赋值（恒为 0），不是内核访问；
+     *    "在未验证地址上连续盲扫"那条路已整段删除，不再出现在本清单里。
      *
-     * ② km_scan_kernel_base(kernel_proc) —— 全文件唯一一处「在未验证的地址上
-     *    **连续**盲扫」。地址来自 kernel_proc（info_run 反查出来的真内核 VA），
-     *    逐页下退、最多 64 MB。**它完全不使用 g_linear_delta，所以 delta 闸门对它
-     *    无效** —— 这正是必须单独处理它的原因：已按 KM_ENABLE_KBASE_SCAN = 0
-     *    停用，理由与恢复前提见那个函数的注释。停用后此行恒返回 0，
-     *    落到下面那段"扫不到也不当失败"的降级分支。
-     *    （另一类"不用 delta 的内核读"是逐跳解引用内核指针，即 ④ 里的 p_list
-     *     遍历 —— 同样单独停用，见 KM_ENABLE_PLIST_WALK。）
-     *
-     * ③ km_locate_linear_map()，内部两段：
-     *    ③-1 km_bootstrap_linear_delta —— 读 pmap + 0x00 / pmap + 0x08。
+     * ② km_locate_linear_map()，内部两段：
+     *    ②-1 km_bootstrap_linear_delta —— 读 pmap + 0x00 / pmap + 0x08。
      *         地址是 g_current_pmap（info_run 反查出来的真 pmap），偏移是常量。
      *         它不依赖 delta；本次改动后它**不写任何全局**，
      *         算出来的 tte − ttep 只进诊断字符串。
@@ -730,14 +628,14 @@ bool km_init(const char **err)
      *         而它换回来的 tte / ttep 两个读数，是下次真出问题时**唯一**能
      *         反推"当时拿到的 pmap 长什么样"的证据。收益实、风险与基线同级，
      *         所以留着。真正危险的那些下钻/拼接已经被闸门挡在下面两步之外。
-     *    ③-2 四条 km_compute_linear_delta —— 每条内部第一步是
+     *    ②-2 四条 km_compute_linear_delta —— 每条内部第一步是
      *         km_page_table_walk(pmap, kernel_proc 或 current_proc)，
      *         而 walk 的**入口闸门**在基准未验通时直接失败：
      *         所以这四条路径当前**一次 kread 都不发**（两条 `walk failed` 日志）。
      *         （将来闸门放开，它们才会去读 pmap 的 tte 与顶层表 entry，
      *          那两次读的地址都出自内核自身写下的数据。）
      *
-     * ④ km_proc_for_pid(自己的 pid) —— **短路命中时**一次 kread 都不发：
+     * ③ km_proc_for_pid(自己的 pid) —— **短路命中时**一次 kread 都不发：
      *    条件是 `pid == kfd->info.env.pid && current_proc`，命中就直接返回
      *    info_run 已经反查好的 current_proc。
      *    **但短路要求 current_proc 非 0**：若 info_run 没能反查出它，
@@ -747,7 +645,7 @@ bool km_init(const char **err)
      *    也就是说：km_init 里现在**没有任何一条**会走链表遍历的路径了。
      *    余下的注意点是短路的那个前提必须成立：**current_proc 非 0**。
      *
-     * ⑤ g_kernel_ready = true —— 纯用户态赋值。
+     * ④ g_kernel_ready = true —— 纯用户态赋值。
      *
      * km_self_test **不在** km_init 里（AppDelegate 在 km_init 返回之后才调），
      * 它的内核访问单独列在那个函数里。
@@ -755,10 +653,11 @@ bool km_init(const char **err)
      * 一句话结论：改完之后 km_init 里没有任何一条路径能把**错算**的地址
      * （delta 参与拼出来的那种）送进 km_read64 / kread —— 那条路已被两道闸门
      * 加污染源封死；而两处"不使用 delta、因此闸门管不到"的路径也各自处理了：
-     * ③-1 保留（读的是 `g_current_pmap + {0, 8}`，与历史基线同址，且它换回的
-     * tte / ttep 是唯一能反推 pmap 形态的证据），④ 的链表遍历停用。
+     * 盲扫那条已整段删除，②-1 保留（读的是 `g_current_pmap + {0, 8}`，
+     * 与历史基线同址，且它换回的 tte / ttep 是唯一能反推 pmap 形态的证据），
+     * ③ 的链表遍历停用。
      * **剩下的那一处"未经映射验证"的读**必须写明，不能算已经解决：
-     *   · ③-1 里 bootstrap 对 pmap + {0, 8} 的两次诊断读。
+     *   · ②-1 里 bootstrap 对 pmap + {0, 8} 的两次诊断读。
      * 它的前提是"地址来自内核自己写下的数据 + 形态检查能挡住多数坏值"，
      * 缺的仍是一件东西：**证明某个地址确实已映射**的手段（ptov_table 等价物）。
      * 那不能用一次相减或一个形态检查补出来。
@@ -768,21 +667,18 @@ bool km_init(const char **err)
           (unsigned long long)kfd->info.kaddr.kernel_proc);
 
     /*
-     * 顺序对齐样本 physrw：先扫 kernel base，再做线性映射定位。
-     * 线性映射的基准要用到 kernel base 附近的确定地址，所以不能倒过来。
-     *
-     * 注意这一行现在**恒返回 0** —— 扫描已被 KM_ENABLE_KBASE_SCAN 停用
-     * （那是 km_init 里唯一一处"在未验证地址上连续盲扫"的内核访问，
-     * 与 delta 无关，所以 delta 闸门拦不住它；详见 km_scan_kernel_base 的注释）。
-     * 逐跳解引用那类（km_proc_for_pid 的 p_list 遍历）同样是"不用 delta"的，
-     * 已按 KM_ENABLE_PLIST_WALK = 0 单独停用 —— 两处都用同一个理由：没有映射验证。
+     * kernel base 恒为 0：反向扫描（唯一一处"在未验证地址上连续盲扫"的内核访问）
+     * 已经整段删除，g_kernel_base 不再有任何写入点。它现在只喂诊断：km_kernel_base()
+     * 的调用方 AppDelegate.swift 打印 "kbase=0x..."，以及 km_self_test 里那行
+     * magic 检查（恒走 "skipped (no kernel base)"）。没有任何功能依赖它 ——
+     * 地址翻译走的是 pmap 与页表，不经过 kernel base。
      */
-    g_kernel_base = km_scan_kernel_base(kfd->info.kaddr.kernel_proc);
-    NSLog(@"[KernelMemory] kernel base = %#llx (scanned)", (unsigned long long)g_kernel_base);
+    g_kernel_base = 0;
+    NSLog(@"[KernelMemory] kernel base = %#llx (scan removed)", (unsigned long long)g_kernel_base);
 
     if (g_kernel_base == 0) {
         /*
-         * 读写原语已经可用，只是没扫到 kernelcache 头。这不影响 kread/kwrite
+         * 读写原语已经可用，只是没有 kernelcache 头。这不影响 kread/kwrite
          * 本身，所以不当作初始化失败 —— kernel base 的消费者可以自行降级。
          */
         NSLog(@"[KernelMemory] kernel base scan missed; kread/kwrite still usable");
@@ -817,26 +713,13 @@ bool km_init(const char **err)
 
     /*
      * 到这里才算对外就绪。放在最后一行，是为了让 km_ready() 在
-     * km_scan_kernel_base / km_locate_linear_map 跑完之前一直返回 false ——
+     * km_locate_linear_map 跑完之前一直返回 false ——
      * 否则别的线程会在这些内部 kread 还在进行时并发进来，而 libkfd 后端
      * 不是线程安全的（kread 改自己的 psemnode，kwrite 与 kread 共用缓冲）。
      */
     g_kernel_ready = true;
 
     return true;
-}
-
-void km_deinit(void)
-{
-    /* 先撤就绪标志，再关句柄：顺序反了会让别的线程在 kclose 之后仍被放进来。 */
-    g_kernel_ready = false;
-
-    if (g_handle == 0) {
-        return;
-    }
-    kclose(g_handle);
-    g_handle = 0;
-    g_kernel_base = 0;
 }
 
 bool km_ready(void)
@@ -877,16 +760,6 @@ uint64_t km_proc_fd_ofiles_offset(void)
      */
     struct kfd *kfd = (struct kfd *)g_handle;
     return dynamic_info(proc__p_fd__fd_ofiles);
-}
-
-uint64_t km_proc_p_list_le_prev_offset(void)
-{
-    if (g_handle == 0) {
-        return 0;
-    }
-    /* 与 km_proc_fd_ofiles_offset 同型（包括那个"必须有同名局部变量 kfd"的理由）。 */
-    struct kfd *kfd = (struct kfd *)g_handle;
-    return dynamic_info(proc__p_list__le_prev);
 }
 
 /*
@@ -1145,7 +1018,7 @@ void km_self_test(char *out, size_t outSize)
 
     /*
      * procForPid 能力自述 —— 一行把"这一层被编译期开关整体停用"与"某个进程
-     * 真的不存在"分开。上层（MemoryProbe / SilentProbe）目前把 km_proc_for_pid
+     * 真的不存在"分开。上层（MemoryProbe）目前把 km_proc_for_pid
      * 的 0 一律写成「找不到该进程的 proc」，那份文案本轮不动，所以面板上唯一
      * 能说清真相的地方就是这一行 —— 它常驻首行（AppDelegate.kernelNote
      * 存的就是这份报告）。纯用户态读取：只查编译期开关，不发 kread。
@@ -1564,7 +1437,8 @@ static bool km_page_table_walk(uint64_t pmap, uint64_t va, uint64_t *pa_out)
          * ── 下钻闸门：拼地址之前必须确认基准可信（本次止损的第二处，唯一的安全边界）──
          *
          * 为什么必须拦在**这里**，而不是只靠调用方入口那四处闸门：
-         * km_translate / km_read_process / km_write_process / km_self_test 入口
+         * km_translate / km_read_process / km_write_process（该入口现已删除）/
+         * km_self_test 入口
          * 查的都是 g_linear_map_valid —— 那只能证明"调用者知道基准没验通"，
          * **不能证明 g_linear_delta 里没有脏值**。b581819 那次就是在四处入口
          * 都挂上闸门之后仍然彩屏的：污染源 bootstrap 在闸门之外，把
@@ -1590,7 +1464,7 @@ static bool km_page_table_walk(uint64_t pmap, uint64_t va, uint64_t *pa_out)
          * 四条 km_compute_linear_delta 路径本身要靠 walk 才能求出 delta，
          * 而 walk 下钻又要求 delta 已可信 —— 这是个**闭环**。闸门生效之后，
          * 设备上会稳定落到 linear=unresolved，km_read_process / km_write_process
-         * 一律直接失败。这是**预期安全态，不是故障**：读不出数据可以接受，
+         * （后者现已删除）一律直接失败。这是**预期安全态，不是故障**：读不出数据可以接受，
          * 把无效地址送进内核解引用不可以。
          * 要打破这个闭环，得让 delta 有一个**不依赖 walk 的可信来源**：
          * 即 ptov_table 的等价物（上游 perf.h:232-248 的 8 项分段表，
@@ -2077,11 +1951,6 @@ bool km_locate_linear_map(void)
     return false;
 }
 
-bool km_linear_map_ready(void)
-{
-    return g_linear_map_valid;
-}
-
 /*
  * ── p_list 链表遍历：**默认停用**（KM_ENABLE_PLIST_WALK = 0）──
  *
@@ -2107,7 +1976,8 @@ bool km_linear_map_ready(void)
  * 而 kread 的工作方式是把地址交给内核去解引用：**目标页没映射就一定是内核态
  * data abort**，也就是彩屏重启，没有"读到垃圾"这个中间态。于是只要链表被写坏、
  * 或 dynamic_info 的 proc__p_list__le_prev / proc__p_pid 偏移填错，
- * 这条路径换回来的是一次重启，而不是一次失败 —— 与 km_scan_kernel_base 同一种赌。
+ * 这条路径换回来的是一次重启，而不是一次失败 —— 与已经整段删除的那条
+ * kernel base 反向盲扫同一种赌。
  * 「形态 + 8 字节对齐 + 4096 跳上限」是本层在**没有映射验证**时能给出的全部
  * 保证，而它不够：它回答的是"这个地址长得像内核地址吗"，不是"它已映射吗"。
  *
@@ -2165,7 +2035,7 @@ uint64_t km_proc_for_pid(int32_t pid)
      * 返回 0 的语义（上层文案就靠这一条区分）：**"无法定位"**，不是"进程不存在"。
      * 具体是哪一种，看 km_proc_lookup_blocker() —— 它非 NULL 时，所有非 self pid
      * 的查询都必然失败，与目标进程活不活着无关。
-     * 上层现在（MemoryProbe.stepDlsym / attachPort、SilentProbe）拿到 0 一律渲染成
+     * 上层现在（MemoryProbe.attachPort）拿到 0 一律渲染成
      * 「找不到 pid 的 proc」，那是**假**结论：把"本层被编译期开关停用"说成
      * "内核里没有这个进程"。两者的处置完全相反（一个要看开关/等实现，一个要看
      * 进程是否还活着），所以本该能区分 —— 这需要上层改一行文案，而那几个文件
@@ -2332,59 +2202,6 @@ bool km_read_process(int32_t pid, uint64_t uaddr, void *out, uint64_t len)
         uint64_t kva = pa + g_linear_delta;
 
         if (!km_read(kva, cursor, chunk)) {
-            return false;
-        }
-
-        cursor += chunk;
-        addr += chunk;
-        remaining -= chunk;
-    }
-
-    return true;
-}
-
-bool km_write_process(int32_t pid, uint64_t uaddr, const void *in, uint64_t len)
-{
-    /*
-     * 写方向的危害比读方向高一档：`pa + g_linear_delta` 在 delta 未被采信时
-     * 得到 `pa + 0`，kwrite 会按内核虚拟地址**落笔**，写坏的是内核内存而不是
-     * 读出一串垃圾（vm_map 被写坏就是这一路）。所以这里的闸门更不能省，
-     * 与 km_read_process 同构：失败返回 false，不下探。
-     */
-    if (!g_linear_map_valid || in == NULL || len == 0) {
-        return false;
-    }
-    /* 写原语逐 64 位落笔，非 8 的倍数没有定义。 */
-    if ((len % sizeof(uint64_t)) != 0) {
-        return false;
-    }
-
-    const uint8_t *cursor = (const uint8_t *)in;
-    uint64_t remaining = len;
-    uint64_t addr = uaddr;
-
-    /*
-     * 与 km_read_process 同构：按页翻译、整页写。
-     * 页内物理页连续，所以一页只翻一次表。
-     */
-    while (remaining > 0) {
-        uint64_t pa = 0;
-        if (!km_translate(pid, addr, &pa)) {
-            return false;
-        }
-
-        uint64_t in_page = KM_PAGE_SIZE - (addr & KM_PAGE_MASK);
-        uint64_t chunk = (remaining < in_page) ? remaining : in_page;
-        /* 写原语要求 8 字节对齐，页边界的余数留到下一轮。 */
-        if ((chunk % sizeof(uint64_t)) != 0) {
-            chunk -= (chunk % sizeof(uint64_t));
-            if (chunk == 0) {
-                return false;
-            }
-        }
-
-        uint64_t kva = pa + g_linear_delta;
-        if (!km_write(kva, cursor, chunk)) {
             return false;
         }
 

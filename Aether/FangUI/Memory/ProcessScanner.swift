@@ -68,13 +68,6 @@ final class ProcessScanner {
         return unsafeBitCast(sym, to: ProcPidPathFn.self)
     }()
 
-    /// 供调试页显示：两条路各自是否可用。
-    static var channelSummary: String {
-        let a = procListPidsPtr != nil ? "proc_listpids=OK" : "proc_listpids=nil"
-        let b = procPidPathPtr != nil ? "proc_pidpath=OK" : "proc_pidpath=nil"
-        return "\(a) · \(b)"
-    }
-
     // MARK: - 对外
 
     /// 找游戏进程 pid。只在精确命中时返回，找不到返回 nil。
