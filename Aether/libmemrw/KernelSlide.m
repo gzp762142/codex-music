@@ -1091,6 +1091,11 @@ static bool slide_read_ptov_table(uint64_t slide, km_slide_ptov_entry *out,
      * 原始字一摆出来，这两者当场分开。
      *
      * 96 字节 = 4 项 × 24 字节：够看出前四项的真实切分方式。
+     *
+     * 后来加了「逐字节」段：只看 8 字节一组的机器字，无法判断字段边界与端序，
+     * 也无法判断起点是否偏了；按字节摆开之后，这三件事当场分开。
+     * 另外把首项偏移分三档试读（-24 / 0 / +24）：表项若被整体错位解释，
+     * 那三档里必有一档能对上，而单看一档永远对不上。
      */
     {
         uint64_t raw[12] = {};
@@ -1107,6 +1112,51 @@ static bool slide_read_ptov_table(uint64_t slide, km_slide_ptov_entry *out,
         } else {
             text_append(t, "  [raw] 符号=%#llx（运行时=%#llx）原始值读失败\n",
                         (unsigned long long)symbol, (unsigned long long)tableAddr);
+        }
+
+        /*
+         * 逐字节段：每项 24 字节，按 b0..b23 摆开。字段边界与端序一眼可判。
+         * 末项之后再多读一项的位置，用来看"表结束"落在哪里（len==0 的边界）。
+         */
+        uint8_t bytes[KM_SLIDE_PTOV_COUNT * 24 + 24] = {};
+        const size_t byteCount = sizeof(bytes);
+        if (slide_read_bulk(tableAddr, bytes, byteCount)) {
+            const size_t itemBytes = 24;
+            text_append(t, "  [hex] 按 %zu 字节/项逐字节（共 %zu 字节）：\n",
+                        itemBytes, byteCount);
+            for (size_t i = 0; i + itemBytes <= byteCount; i += itemBytes) {
+                text_append(t, "    item%zu:", i / itemBytes);
+                for (size_t k = 0; k < itemBytes; k++) {
+                    text_append(t, " %02x", bytes[i + k]);
+                }
+                text_append(t, "\n");
+            }
+        } else {
+            text_append(t, "  [hex] 逐字节段读取失败\n");
+        }
+    }
+
+    /*
+     * 首项三档试读：符号地址可能不是表头。这三档各自按结构体解释并打印首项，
+     * 哪一档的 {pa, va, len} 三个域都合法，就是真正的一句话答案。
+     */
+    {
+        static const int64_t offsets[] = { -24, 0, 24 };
+        for (size_t o = 0; o < sizeof(offsets) / sizeof(offsets[0]); o++) {
+            const int64_t delta = offsets[o];
+            const uint64_t addr = tableAddr + (uint64_t)delta;
+            km_slide_ptov_entry one = {};
+            if (!slide_read_bulk(addr, &one, sizeof(one))) {
+                text_append(t, "  [偏移 %+lld] %#llx 读失败\n",
+                            (long long)delta, (unsigned long long)addr);
+                continue;
+            }
+            text_append(t, "  [偏移 %+lld] %#llx → pa=%#llx va=%#llx len=%#llx%s\n",
+                        (long long)delta, (unsigned long long)addr,
+                        (unsigned long long)one.pa,
+                        (unsigned long long)one.va,
+                        (unsigned long long)one.len,
+                        (one.pa < (1ULL << 48) && km_slide_kernel_ptr(one.va)) ? "  ← 三个域都合法" : "");
         }
     }
 
