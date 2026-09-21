@@ -879,6 +879,78 @@ uint64_t km_proc_fd_ofiles_offset(void)
     return dynamic_info(proc__p_fd__fd_ofiles);
 }
 
+uint64_t km_proc_p_list_le_prev_offset(void)
+{
+    if (g_handle == 0) {
+        return 0;
+    }
+    /* 与 km_proc_fd_ofiles_offset 同型（包括那个"必须有同名局部变量 kfd"的理由）。 */
+    struct kfd *kfd = (struct kfd *)g_handle;
+    return dynamic_info(proc__p_list__le_prev);
+}
+
+/*
+ * ── 给 KernelPhysWindow 的四个只读接线（声明与理由见 KernelMemory.h）──
+ *
+ * 前三个只是"把已经存在的值读出来"：不发 kread、不写状态，也不参与本文件
+ * 任何一条读路径。
+ */
+uint64_t km_task_map_offset(void)
+{
+    if (g_handle == 0) {
+        return 0;
+    }
+    /* dynamic_info 是靠名字捕获局部变量 `kfd` 的宏，见 km_proc_fd_ofiles_offset。 */
+    struct kfd *kfd = (struct kfd *)g_handle;
+    return dynamic_info(task__map);
+}
+
+uint64_t km_proc_object_size(void)
+{
+    if (g_handle == 0) {
+        return 0;
+    }
+    struct kfd *kfd = (struct kfd *)g_handle;
+    return dynamic_info(proc__object_size);
+}
+
+uint64_t km_vm_map_pmap_offset(void)
+{
+    /*
+     * 纯编译期常量，不查表、不看内核层是否就绪 —— 版本表里没有这一项，
+     * 布局的唯一来源是 static_info.h 的结构体定义（与上游 info.h:151
+     * 的 static_kget(struct _vm_map, pmap, ...) 同源）。
+     */
+    return (uint64_t)offsetof(struct _vm_map, pmap);
+}
+
+/*
+ * 内核页大小。
+ *
+ * 为什么用 sysctl 而不是去内核里读 `_vm_kernel_page_size`：后者要先有 XPF 解符号、
+ * 再有 kread，而页大小在**建任何东西之前**就要用（窗口地址的公式与页表几何都靠它）。
+ * 引入那条依赖等于让"探路"这一步也被 XPF 卡住。
+ *
+ * `hw.pagesize` 在 iOS 上就是内核页大小（同一个 sysctl 也被 libkfd 的
+ * pages() 宏间接依赖：common.h:44 用 ARM_PGBYTES=16K 硬编码，那是本工程
+ * 只支持 16K 机型的另一个原因，见 KernelPhysWindow.m 的几何判据）。
+ */
+uint64_t km_kernel_page_size(void)
+{
+    /*
+     * hw.pagesize 是 int（4 字节），**不能**拿 uint64_t 去接：那样 sysctl 只会写
+     * 低 4 字节并把 size 改回 4，高 4 字节保留缓冲区原值 —— 一旦当初栈上是垃圾，
+     * 得到的就是一个"看似合理的巨大页大小"，而页大小要参与决定页表几何，
+     * 带着错值往下走就是把没验证的地址喂给 kread。用 u32 接、再零扩展。
+     */
+    uint32_t value = 0;
+    size_t size = sizeof(value);
+    if (sysctlbyname("hw.pagesize", &value, &size, NULL, 0) != 0) {
+        return 0;
+    }
+    return (uint64_t)value;
+}
+
 bool km_read(uint64_t addr, void *out, uint64_t len)
 {
     if (g_handle == 0 || out == NULL || len == 0) {

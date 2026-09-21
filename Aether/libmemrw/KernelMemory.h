@@ -60,6 +60,60 @@ uint64_t km_current_proc(void);
 /// 内核层未就绪、或当前内核版本不匹配任何表项时返回 0。
 uint64_t km_proc_fd_ofiles_offset(void);
 
+/// `struct proc` 内 `p_list.le_prev` 的偏移（取自 libkfd 的版本表，目标机为 8）。
+/// 给 KernelSlide 的 allproc 锚点用：沿 le_prev 从 current_proc 走到 allproc 链头。
+/// 内核层未就绪、或当前内核版本不匹配任何表项时返回 0。
+uint64_t km_proc_p_list_le_prev_offset(void);
+
+#pragma mark - 给 KernelPhysWindow 的四个只读接线
+/*
+ * 「建页表窗口」那条路要从 current_proc 自己走一遍
+ *     proc → task → vm_map → pmap        （上游 libkfd/info.h:137-153 同构）
+ * 再拿 pmap 的 tte / ttep 当页表遍历起点（KernelPhysWindow.h 开头有完整动机）。
+ *
+ * 这条链的四个输入只有本文件拿得到，理由与上面 KernelSlide 那条接线完全相同：
+ * 偏移在 libkfd 的版本表 / 结构体定义里，而 libkfd.h 只许本文件 include
+ * （kopen/kread/kwrite 都是非 static 定义，第二个 include 点会撞重复符号）。
+ * 所以这里各开一个只读访问器，而不是把 `struct kfd *` 交出去。
+ *
+ * 四个函数都只读已经存在的值，不发 kread、不改任何状态。
+ */
+
+/// `struct task` 内 `map` 的偏移（取自 libkfd 的版本表；目标机为 0x28）。
+/// 内核层未就绪、或当前内核版本不匹配任何表项时返回 0。
+uint64_t km_task_map_offset(void);
+
+/// `struct proc` 的 object_size —— 也是 `task` 相对 `proc` 的偏移。
+///
+/// 这个恒等式不是巧合：内核把 proc 与 task 放在同一块分配里，task 紧跟在
+/// proc 之后（libkfd/info.h:137 `current_task = current_proc + proc__object_size`）。
+/// 所以本函数既是 proc 对象大小，也是「proc → task」这一步的偏移。
+/// 内核层未就绪、或当前内核版本不匹配任何表项时返回 0。
+uint64_t km_proc_object_size(void);
+
+/// `struct _vm_map` 内 `pmap` 的偏移。
+///
+/// 来源与上面几个不同：它**不在**版本表里（libkfd 的 dynamic_info 没有这一项），
+/// 而是直接 `offsetof(struct _vm_map, pmap)` —— 布局取自
+/// libkfd/info/static_info.h:198-249 的结构体定义，与上游 info.h:151
+/// 那句 `static_kget(struct _vm_map, pmap, ...)` 是同一个来源。
+/// 本函数不依赖内核层是否就绪（纯编译期常量）。
+uint64_t km_vm_map_pmap_offset(void);
+
+/// 内核页大小（字节）。
+///
+/// 为什么非要它：窗口地址的公式 `L1_BLOCK_SIZE × (L1_BLOCK_COUNT − 1)` 两个输入
+/// 都随页大小变（16K → 2^36 × 7 = 0x7000000000；4K → 2^30 × 255 = 0x3FC0000000），
+/// 而页表几何（几级、每级 shift/mask）同样随页大小变。写死 16K 会在 4K 机型上
+/// 走一条几何完全不同的遍历 —— 那是把未映射地址喂给 kread 的经典形态。
+///
+/// 取值口径与样本一致：样本的建表函数读 `_vm_kernel_page_size`
+/// （证据见 docs/当前任务.md §0.4「地址推导」），本工程用
+/// `sysctlbyname("hw.pagesize")` 取同一个值 —— iOS 上两者恒等，
+/// 且 sysctl 是用户态调用，内核层没就绪时也能拿到。
+/// 取不到返回 0（调用方必须按「不知道」处理，不许兜底成 16K）。
+uint64_t km_kernel_page_size(void);
+
 #pragma mark - 地址翻译层
 /*
  * 从「内核读写原语」走到「读目标进程用户态地址」。

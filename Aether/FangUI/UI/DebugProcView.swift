@@ -17,8 +17,12 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     /// 非空时表格显示这些文本行（Jetsam 报告等），否则显示进程列表
     private var extraRows: [String] = []
     private var gpid: Int32 = 0
-    /// 顶部信息区的高度：三行读数 + 一行 XPF 常驻状态 + 一行 Slide 常驻状态。
-    private let headerH: CGFloat = 79
+    /// 顶部信息区的高度：三行读数 + 一行 XPF 常驻状态 + 一行 Slide 常驻状态
+    /// + 一行建窗（physrw 窗口）常驻状态。
+    ///
+    /// 这里的数字必须与 layoutSubviews 里**逐行给的 y** 对得上：那一排 y 是
+    /// 15 递增写死的（0/15/30/45/60/75），少加一行就会出现"按钮压住最后一行"。
+    private let headerH: CGFloat = 94
     private let btnRowH: CGFloat = 26
 
     private let countLabel = UILabel()
@@ -37,6 +41,14 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     /// （它只能通过 kernel_base 处的 Mach-O 头自检才会被发布），所以结论要常驻，
     /// 重建后靠 slideNote 恢复。
     private let slideLabel = UILabel()
+    /// 建窗（physrw 窗口）常驻状态行（「［建窗］ …」）。
+    ///
+    /// 与前两条同理：面板收放会整个重建本视图，而这条结论最该一直挂着看 ——
+    /// 它回答的是「第 ② 步要不要先建页表」，而那个答案决定了下一段写什么代码。
+    /// 名字里带 window 是为了不与上面那个「窗口」按钮（MemoryProbe 的
+    /// 本地虚拟地址窗口，纯用户态 vm_remap）混在一起：**两者是完全不同的东西**，
+    /// 一个在用户态建窗口、一个要在内核里建页表。
+    private let windowLabel = UILabel()
     private let table = UITableView(frame: .zero, style: .plain)
 
     /// 跑一次：刷新 → 找村口 → 世界 → 名字池，一条链自动走完
@@ -84,6 +96,15 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     /// 与「XPF」的差别是它**要 kread**（读 fileproc / fileops / ptov_table），
     /// 所以前置条件是内核层就绪，且必须与读取链串行（见 runSlideProbe）。
     private let btnSlide = UIButton(type: .system)
+    /// 建窗：physrw 窗口（0x7000000000）的**只读**探针 —— 走 pmap → ttep 逐级下行，
+    /// 回答「那里现在有没有已存在的页表」。**一次内核写都不做**，写自映射是下一段。
+    ///
+    /// 与「窗口」按钮的区别要说清：那个建的是**用户态**的本地虚拟地址窗口
+    /// （vm_remap，见 MemoryProbe），本按钮碰的是**内核页表**。名字相近、层次不同。
+    /// 与「Slide」的依赖关系是硬的：页表项里存的是 PA，下钻要 KVA，
+    /// 而那个换算只有 KernelSlide 提供 —— 所以本按钮得在 Slide 就绪之后才有结论，
+    /// 没就绪时会明确报「先跑 Slide」而不是猜一个地址。
+    private let btnPhysWindow = UIButton(type: .system)
 
     /// 面板上的按钮与其 action。**唯一数据源**：init 按它接线，layoutSubviews 按它排版。
     /// 原先这两处各写一份列表，加一个按钮就得改两个地方、还必须顺序一致 —— 迟早会错位。
@@ -108,7 +129,8 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         (btnMemory, "内存", #selector(onMemory)),
         (btnTracker, "自动", #selector(onTracker)),
         (btnXpf, "XPF", #selector(onXpfProbe)),
-        (btnSlide, "Slide", #selector(onSlideProbe))
+        (btnSlide, "Slide", #selector(onSlideProbe)),
+        (btnPhysWindow, "建窗", #selector(onPhysWindowProbe))
     ]
 
     private let accent = UIColor.hex(0x185EE0)
@@ -119,7 +141,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         super.init(frame: frame)
         backgroundColor = .clear
 
-        for l in [countLabel, hitLabel, probeLabel, crashLabel, xpfLabel, slideLabel] {
+        for l in [countLabel, hitLabel, probeLabel, crashLabel, xpfLabel, slideLabel, windowLabel] {
             l.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
             l.textColor = idleText
             l.adjustsFontSizeToFitWidth = true
@@ -150,6 +172,9 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         xpfLabel.text = DebugProcView.xpfNote
         // Slide 同理：它只有在通过 kernel_base 的 Mach-O 头自检之后才有结论。
         slideLabel.text = DebugProcView.slideNote
+        // 建窗同理：它是一条只读结论（「有页表 / 没有页表」），比上面两条更该常驻 ——
+        // 下一段写什么代码完全取决于它，而面板收放会把这个视图整个换掉。
+        windowLabel.text = DebugProcView.physWindowNote
 
         table.dataSource = self
         table.delegate = self
@@ -183,6 +208,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         probeLabel.frame = CGRect(x: 0, y: 30, width: w, height: 14)
         xpfLabel.frame = CGRect(x: 0, y: 45, width: w, height: 14)
         slideLabel.frame = CGRect(x: 0, y: 60, width: w, height: 14)
+        windowLabel.frame = CGRect(x: 0, y: 75, width: w, height: 14)
 
         // 6 列一行。按钮数由 actionButtons 决定，不再假定正好 12 个（6×2）——
         // 多出来的按钮会自动排到下一行，表格起点跟着让，不会被压住。
@@ -366,6 +392,23 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
 
     /// Slide 常驻状态行。理由与 xpfNote 完全相同（面板每次收放都会新建本视图）。
     private static var slideNote = "［Slide］ 未计算（点「Slide」按钮）"
+
+    /// 建窗常驻状态行。理由同上。
+    ///
+    /// 与 `xpfNote` 的唯一差别是它**会被重新点掉**：结论依赖"页表现在有没有"，
+    /// 而下一段一旦真的建出表来，这个结论就必须能变 —— 所以这里只是一个
+    /// 显示用的快照，判断永远以 km_physwindow_probe() 当次的返回值为准
+    /// （C 侧也刻意不缓存结论，见 KernelPhysWindow.h）。
+    private static var physWindowNote = "［建窗］ 未探测（点「建窗」按钮）"
+
+    /// 最近一次探测的状态枚举。
+    ///
+    /// 为什么要存它而不是让 UI 再调一次 km_physwindow_probe()：那一次调用会
+    /// 在**主线程、不经过 AutoTracker 串行队列**的情况下 kread，而 kread 后端
+    /// （kread_sem_open 每次读改写自己 psemnode 的 pinfo）不是线程安全的。
+    /// 一个只为取状态枚举的重复调用，不值得把串行纪律破掉。
+    /// 由 physWindowReport() 在后台线程写、主线程读 —— 与 xpfNote/slideNote 同一套。
+    private static var physWindowLastStatus: km_physwindow_status = KM_PW_NOT_READY
 
     /// 内核就绪后自动刷一次面板 —— 自检是异步的，面板可能先于它建好。
     private var kernelWasReady = false
@@ -1066,6 +1109,122 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         lines.append("km_slide_value() = 0x" + String(km_slide_value(), radix: 16))
         lines.append("km_slide_kernel_base() = 0x" + String(km_slide_kernel_base(), radix: 16))
         lines.append("km_phystokv_ready() = " + (km_phystokv_ready() ? "true" : "false"))
+        return lines.joined(separator: "\n")
+    }
+
+    // MARK: - 建窗（physrw 窗口）只读探针
+
+    /// 与 slideBusy 同一套防重入（同型同名，方便对照排查）。
+    private var physWindowBusy = false
+    private var physWindowStarted = Date.distantPast
+
+    @objc private func onPhysWindowProbe() {
+        runPhysWindowProbe()
+    }
+
+    /// 「建窗」按钮：physrw 窗口的**只读**探针。
+    ///
+    /// 与「Slide」同一套写法与同一套理由：整个探针会 kread（十几次），
+    /// 必须走 AutoTracker 那条串行队列 —— libkfd 的 kread 后端每次读都要改写
+    /// 自己 psemnode 的 pinfo，和状态机的读取链并发就是互相踩。
+    /// 也在后台线程跑：它内部可能触发多次内核读，主线程被堵住的话面板就冻住了。
+    ///
+    /// **本按钮不做任何写操作**（写自映射是下一段），所以它不需要「失败即终止
+    /// 本次会话」那条纪律：失败之后可以立刻再点一次。
+    private func runPhysWindowProbe() {
+        if physWindowBusy {
+            // 与 Slide 同一套防重入：一次探针只有十几次读，真卡住的话是内核层面的事，
+            // 30 秒足够判定，不需要按 XPF 那种几十秒的门槛放行。
+            if Date().timeIntervalSince(physWindowStarted) <= 30 {
+                showReport("建窗: 上一次探测还没回来（内核可能被堵住了），等它")
+                return
+            }
+        }
+        physWindowBusy = true
+        physWindowStarted = Date()
+        windowLabel.text = "［建窗］ 探测中…（只读，不发写操作）"
+        windowLabel.textColor = idleText
+        probeLabel.text = "建窗: 只读探测中…"
+        probeLabel.textColor = idleText
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            // 与读取链共用同一条串行队列（本按钮会 kread，理由见上面的注释）
+            let text = AutoTracker.shared.syncExternal { DebugProcView.physWindowReport() }
+            DispatchQueue.main.async {
+                guard let s = self else { return }
+                s.physWindowBusy = false
+                s.showReport(text)
+
+                /*
+                 * 状态从上面那次探测**抄下来**，这里不再调 km_physwindow_probe()。
+                 *
+                 * 关键不是省那十几次读，而是：再调一次就在**主线程**、且**不经过
+                 * syncExternal** 去 kread —— 那正好是上面那段注释在防的事
+                 * （libkfd 的 kread 后端每次读都改写自己 psemnode 的 pinfo）。
+                 * 一个只为了取状态枚举的重复调用，不值得把整条串行纪律破掉。
+                 * 状态在 physWindowReport 里存进 static，这里读它。
+                 */
+                let status = DebugProcView.physWindowLastStatus
+                let line: String
+                switch status {
+                case KM_PW_HIT_EXISTING:
+                    line = "［建窗］ ✓ 窗口地址上已有页表（第 ② 步可省）"
+                case KM_PW_NO_TABLE:
+                    line = "［建窗］ ✗ 窗口地址上没有页表（第 ② 步必须先建表）"
+                case KM_PW_NOT_READY:
+                    line = "［建窗］ 未完成：前置不成立（诊断见列表）"
+                case KM_PW_PMAP_UNRESOLVED:
+                    line = "［建窗］ 未完成：pmap 链路取不到（诊断见列表）"
+                case KM_PW_L3_NOT_LEAF:
+                    line = "［建窗］ L3 表项有效但不是叶（异常，诊断见列表）"
+                case KM_PW_TRUNCATED:
+                    line = "［建窗］ 诊断文本被截断（结论见列表）"
+                default:
+                    line = "［建窗］ 未完成（诊断见列表）"
+                }
+                s.windowLabel.text = line
+                s.windowLabel.textColor = (status == KM_PW_HIT_EXISTING) ? s.accent : s.warnText
+                DebugProcView.physWindowNote = line
+            }
+        }
+    }
+
+    /// 真正碰 C 接口的那些调用。**必须在主线程之外执行**（见 runPhysWindowProbe）。
+    ///
+    /// 与 slideReport 同一条口径：报告的正文（每一步的判据与读到的值）由 C 侧
+    /// 拼好，面板**不复算任何判据** —— 两边各判断一次的话，迟早出现
+    /// "列表里说没有页表、状态行说有"这种自相矛盾。
+    private static func physWindowReport() -> String {
+        var lines: [String] = []
+
+        /*
+         * 这里与 slideReport 的顺序不同（那边先 resolve、再取诊断），原因是
+         * km_physwindow_probe 自己就是探测 —— 重跑一遍会多打一遍内核读，
+         * 而两次读之间页表状态理论上可以变，于是会出现"状态行来自第二次、
+         * 列表来自第一次"的错位。所以先跑一次，再取它写好的文本。
+         * 取到 nil（还没跑过的提示）时下面那次调用就把它填上了。
+         */
+        lines.append("== 建窗（physrw 窗口）只读探针 ==")
+        lines.append("本按钮**全程不写内核内存**：没有 km_write / kwrite / physwrite 调用。")
+        lines.append("写自映射是下一段（第 ② 步的后半段）。")
+
+        let status = km_physwindow_probe()
+        // 交给主线程的是这一次的结论（它不再自己重跑一遍，理由见 physWindowLastStatus）。
+        DebugProcView.physWindowLastStatus = status
+
+        if let diagnostic = km_physwindow_diagnostic() {
+            lines.append(contentsOf: diagnostic.split(separator: "\n").map(String.init))
+        }
+
+        lines.append("== 对外接口 ==")
+        // 窗口地址用 km_physwindow_last_address()（那次探测算出来的），
+        // 不在这里重算 —— 重算会再走一遍 sysctl，而"面板不复算判据"是本文件的既有口径。
+        lines.append("窗口地址 km_physwindow_last_address() = 0x"
+                     + String(km_physwindow_last_address(), radix: 16))
+        lines.append("km_physwindow_address() = 0x" + String(km_physwindow_address(), radix: 16))
+        lines.append("km_kernel_page_size() = 0x" + String(km_kernel_page_size(), radix: 16))
+        lines.append("km_phystokv_ready() = " + (km_phystokv_ready() ? "true" : "false"))
+        lines.append("km_physwindow_probe() status = " + String(status.rawValue))
         return lines.joined(separator: "\n")
     }
 
