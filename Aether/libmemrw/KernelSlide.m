@@ -1074,29 +1074,89 @@ static bool slide_read_ptov_table(uint64_t slide, km_slide_ptov_entry *out,
         return slide_refuse(run, t, "⑥ ptov_table", "表读不出来");
     }
 
-    uint64_t valid = 0;
-    for (uint64_t i = 0; i < KM_SLIDE_PTOV_COUNT; i++) {
-        if (table[i].len == 0) break; /* 表结束（perf.h:240） */
+    /*
+     * 整张表读进来了，先原样收下 —— 后面无论判成合不合法，调用方手里都有这份数据。
+     * （这一句必须在读成功之后：放在前面搬的会是一段被清零的数组。）
+     */
+    memcpy(out, table, tableSize);
 
-        if (!km_slide_kernel_ptr(table[i].va) ||
-            table[i].pa >= (1ULL << 48) ||
-            table[i].len >= (1ULL << 48)) {
-            text_append(t, "  ptov[%llu] 形态不合法：pa=%#llx va=%#llx len=%#llx\n",
-                        (unsigned long long)i,
-                        (unsigned long long)table[i].pa,
-                        (unsigned long long)table[i].va,
-                        (unsigned long long)table[i].len);
-            return slide_refuse(run, t, "⑥ ptov_table", "表项形态不合法");
+    /*
+     * ── 原始 dump 段（诊断优先）──────────────────────────────────────────
+     *
+     * 为什么要把原始字直接打出来：面板与落盘都只能看到**按结构体解释后**的三元组，
+     * 而"这一项到底是不是 {pa, va, len}"正是待判定的问题本身。用错了假设去解释，
+     * 看到的就永远是"形态不合法"，无法区分下面两种成因：
+     *   · 符号地址偏移（XPF 给的引用点不等于表本身）；
+     *   · 表项布局与上游不一致（字段顺序或每项大小不是 24 字节）。
+     * 原始字一摆出来，这两者当场分开。
+     *
+     * 96 字节 = 4 项 × 24 字节：够看出前四项的真实切分方式。
+     */
+    {
+        uint64_t raw[12] = {};
+        const size_t rawBytes = sizeof(raw);
+        if (slide_read_bulk(tableAddr, raw, rawBytes)) {
+            text_append(t, "  [raw] 符号=%#llx（运行时=%#llx）处 %zu 字节原始值：\n",
+                        (unsigned long long)symbol, (unsigned long long)tableAddr, rawBytes);
+            for (size_t i = 0; i < rawBytes / sizeof(uint64_t); i += 2) {
+                text_append(t, "    +%#04zx: %#018llx %#018llx\n",
+                            i * sizeof(uint64_t),
+                            (unsigned long long)raw[i],
+                            (unsigned long long)raw[i + 1]);
+            }
+        } else {
+            text_append(t, "  [raw] 符号=%#llx（运行时=%#llx）原始值读失败\n",
+                        (unsigned long long)symbol, (unsigned long long)tableAddr);
         }
-        valid++;
+    }
+
+    /*
+     * 逐项按结构体解释并**全部打印**，合法性判定留到循环之后。
+     *
+     * 这里以前是"第一项不合法就 return" —— 那会让诊断只留下 ptov[0] 一行，
+     * 另外 7 项永远看不到，而"整张表长什么样"恰恰是判断布局的关键证据。
+     * 判定该由结论承担，不该由打印顺序承担。
+     */
+    uint64_t valid = 0;
+    bool allValid = true;
+    uint64_t shown = 0;
+    for (uint64_t i = 0; i < KM_SLIDE_PTOV_COUNT; i++) {
+        if (table[i].len == 0) {
+            text_append(t, "  ptov[%llu] len=0 → 按 perf.h:240 视为表结束\n",
+                        (unsigned long long)i);
+            break; /* 表结束（perf.h:240） */
+        }
+
+        const bool itemValid = km_slide_kernel_ptr(table[i].va) &&
+                               table[i].pa < (1ULL << 48) &&
+                               table[i].len < (1ULL << 48);
+        text_append(t, "  ptov[%llu]%s pa=%#llx va=%#llx len=%#llx\n",
+                    (unsigned long long)i,
+                    itemValid ? "" : " 【形态不合法】",
+                    (unsigned long long)table[i].pa,
+                    (unsigned long long)table[i].va,
+                    (unsigned long long)table[i].len);
+        shown++;
+        if (itemValid) {
+            valid++;
+        } else {
+            allValid = false;
+        }
     }
 
     if (valid == 0) {
-        text_append(t, "  ptov_table 一项有效项都没有（首项 len 就是 0）\n");
-        return slide_refuse(run, t, "⑥ ptov_table", "表是空的");
+        text_append(t, "  上面 %llu 项没有一项通过形态检查（表是空的，或全部不合法）\n",
+                    (unsigned long long)shown);
+        return slide_refuse(run, t, "⑥ ptov_table", "表是空的或全部不合法");
+    }
+    if (!allValid) {
+        text_append(t, "  上面 %llu 项里有形态不合法的项，整表拒绝 —— "
+                       "半张表比没有表更危险（段外换算）。\n",
+                    (unsigned long long)shown);
+        return slide_refuse(run, t, "⑥ ptov_table", "表项形态不合法");
     }
 
-    memcpy(out, table, tableSize);
+    /* out 已在函数开头拷过（那时表刚读进来），这里不再重复。 */
     text_append(t, "⑥ ptov_table=%#llx（符号 %#llx + slide）有效项 %llu\n",
                 (unsigned long long)tableAddr, (unsigned long long)symbol,
                 (unsigned long long)valid);
