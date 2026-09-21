@@ -72,9 +72,11 @@ final class JetsamLogReader {
         // 目标：用前缀搜（不能要求完整名）
         let hasTarget = text.contains(targetPrefix)
         if hasTarget {
-            rows.append("目标[\\(targetPrefix)] 在日志中 ✓ rpages=" + String(targetPages(text)))
+            // 这里必须是单个反斜杠的插值 \(...) —— 写成 \\( 只会得到一个字面反斜杠，
+            // 面板上就原样显示 "目标[\(targetPrefix)]"，看上去像日志里真有这么个名字。
+            rows.append("目标[\(targetPrefix)] 在日志中 ✓ rpages=" + String(targetPages(text)))
         } else {
-            rows.append("目标[\\(targetPrefix)] 不在日志中 ✗")
+            rows.append("目标[\(targetPrefix)] 不在日志中 ✗")
         }
 
         // 把日志里出现过的、带 rpages 的进程名列出来（前 12 个）

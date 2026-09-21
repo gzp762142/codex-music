@@ -45,8 +45,16 @@ const struct dynamic_info kern_versions[] = {
      * out below is the real thing, left in as documentation of where the
      * numbers came from.
      *
-     * Entries run oldest first so a line such as "22.0.0" answers for every
-     * Darwin 22 banner that no later entry claims.
+     * There is no catch-all entry: the old claim that a line such as "22.0.0"
+     * answers for every Darwin 22 banner is wrong under this comparison.
+     * "Darwin Kernel Version 22.0.0" and "…22.1.0" diverge at index 24 (the
+     * '0' of the minor), well inside the 29 characters that are compared, and
+     * strncmp does not stop early at the shorter key's NUL - it compares the
+     * full 29 characters (verified in tools/verify_dynamic_info.py section 5).
+     * A 22.0.0 key therefore matches nothing but 22.0.x. Every Darwin minor
+     * needs an entry of its own: a banner with no entry matches nothing, and
+     * info_init() rejects the device instead of silently falling back to a
+     * neighbouring version's offsets.
      *
      * The kernelcache__* fields are deliberately nil: this build resolves the
      * kernel base by scanning (see KernelMemory.c), not by reading perf's
