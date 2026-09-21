@@ -1246,6 +1246,21 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         lines.append("本按钮**全程不写内核内存**：没有 km_write / kwrite / physwrite 调用。")
         lines.append("写自映射是下一段（第 ② 步的后半段）。")
 
+        /*
+         * 先按需建立 PA→KVA 换算表，再探测。
+         *
+         * 为什么必须在这里调：km_physwindow_probe() 的下钻要把页表项里的 PA 补成 KVA
+         * （走 km_phystokv），换算表没就绪时它会直接返回 NO_KVA 并在正文里写
+         * "先点面板上的「Slide」按钮"。而换算表与 slide 是**数据依赖、分不开**
+         * （读那些符号要用"链接期 vmaddr + slide"算出的运行时地址）—— 那件事收在
+         * km_phystokv_ensure() 里，所以面板侧不该再要求用户按某个顺序点按钮。
+         * 首次会花几十秒解析 kernelcache，上面的"探测中…"文案就是给这段时间的。
+         *
+         * 返回值不在这里判：换算表没建起来时探针自己会给出准确的原因
+         * （NO_KVA 那一段），面板不复算判据。
+         */
+        _ = km_phystokv_ensure()
+
         let status = km_physwindow_probe()
         // 交给主线程的是这一次的结论（它不再自己重跑一遍，理由见 physWindowLastStatus）。
         DebugProcView.physWindowLastStatus = status
