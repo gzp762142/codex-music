@@ -51,9 +51,14 @@
 //                    （KernelMemory.h:84-101，来自 libkfd 版本表与 static_info.h）
 //    ② 页表起点      pmap->ttep（pmap + 0x08，static_info.h:255-257 的 pmap 头两个字段）
 //    ③ 窗口地址      km_physwindow_address()（= L1_BLOCK_SIZE × (L1_BLOCK_COUNT − 1)）
-//    ④ 页表几何      L1 索引掩码来自 XPF 的 kernelConstant.ARM_TT_L1_INDEX_MASK
-//                    （Dopamine translation.c:125 用的是同一个键），
-//                    L2/L3 的 shift 与掩码是 16K 固定几何（pte.h:78/83）
+//    ④ 页表几何      三级**全部**是 16K 用户侧常量：L1 = bits 38:36 / 3 位
+//                    （0x0000007000000000，共 8 块，即用户侧 T0SZ = 25），
+//                    L2 / L3 各自 11 位（pte.h:78/83；libkfd 快照
+//                    static_info.h:70/75 同值）
+//                    **刻意不取** XPF 的 kernelConstant.ARM_TT_L1_INDEX_MASK：
+//                    那个键按 kernelConstant.T1SZ_BOOT（**内核侧** TTBR1 几何）
+//                    选值，与本模块要的**用户侧**（T0SZ）几何是两套东西 ——
+//                    真机（M2）上第一次暴露就是这条，全过程记在 .m 文件头部。
 //    ⑤ 物理页记账    vm_first_phys / pv_head_table / PT_INDEX_MAX（XPF，见 XpfBridge.h）
 //    ⑥ 内核页表根    cpu_ttep（XPF 符号，读它的**内容** = TTBR1 的值），
 //                    只在算 pmap->sw_asid 那一页的物理地址时用（见下面 ⑧）

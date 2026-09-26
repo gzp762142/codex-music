@@ -35,15 +35,37 @@
  *     get_l2_block_size()  = 0x2000000
  *     get_l2_block_count() = 2048
  *
- * 「L1 块数 = 8」这一条同时定死了 L1 索引的位宽：用户地址空间上界 2^39
- * （T1SZ_BOOT = 25 的机型的用户空间），除以一个 L1 表项覆盖的 2^36，正好 8 项
- * → **L1 索引 3 位**。XPF 的 common.c:113-127 对 T1SZ_BOOT = 25 返回的
- * ARM_TT_L1_INDEX_MASK 就是 0x7000000000（bits 38:36），本文件一律从那里取，
- * 不在这里写死 —— 理由见下面 KM_PM_L1_INDEX_MASK 的说明。
- *
  * 窗口地址 = L1_BLOCK_SIZE × (L1_BLOCK_COUNT − 1) = 7 × 2^36 = 0x7000000000
  * （physrw_pte.c:13 的 MAGIC_PT_ADDRESS；本文件用 km_physwindow_address() 取，
  * 不另立一份）。
+ *
+ * ── L1 索引为什么是 3 位，而不是 11 位 ──
+ *
+ * 「L1 块数 = 8」这一条同时定死了 L1 索引的位宽：**用户**地址空间上界是
+ * 2^39 = 0x8000000000（就是 MACH_VM_MAX_ADDRESS；KernelPhysWindow.m 的几何表
+ * 16K 那一列把它与 2^36 × 8 写在了一行上，docs/当前任务.md §0.4「地址推导」
+ * 用样本反汇编独立算出了同一个数），除以一个 L1 表项覆盖的 2^36，正好 8 项
+ * → **L1 索引 3 位** → bits 38:36 → 掩码 0x0000007000000000。
+ * 换成位数说就是**用户侧** TCR_EL1.T0SZ = 64 − 39 = **25**。
+ *
+ * **所以这个掩码不能从 XPF 取。** 上游 common.c:113-127 的
+ * kernelConstant.ARM_TT_L1_INDEX_MASK 是按 kernelConstant.T1SZ_BOOT 选值的
+ * （T1SZ_BOOT 本身由 common.c:100-111 数 pointer_mask 的置位数得出），而
+ * T1SZ_BOOT 描述的是**内核侧**（TTBR1）的 VA 位宽：
+ *     T1SZ_BOOT = 17 → common.c:118 给 0x00007ff000000000（11 位）
+ *     T1SZ_BOOT = 25 → common.c:120 给 0x0000007000000000（3 位）
+ *     T1SZ_BOOT = 26 → common.c:122 给 0x0000003fc0000000（9 位）
+ * 老机型上 T0SZ 与 T1SZ 都是 25，两个语义重合，于是 case 25 恰好返回本模块要的
+ * 那个值；本工程的目标机（iPad14,3 / M2 / iPadOS 16.4.1）是 ARM_LARGE_MEMORY
+ * 内核（common.c:187 用 kernelBase == 0xfffffe0007004000 判它），T1SZ_BOOT 实读
+ * 17，XPF 于是给出 11 位掩码 —— 而本模块建的是**用户 pmap** 的窗口，11 位掩码在
+ * 这里推出 2048 个 L1 块，与真实的 8 块不符。真机就是这么翻的车：预检在 ③ 的
+ * 自洽判据上停住，报「掩码推出 2048 块，常量是 8」。
+ *
+ * 结论：本文件把用户侧几何写成常量，**永不**从那个键取（XpfBridge 的那组键里
+ * 也已经没有它了，见 XpfBridge.h 的「建页表窗口」一节）。同一套几何的另一半在
+ * KernelPhysWindow.m 的 KM_PW_INDEX_L1 / KM_PW_SHIFT_L1 —— 两处必须逐位一致，
+ * 那个模块在真机上从来没报过这个错，正因为它的 L1 一直是 3 位。
  */
 #define KM_PM_16K_L1_BLOCK_SIZE 0x1000000000ULL /* 2^36 */
 #define KM_PM_16K_L1_BLOCK_COUNT 8ULL
@@ -54,14 +76,27 @@
 #define KM_PM_L2_BLOCK_MASK (KM_PM_16K_L2_BLOCK_SIZE - 1ULL)
 
 /*
- * L2 / L3 的 shift 与索引掩码：pte.h:77-78、pte.h:82-83 的
- * ARM_16K_TT_L2_SHIFT / ARM_16K_TT_L2_INDEX_MASK / ARM_16K_TT_L3_SHIFT /
- * ARM_16K_TT_L3_INDEX_MASK。这两级**不随** T1SZ_BOOT 变（L2/L3 各自 11 位，
- * 3 + 11 + 11 + 14 = 39），所以是常量而不是从 XPF 取。
+ * 三级的 shift 与索引掩码。
+ *
+ * L1：**用户侧几何**（为什么是 3 位、为什么不能从 XPF 取，见文件头部那段）。
+ *     位移与掩码分开写是有意的：它们是两个独立的抄写点，kpm_load() 的 ③ 段
+ *     会把"从掩码数出的位移"与 KM_PM_SHIFT_L1 对照，抄错任一个立刻停。
+ *     与 KernelPhysWindow.m 的 KM_PW_SHIFT_L1 / KM_PW_INDEX_L1 必须逐位相同：
+ *     两个模块算的是同一个窗口地址的同一套几何，分叉就会让一个说"已有页表"、
+ *     另一个说"需要建表"（KernelPhysMap.h 的「面板调用顺序」第 3 条要求两者对得上）。
+ *
+ * L2 / L3：pte.h:77-78、pte.h:82-83 的 ARM_16K_TT_L2_SHIFT /
+ *     ARM_16K_TT_L2_INDEX_MASK / ARM_16K_TT_L3_SHIFT / ARM_16K_TT_L3_INDEX_MASK
+ *     （libkfd 快照 static_info.h:69/70 与 :74/75，同值）。这两级**不随**
+ *     T0SZ / T1SZ 变（各自 11 位），所以一直是常量。
+ *     三级合起来 3 + 11 + 11 + 14 = 39 —— 正好是用户地址空间上界 2^39 的位数，
+ *     这一条是对整套几何的独立核验。
  */
+#define KM_PM_SHIFT_L1 36ULL
+#define KM_PM_INDEX_L1 0x0000007000000000ULL /* bits 38:36，3 位（见文件头部） */
 #define KM_PM_SHIFT_L2 25ULL
-#define KM_PM_SHIFT_L3 14ULL
 #define KM_PM_INDEX_L2 0x0000000ffe000000ULL /* bits 35:25，11 位 */
+#define KM_PM_SHIFT_L3 14ULL
 #define KM_PM_INDEX_L3 0x0000000001ffc000ULL /* bits 24:14，11 位 */
 
 /*
@@ -73,15 +108,19 @@
 #define KM_PM_OFFMASK_L2 0x0000000001ffffffULL /* 2^25 − 1 */
 #define KM_PM_OFFMASK_L3 0x0000000000003fffULL /* 2^14 − 1 */
 
-/// L1 索引掩码的**唯一来源是 XPF**（kernelConstant.ARM_TT_L1_INDEX_MASK）。
-///
-/// 为什么不像 L2/L3 那样写常量：ARM_LARGE_MEMORY 内核把用户空间从 47 位削到
-/// 39 位，L1 索引从 11 位变 3 位（common.c:113-127 三个 case 分别返回
-/// 0x7ff000000000 / 0x7000000000 / 0x3fc0000000）。本工程的目标机是 16K + 大内存
-/// 配置（窗口地址 0x7000000000 的存在本身就要求 L1 块数是 8），但我们**不靠这个
-/// 推断去写常量** —— 推断错了会在 L1 那一步索引到别的表项，而那种错在这里的
-/// 表现形式是「读到一张不属于自己的表，然后把它的内容当下一级表地址」。
-/// 取不到就直接报 KM_PM_KEYS_MISSING 并中止（头文件承诺：不许回退成硬编码常量）。
+/*
+ * 一条不许加回来的写法：**不要**再从这个键取 L1 掩码 ——
+ * kernelConstant.ARM_TT_L1_INDEX_MASK（common.c:113-127）按 T1SZ_BOOT 选值，
+ * 表达的是内核侧（TTBR1）几何；本模块建的是用户 pmap 的窗口，要用户侧（T0SZ）
+ * 几何，两者在 T1SZ_BOOT = 17 的目标机上分家（全过程见文件头部）。
+ *
+ * 这**不违反**头文件「不许用兜底常量把失败包装成成功」那条硬约束：
+ * 用户侧几何本身是常量（它由架构与页大小定死，不来自这台设备的任何一次读取），
+ * 所以它不承担"取不到就回退"的风险。反过来，从那个键取才是真正的兜底 ——
+ * 拿一台设备**内核侧**的几何去当**用户侧**地址空间的几何，正是这次翻车。
+ * 同一套用户侧常量在 KernelPhysWindow.m 里一直是这么写的，那个模块在真机上
+ * 从来没报过这条错 —— 两支的差别只有这一个。
+ */
 
 /// pmap 结构头部两个字段（static_info.h:255-257：struct pmap 以 tte / ttep 开头）。
 #define KM_PM_PMAP_OFF_TTE 0x00ULL
@@ -824,17 +863,25 @@ static km_physmap_status kpm_load(km_pm_ctx *ctx, km_pm_text *t)
     g_physmapWindow = ctx->window;
 
     /* ── ② XPF 键 ── */
-    kpm_append(t, "== ② XPF 键（缺任一就中止，不许回退成硬编码常量）==\n");
+    kpm_append(t, "== ② XPF 键（必需项缺一就中止；t1sz_boot / vm_last_phys 只作诊断）==\n");
     km_xpf_physmap_keys keys = {};
     if (!km_xpf_physmap_keys_fetch(&keys)) {
         kpm_append(t, "✗ km_xpf_physmap_keys_fetch 失败：XPF 未就绪。\n");
         return KM_PM_NOT_READY;
     }
+    /*
+     * 数组顺序**必须**与 XpfBridge.h 的 km_xpf_physmap_keys 字段顺序逐个对齐：
+     * km_xpf_physmap_key_name(i) 按下标取名字，错位会把 A 键的结果挂在 B 键的标题
+     * 下，而那种错在屏幕上看起来完全正常。结构体那一侧由 XpfBridge.m 里那组
+     * offsetof 静态断言钉住；这一侧靠本注释，以及下面用 sizeof 取循环上界
+     * （数组增减时循环自动跟随，不会再出现"数组 7 项、循环写 8"这种分叉）。
+     */
     const km_xpf_item_result *const all[] = {
-        &keys.pv_head_table, &keys.vm_first_phys,  &keys.vm_last_phys, &keys.cpu_ttep,
-        &keys.pt_index_max,  &keys.kernel_el,      &keys.arm_tt_l1_index_mask, &keys.t1sz_boot,
+        &keys.pv_head_table, &keys.vm_first_phys, &keys.vm_last_phys, &keys.cpu_ttep,
+        &keys.pt_index_max,  &keys.kernel_el,     &keys.t1sz_boot,
     };
-    for (int i = 0; i < 8; i++) {
+    const int keyCount = (int)(sizeof(all) / sizeof(all[0]));
+    for (int i = 0; i < keyCount; i++) {
         const km_xpf_item_result *r = all[i];
         kpm_append(t, "  [%d] %s：registered=%s fetched=%s value=%#llx\n", i,
                    km_xpf_physmap_key_name(i), r->registered ? "yes" : "no",
@@ -842,28 +889,51 @@ static km_physmap_status kpm_load(km_pm_ctx *ctx, km_pm_text *t)
     }
 
     /*
-     * 这六个必须有值（另外两个 vm_last_phys / t1sz_boot 只用于佐证与上界检查；
-     * vm_last_phys 目前确实只作参考 —— 本文件用 vm_first_phys 做下溢检查，
-     * 上界检查留到有实测需求时再加，不在这一轮凭空添一条没人验证过的判据）：
+     * 必需的五个（另两个 vm_last_phys / t1sz_boot 只作参考与诊断：
+     * vm_last_phys 本文件确实没用它 —— 下溢检查用 vm_first_phys，上界检查留到有实测
+     * 需求时再加；t1sz_boot 只用来在诊断里说明这台设备**内核侧**几何的来源，
+     * 它**不参与**任何几何计算，见 ③ 段）：
      *   pv_head_table   → 物理页记账表（kernel.c:109）
      *   vm_first_phys   → 物理页索引的基准（kernel.c:104）
      *   cpu_ttep        → 内核页表根，算 sw_asid 那一页的物理地址用（translation.c:107）
      *   PT_INDEX_MAX    → pt_desc 里 va[] 数组的长度（info.c:109）
      *   kernel_el       → pmapEl2Adjust（info.c:42）
-     *   ARM_TT_L1_INDEX_MASK → L1 索引掩码，页表几何的一部分（translation.c:125）
+     *
+     * ARM_TT_L1_INDEX_MASK 不在这里：它已经从 XpfBridge 的键集合里移除，
+     * 因为它是内核侧（T1SZ）几何、而本模块要用户侧（T0SZ）几何 —— 见文件头部。
      */
     if (!keys.pv_head_table.fetched || !keys.vm_first_phys.fetched || !keys.cpu_ttep.fetched ||
-        !keys.pt_index_max.fetched || !keys.kernel_el.fetched ||
-        !keys.arm_tt_l1_index_mask.fetched) {
-        kpm_append(t, "✗ 上面标 fetched=no 的键里有必需项缺失 —— 中止（不回退成硬编码常量）。\n");
+        !keys.pt_index_max.fetched || !keys.kernel_el.fetched) {
+        kpm_append(t, "✗ 上面标 fetched=no 的键里有必需项缺失 —— 中止（不回退成兜底常量）。\n");
         return KM_PM_KEYS_MISSING;
     }
 
     /* ── ③ 页表几何 ── */
-    kpm_append(t, "== ③ 页表几何（L1 掩码来自 XPF，L2/L3 是 16K 常量）==\n");
-    const uint64_t l1IndexMask = keys.arm_tt_l1_index_mask.value;
-    kpm_append(t, "  kernelConstant.ARM_TT_L1_INDEX_MASK=%#llx（T1SZ_BOOT 实读=%#llx）\n",
-               (unsigned long long)l1IndexMask, (unsigned long long)keys.t1sz_boot.value);
+    /*
+     * L1 用**本文件的用户侧常量**（KM_PM_INDEX_L1），不从 XPF 取 —— 理由见文件头部：
+     * ARM_TT_L1_INDEX_MASK 按 T1SZ_BOOT（内核侧 TTBR1 几何）选值，本模块建的是
+     * 用户 pmap 的窗口，要的是 T0SZ 那一套。老机型上两者重合（都是 25），
+     * 目标机上 T1SZ_BOOT = 17 → 分家。
+     *
+     * `l1Shift` 仍然**从掩码里数出来**、而不是把 KM_PM_SHIFT_L1 直接赋进
+     * levels[].shift：位移与掩码是两个独立的抄写点，只留一个来源时抄错哪个都会安静
+     * 生效；两个来源互相对照，任一侧抄错立刻停。所以这里的推导从"取值手段"变成
+     * "自检手段"，判据见下面那两段。
+     */
+    kpm_append(t, "== ③ 页表几何（三级都是 16K 用户侧常量；不从 XPF 取 L1 掩码）==\n");
+    const uint64_t l1IndexMask = KM_PM_INDEX_L1;
+    kpm_append(t, "  L1 掩码 = %#llx（bits 38:36 共 3 位 = 用户侧 T0SZ 25：上界 2^39 ÷ "
+                  "L1 块 2^36 = 8 块）\n",
+               (unsigned long long)l1IndexMask);
+    /*
+     * T1SZ_BOOT 只打不用。它是这台设备**内核侧**几何的来源，也正是本模块不再从
+     * XPF 取掩码的原因；摆在这里是为了日后一眼辨认 —— 看到 T1SZ_BOOT = 17 就应当
+     * 知道 XPF 那个键会给 11 位（common.c:118），与上面这行 3 位掩码不是同一套几何。
+     * 值为 0 表示这个键没取到（它是可选项，不阻断预检）。
+     */
+    kpm_append(t, "  kernelConstant.T1SZ_BOOT 实读 = %llu（内核侧几何，仅诊断；"
+                  "任一情况下都不参与本模块的几何计算）\n",
+               (unsigned long long)keys.t1sz_boot.value);
 
     uint64_t l1Shift = 0;
     while (l1Shift < 63 && ((l1IndexMask >> l1Shift) & 0x1ULL) == 0) {
@@ -872,8 +942,26 @@ static km_physmap_status kpm_load(km_pm_ctx *ctx, km_pm_text *t)
     if (l1IndexMask == 0 || ((l1IndexMask >> l1Shift) & 0x1ULL) == 0) {
         kpm_append(t, "✗ L1 索引掩码 %#llx 解不出位移 —— 中止。\n",
                    (unsigned long long)l1IndexMask);
-        return KM_PM_KEYS_MISSING;
+        /*
+         * 归到 NOT_READY，**不是** KEYS_MISSING。
+         *
+         * 这条判据看的是源文件里那两个几何常量的自洽，与 XPF 有没有取到键无关。
+         * 而 KEYS_MISSING 的摘要会显示"有必需的 XPF 键取不到" —— 那是误导：
+         * 上一轮 L1 掩码翻车时，真正的原因是取错了**来源**（内核侧 T1SZ 几何），
+         * 报的却是键缺失，会把人往"XPF 解析失败"的方向带。
+         */
+        return KM_PM_NOT_READY;
     }
+    if (l1Shift != KM_PM_SHIFT_L1) {
+        kpm_append(t, "✗ L1 掩码 %#llx 解出的位移是 %llu，KM_PM_SHIFT_L1 是 %llu ——\n",
+                   (unsigned long long)l1IndexMask, (unsigned long long)l1Shift,
+                   (unsigned long long)KM_PM_SHIFT_L1);
+        kpm_append(t, "  两个抄写点不一致（源文件里的掩码与位移不是同一套几何），"
+                      "中止，不挑一个继续。\n");
+        return KM_PM_NOT_READY; /* 同上：常量自洽问题，不是键缺失 */
+    }
+    kpm_append(t, "✓ L1 shift 自检：从掩码数出 %llu，与 KM_PM_SHIFT_L1（%llu）一致\n",
+               (unsigned long long)l1Shift, (unsigned long long)KM_PM_SHIFT_L1);
 
     ctx->levels[KM_PM_TT_L1_LEVEL] = (km_pm_tt_level){
         .offMask = KM_PM_OFFMASK_L1,
@@ -911,13 +999,13 @@ static km_physmap_status kpm_load(km_pm_ctx *ctx, km_pm_text *t)
     /*
      * 合法性判据（两条都不是"应该成立"，是这条算法的前提）：
      *   · L1 索引 < L1_BLOCK_COUNT：窗口是"最后一个 L1 块"，索引必须是 7（16K）。
-     *     越界就说明 XPF 的掩码与窗口地址说的不是同一台设备。
+     *     越界就说明本文件那套几何常量与窗口地址说的不是同一个地址空间。
      *   · L3 索引必须是 0：自映射写的是窗口地址那条 L3 表的**第 0 项**。
      *     L3 索引非 0 时"窗口的页表项 = 表第 0 项"就不成立，写进去的是别的项的地址
      *     —— 那是一次写错地址的内核写。
      */
     if (windowL1Index >= KM_PM_16K_L1_BLOCK_COUNT) {
-        kpm_append(t, "✗ 窗口的 L1 索引 %llu ≥ L1 块数 %llu —— 掩码与窗口地址不自洽，中止。\n",
+        kpm_append(t, "✗ 窗口的 L1 索引 %llu ≥ L1 块数 %llu —— 几何常量与窗口地址不自洽，中止。\n",
                    (unsigned long long)windowL1Index,
                    (unsigned long long)KM_PM_16K_L1_BLOCK_COUNT);
         return KM_PM_KEYS_MISSING;
@@ -931,9 +1019,10 @@ static km_physmap_status kpm_load(km_pm_ctx *ctx, km_pm_text *t)
                (unsigned long long)windowL1Index, (unsigned long long)KM_PM_16K_L1_BLOCK_COUNT);
 
     /*
-     * ── 几何自洽，两条 ──
+     * ── 几何自洽，两条 —— 这条判据是本轮真机翻车时**唯一抓住问题的地方**，
+     *    不要删、不要放宽，只能加强 ──
      *
-     * 这不是"再确认一遍"，而是把一个**已经踩过的坑**变成可执行判据：
+     * 这不是"再确认一遍"，而是把一个**已经踩过两次的坑**变成可执行判据：
      * L1 索引掩码有两种写法（11 位 0x7ff000000000 / 3 位 0x7000000000），
      * 而窗口地址 0x7000000000 在**两种写法下都给出索引 7** —— 于是"用错掩码"
      * 这件事在看索引那一行时**看不出来**。掩码与块数的关系才是能分辨它的东西：
@@ -941,8 +1030,25 @@ static km_physmap_status kpm_load(km_pm_ctx *ctx, km_pm_text *t)
      * 11 位掩码会算出 2048，立刻中止 —— 而它一旦漏过去，遍历会在 L1 那一步
      * 索引到别的表项，把一个不属于自己的表当成下一级表。
      *
+     * **不要把这条判据当成形式主义**：在窗口地址 0x7000000000 这一个点上，
+     * 11 位掩码算出的索引与 3 位的**恰好相同**（用户 VA 的 bits 39..46 恒为 0，
+     * 11 位掩码多覆盖的那几位在用户空间里永远是 0 —— KernelMemory.m:1212-1218
+     * 记着同一件事："对用户 VA 恰好蒙对"）。所以"用错掩码"在那一点上不产生
+     * 错的索引值，只有在地址往下移（用户空间更低处）时才真错。
+     * 换句话说：位宽自洽判据是**唯一**能在本机上分辨这两套几何的东西；
+     * 拿"索引值看起来对"去论证掩码没问题，正是这次翻车的推理。
+     *
+     * 真机（iPad14,3 / M2 / iPadOS 16.4.1）上就是这么停住的，而当时这一条的
+     * 失败文本只说了"XPF 给的掩码不是这台机器的几何（或常量抄错了）"——
+     * 方向对，但没有指向根因。根因是**语义错配**，所以下面把两条路都铺在文本里：
+     *     本模块的 L1 掩码必须是**用户侧 T0SZ** 几何（上界 2^39 ÷ L1 块 2^36 = 8 块）
+     *     11 位掩码则来自**内核侧 T1SZ_BOOT**（common.c:113-127 按它选值）
+     * 两者在 T0SZ == T1SZ == 25 的老机型上重合、在 T1SZ_BOOT = 17 的目标机上分家。
+     * 失败时一并打印 T1SZ_BOOT 的实读值：那是"这台设备内核侧几何长什么样"的
+     * 唯一线索，下次看一眼就知道该往哪个方向查。
+     *
      * 第二条同理：一个 L2 块覆盖多少页，必须与 Dopamine util.c:384-394 的块数一致
-     * （16K：0x2000000 / 0x4000 = 2048）。把"我抄的两个数是不是同一台机器的"
+     * （16K：0x2000000 / 0x4000 = 2048）。把"我抄的两个数是不是同一套几何的"
      * 变成可执行检查，而不是靠人比对两行常量。
      */
     const uint64_t l1BlockCountFromMask = ((l1IndexMask >> l1Shift) + 1);
@@ -955,10 +1061,21 @@ static km_physmap_status kpm_load(km_pm_ctx *ctx, km_pm_text *t)
                (unsigned long long)(KM_PM_16K_L2_BLOCK_SIZE / ctx->pageSize),
                (unsigned long long)KM_PM_16K_L2_BLOCK_COUNT);
     if (l1BlockCountFromMask != KM_PM_16K_L1_BLOCK_COUNT) {
-        kpm_append(t, "✗ L1 掩码与 L1 块数不自洽：掩码推出 %llu 块，常量是 %llu ——\n",
-                   (unsigned long long)l1BlockCountFromMask,
+        kpm_append(t, "✗ L1 掩码与 L1 块数不自洽：掩码 %#llx 推出 %llu 块，常量是 %llu ——\n",
+                   (unsigned long long)l1IndexMask, (unsigned long long)l1BlockCountFromMask,
                    (unsigned long long)KM_PM_16K_L1_BLOCK_COUNT);
-        kpm_append(t, "  说明 XPF 给的掩码不是这台机器的几何（或常量抄错了），中止。\n");
+        kpm_append(t, "  先查掩码的**来源方向**：本模块要的是**用户侧 T0SZ** 几何 ——\n");
+        kpm_append(t, "    用户地址空间上界 2^39（MACH_VM_MAX_ADDRESS）÷ L1 块 2^36 = 8 块 → "
+                      "3 位 → 0x0000007000000000。\n");
+        kpm_append(t, "  若掩码是 11 位 0x00007ff000000000，那属于**内核侧 T1SZ_BOOT** 几何：\n");
+        kpm_append(t, "    XPF 的 kernelConstant.ARM_TT_L1_INDEX_MASK 就是按 T1SZ_BOOT 选值的"
+                      "（common.c:113-127，17 → 11 位 / 25 → 3 位）。\n");
+        kpm_append(t, "  本机内核侧 T1SZ_BOOT 实读 = %llu；两个语义在 T0SZ == T1SZ == 25 的\n",
+                   (unsigned long long)keys.t1sz_boot.value);
+        kpm_append(t, "  老机型上重合，在 T1SZ_BOOT = 17 的 ARM_LARGE_MEMORY 机型上分家 ——\n");
+        kpm_append(t, "  本模块要的**始终**是前者（常量 KM_PM_INDEX_L1，与 KernelPhysWindow 的\n");
+        kpm_append(t, "  KM_PW_INDEX_L1 同一取值）。也可能是 KM_PM_INDEX_L1 / KM_PM_SHIFT_L1 / "
+                      "KM_PM_16K_L1_BLOCK_COUNT 三个常量之间被改坏了。中止。\n");
         return KM_PM_KEYS_MISSING;
     }
     if ((KM_PM_16K_L2_BLOCK_SIZE / ctx->pageSize) != KM_PM_16K_L2_BLOCK_COUNT) {
@@ -967,7 +1084,41 @@ static km_physmap_status kpm_load(km_pm_ctx *ctx, km_pm_text *t)
                    (unsigned long long)KM_PM_16K_L2_BLOCK_COUNT);
         return KM_PM_KEYS_MISSING;
     }
-    kpm_append(t, "✓ 几何自洽（L1 掩码↔块数、L2 块↔页大小都一致）\n");
+    kpm_append(t, "✓ 几何自洽（L1 掩码↔块数、L2 块↔页大小都一致；"
+                  "T1SZ_BOOT=%llu 只作辨认，未参与计算）\n",
+               (unsigned long long)keys.t1sz_boot.value);
+
+    /*
+     * 第三条：与 KernelPhysWindow 的几何**对齐检查**。
+     *
+     * 两个模块算的是同一个窗口地址的同一套几何（KernelPhysWindow.m 的
+     * KM_PW_16K_BLOCK_SIZE / KM_PW_16K_BLOCK_COUNT 与本文件的
+     * KM_PM_16K_L1_BLOCK_SIZE / KM_PM_16K_L1_BLOCK_COUNT 是同一对常量），
+     * 而窗口地址是**它**算出来的（km_physwindow_address()）。于是"两处有没有分叉"
+     * 这件事在这里可以判：窗口必须恰好是最后一个 L1 块的块首，即
+     *     window == L1_BLOCK_SIZE × (L1_BLOCK_COUNT − 1)
+     * 分叉的失败形态很明确：KernelPhysWindow 那侧若改了页大小分支或块常量
+     * （例如换到 4K 的 0x3FC0000000）而本文件还是 16K，这条立刻不过；反过来
+     * 本文件这几个常量被改坏也一样。这是把任务书那句"两个模块必须表达同一套几何"
+     * 从注释约定变成可执行判据 —— 只靠注释约定，本轮就已经分叉过一次。
+     * 判据写成乘法而不是与 0x7000000000 比较：写死就多出第三个抄写点。
+     */
+    uint64_t expectedWindow = 0;
+    if (!kpm_mul(KM_PM_16K_L1_BLOCK_SIZE, KM_PM_16K_L1_BLOCK_COUNT - 1ULL, &expectedWindow) ||
+        ctx->window != expectedWindow) {
+        kpm_append(t, "✗ 窗口地址 %#llx ≠ L1_BLOCK_SIZE %#llx × (L1_BLOCK_COUNT %llu − 1) = %#llx ——\n",
+                   (unsigned long long)ctx->window, (unsigned long long)KM_PM_16K_L1_BLOCK_SIZE,
+                   (unsigned long long)KM_PM_16K_L1_BLOCK_COUNT,
+                   (unsigned long long)expectedWindow);
+        kpm_append(t, "  说明 km_physwindow_address() 给出的几何与本文件的 L1 常量不是同一套\n");
+        kpm_append(t, "  （KernelPhysWindow.m 那侧的页大小分支或块常量改了）。中止，不猜窗口。\n");
+        return KM_PM_NOT_READY;
+    }
+    kpm_append(t, "✓ 与 KernelPhysWindow 的几何对齐：窗口 %#llx = L1 块大小 %#llx × %llu"
+                  "（第 %llu 个 L1 块的块首）\n",
+               (unsigned long long)ctx->window, (unsigned long long)KM_PM_16K_L1_BLOCK_SIZE,
+               (unsigned long long)(KM_PM_16K_L1_BLOCK_COUNT - 1ULL),
+               (unsigned long long)(KM_PM_16K_L1_BLOCK_COUNT - 1ULL));
 
     /* ── ④ pmap 链路 ── */
     kpm_append(t, "== ④ pmap 链路（proc → task → vm_map → pmap）==\n");

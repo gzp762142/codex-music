@@ -73,8 +73,8 @@ uint64_t km_xpf_kernel_base(void);
  *         PatchFinder_arm64.c:52-75 的 resolve_adrp_..._reference 返回
  *        section 的链接期地址）。要用它必须自己 + slide。
  *      · `kernelConstant.*`   —— finder 直接算出一个**数值**（例如
- *        common.c:113-127 的 ARM_TT_L1_INDEX_MASK 就是按 T1SZ_BOOT 选出的
- *        掩码本身），**不能**再加 slide、也不能当地址解引用。
+ *        common.c:129-176 的 PT_INDEX_MAX：数出来的表项条数），**不能**再加
+ *        slide、也不能当地址解引用。
  *    这条区分在 KernelSlide.m:1073 已经用掉过一次（`symbol + slide`），
  *    但那处是调用方自己记得；这里把它变成类型上的区分。
  *
@@ -82,8 +82,26 @@ uint64_t km_xpf_kernel_base(void);
  *    一律返回 0（xpf.c:710），而这两者的处置完全不同：前者是"这份 XPF 快照
  *    不含这个键"，后者是"含，但这次没找到"。所以取值结果带 registered 标志。
  *
- * ③ 一次取齐。8 个键分 8 次调用会被人误会成"8 个独立步骤"，而实际上它们是
+ * ③ 一次取齐。7 个键分 7 次调用会被人误会成"7 个独立步骤"，而实际上它们是
  *    建表这一个动作的**同一组输入**；一次取齐也让诊断能把它们并列显示。
+ *
+ * ── 为什么这里**没有** kernelConstant.ARM_TT_L1_INDEX_MASK ──
+ *
+ * 它曾经在这个集合里（KernelPhysMap 用它当页表几何的 L1 索引掩码），真机验证
+ * （iPad14,3 / M2 / iPadOS 16.4.1）把它否掉了：common.c:113-127 的那个键按
+ * kernelConstant.T1SZ_BOOT 选值，而 T1SZ_BOOT 是**内核侧**（TTBR1）的 VA 位宽 ——
+ * 该机上实读 17，于是它给 11 位 0x00007ff000000000（与 libkfd 快照
+ * static_info.h:65 的 ARM_16K_TT_L1_INDEX_MASK 同值，那一份也是为 T1SZ = 17 的
+ * 内核写的）。而 KernelPhysMap 建的是**用户 pmap** 的窗口，要的是**用户侧**
+ * （T0SZ = 25）几何：上界 2^39 ÷ L1 块 2^36 = 8 块 → 3 位 0x0000007000000000。
+ * 两个语义在 T0SZ == T1SZ == 25 的老机型上重合，在目标机上分家 —— 于是预检在
+ * "掩码推出的块数"那条自洽判据上停住（详见 KernelPhysMap.m 文件头部那段）。
+ *
+ * 所以取值侧**不再取它**、诊断侧**不再显示它**：留着就是一个"取了但不用"的键，
+ * 而它正是最容易被人顺手拿回去当几何用的那一个。用户侧几何是常量（由架构与页
+ * 大小定死，不来自任何一次读取），不需要经过这里。KernelPhysMap 只保留
+ * kernelConstant.T1SZ_BOOT 作诊断（说明这台设备内核侧几何长什么样），
+ * 它不参与几何计算。
  */
 typedef struct {
     /// 键在 XPF 的 item 链表里注册过（xpf_item_register 走过一次）。
@@ -101,6 +119,9 @@ typedef struct {
 
 /// 「建页表窗口」这条路一次要用到的全部 XPF 键。
 /// 字段名即键名（下划线换点），注释标出返回值是哪一类。
+///
+/// **顺序即 km_xpf_physmap_key_name() 的下标**（XpfBridge.m 里那组 offsetof
+/// 静态断言把字段顺序钉住）。ARM_TT_L1_INDEX_MASK 不在这里，理由见上面那一节。
 typedef struct {
     km_xpf_item_result pv_head_table;        /* kernelSymbol.pv_head_table   → 链接期地址 */
     km_xpf_item_result vm_first_phys;        /* kernelSymbol.vm_first_phys   → 链接期地址 */
@@ -108,11 +129,10 @@ typedef struct {
     km_xpf_item_result cpu_ttep;             /* kernelSymbol.cpu_ttep        → 链接期地址 */
     km_xpf_item_result pt_index_max;         /* kernelConstant.PT_INDEX_MAX  → 数值 */
     km_xpf_item_result kernel_el;            /* kernelConstant.kernel_el     → 数值 */
-    km_xpf_item_result arm_tt_l1_index_mask; /* kernelConstant.ARM_TT_L1_INDEX_MASK → 数值 */
-    km_xpf_item_result t1sz_boot;            /* kernelConstant.T1SZ_BOOT     → 数值 */
+    km_xpf_item_result t1sz_boot;            /* kernelConstant.T1SZ_BOOT     → 数值（仅诊断） */
 } km_xpf_physmap_keys;
 
-/// 一次取齐上面那 8 个键（同一个临界区内完成，避免中途 deinit 让结果自相矛盾）。
+/// 一次取齐上面那 7 个键（同一个临界区内完成，避免中途 deinit 让结果自相矛盾）。
 ///
 /// 返回 false 只有两种含义：out 为 NULL，或 **XPF 未初始化**（此前置不成立）。
 /// **不含**"某个键取不到" —— 那要看逐键的 registered / fetched（两者要分开报告，
@@ -123,7 +143,7 @@ typedef struct {
 bool km_xpf_physmap_keys_fetch(km_xpf_physmap_keys *out);
 
 /*
- * 刻意**不导出**「只取一个键」的公开版本：上面的 fetch 已经一次取齐全部 8 个
+ * 刻意**不导出**「只取一个键」的公开版本：上面的 fetch 已经一次取齐全部 7 个
  * （同一个临界区），另开一个单键入口会是一条谁都不走的路 —— 工程里不要
  * "看起来能跑的空壳"。逐键形状的取值由 fetch 内部的 item_get_locked 承担。
  */

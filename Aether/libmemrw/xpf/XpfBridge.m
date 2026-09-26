@@ -225,10 +225,9 @@ static const char *const kPhysmapKeyNames[] = {
     "kernelSymbol.cpu_ttep",
     "kernelConstant.PT_INDEX_MAX",
     "kernelConstant.kernel_el",
-    "kernelConstant.ARM_TT_L1_INDEX_MASK",
     "kernelConstant.T1SZ_BOOT",
 };
-#define KM_XPF_PHYSMAP_KEY_COUNT 8
+#define KM_XPF_PHYSMAP_KEY_COUNT 7
 
 _Static_assert(sizeof(kPhysmapKeyNames) / sizeof(kPhysmapKeyNames[0]) == KM_XPF_PHYSMAP_KEY_COUNT,
                "key name table size must match km_xpf_physmap_keys");
@@ -237,22 +236,25 @@ _Static_assert(sizeof(kPhysmapKeyNames) / sizeof(kPhysmapKeyNames[0]) == KM_XPF_
  * 「名字表下标 ↔ 结构体字段」的**机器检查**。
  *
  * 上面那句 _Static_assert 只钉了名字表自己的条数，**钉不住结构体**：
- * km_xpf_physmap_keys 的 8 个字段类型完全相同（都是 km_xpf_item_result），
+ * km_xpf_physmap_keys 的 7 个字段类型完全相同（都是 km_xpf_item_result），
  * 所以 `out->cpu_ttep = results[3]` 这种赋值在字段被改名或换序之后**照样编译**，
  * 只是把 A 键的结果静默地放进 B 字段 —— 而那种错在屏幕上看起来完全正常，
  * 正是本项目最忌的一类（KernelSlide.m:1090-1098 记着"观测格式害人抄错"的账）。
  *
  * offsetof 是唯一能钉住顺序的东西：字段换序 → 偏移变 → 这两句立刻编译失败。
- * 钉三个不均匀分布的下标（0 与 7 由 sizeof 那句间接覆盖）。
+ * 钉三个不均匀分布的下标（0 与末位由 sizeof 那句间接覆盖）。
+ *
+ * 注意末位断言跟着字段总数走：本轮移除了 arm_tt_l1_index_mask（理由见
+ * XpfBridge.h 的「为什么这里没有 ARM_TT_L1_INDEX_MASK」），t1sz_boot 从 7 挪到 6。
  */
 _Static_assert(offsetof(km_xpf_physmap_keys, cpu_ttep) == 3 * sizeof(km_xpf_item_result),
                "field order drift: cpu_ttep must stay at slot 3");
 _Static_assert(offsetof(km_xpf_physmap_keys, pt_index_max) == 4 * sizeof(km_xpf_item_result),
                "field order drift: pt_index_max must stay at slot 4");
-_Static_assert(offsetof(km_xpf_physmap_keys, t1sz_boot) == 7 * sizeof(km_xpf_item_result),
-               "field order drift: t1sz_boot must stay at slot 7");
-_Static_assert(sizeof(km_xpf_physmap_keys) == 8 * sizeof(km_xpf_item_result),
-               "field count drift: km_xpf_physmap_keys must hold exactly 8 results");
+_Static_assert(offsetof(km_xpf_physmap_keys, t1sz_boot) == 6 * sizeof(km_xpf_item_result),
+               "field order drift: t1sz_boot must stay at slot 6");
+_Static_assert(sizeof(km_xpf_physmap_keys) == 7 * sizeof(km_xpf_item_result),
+               "field count drift: km_xpf_physmap_keys must hold exactly 7 results");
 
 const char *km_xpf_physmap_key_name(int index)
 {
@@ -322,7 +324,7 @@ bool km_xpf_physmap_keys_fetch(km_xpf_physmap_keys *out)
 
     /*
      * 按位置逐个搬运而不是 memcpy：memcpy 会在字段换序/改名时静静地跟着错。
-     * 逐个赋值同样挡不住（八个字段类型相同），所以顺序由上面那组 offsetof
+     * 逐个赋值同样挡不住（七个字段类型相同），所以顺序由上面那组 offsetof
      * 静态断言来钉。
      */
     out->pv_head_table = results[0];
@@ -331,8 +333,7 @@ bool km_xpf_physmap_keys_fetch(km_xpf_physmap_keys *out)
     out->cpu_ttep = results[3];
     out->pt_index_max = results[4];
     out->kernel_el = results[5];
-    out->arm_tt_l1_index_mask = results[6];
-    out->t1sz_boot = results[7];
+    out->t1sz_boot = results[6];
     return true;
 }
 
