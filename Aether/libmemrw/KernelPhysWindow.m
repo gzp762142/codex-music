@@ -33,10 +33,24 @@
  * 它紧邻上界 MACH_VM_MAX_ADDRESS（0x8000000000），正常分配不会覆盖到它，
  * 所以它现在必然是未映射的（样本 §0.4 (II) 已把"它是不是别人建好的"排除掉了）。
  */
-#define KM_PW_16K_BLOCK_SIZE 0x1000000000ULL /* 2^36 */
-#define KM_PW_16K_BLOCK_COUNT 7ULL           /* = L1_BLOCK_COUNT(8) − 1，见下面几何 */
+/*
+ * 这两个常量是 **L1 表的表项数**，不是"最大索引"。
+ *
+ * 2026-09-26 纠正：它们原先是 7 / 255（= 表项数 − 1、即最大索引），于是
+ * km_physwindow_address() 靠 `SIZE × COUNT` 凑出地址，而同一个文件里
+ * physwindow_walk() 的几何自洽断言却按"掩码覆盖几项"来比 —— **7 ≠ 8，断言恒假**，
+ * 探针在 `✗ 页表几何自相矛盾` 处终止、一次 kread 都不发（真机症状：
+ * 「建窗 未完成：前置不成立」，诊断第 ⑥ 段那三行）。
+ *
+ * 名字叫 COUNT、注释写着 "= L1_BLOCK_COUNT(8) − 1"，这两件事本身就是矛盾的，
+ * 而 KernelPhysMap.m:90 的同一对常量取的是 **8** —— 两个模块对同一套几何持相反语义。
+ * 现在统一成"表项数"，最大索引一律在用到的地方写成 `COUNT − 1`。
+ * 地址取值不变：2^36 × (8 − 1) = 0x7000000000。
+ */
+#define KM_PW_16K_BLOCK_SIZE 0x1000000000ULL /* 2^36，一个 L1 表项覆盖的字节数 */
+#define KM_PW_16K_BLOCK_COUNT 8ULL           /* L1 表项数（= 最大索引 7 + 1） */
 #define KM_PW_4K_BLOCK_SIZE 0x40000000ULL    /* 2^30 */
-#define KM_PW_4K_BLOCK_COUNT 255ULL          /* = L1_BLOCK_COUNT(256) − 1 */
+#define KM_PW_4K_BLOCK_COUNT 256ULL          /* L1 表项数（= 最大索引 255 + 1） */
 
 /*
  * arm64 页表几何。
@@ -244,7 +258,14 @@ uint64_t km_physwindow_address(void)
         return 0;
     }
     uint64_t window = 0;
-    if (!physwindow_mul(blockSize, blockCount, &window)) {
+    /*
+     * 窗口 = **最后一个 L1 块的块首** = SIZE × (COUNT − 1)，不是 SIZE × COUNT。
+     *
+     * 为什么这里是 `− 1`：COUNT 是表项数（16K 下 8），而窗口落在**第 8 项、下标 7**
+     * 那一块上（KernelPhysMap.m:1897 的同一条公式、同一个理由）。写成 × COUNT
+     * 会得到 0x8000000000 —— 那是用户地址空间的上界本身，不是一个可用的窗口地址。
+     */
+    if (!physwindow_mul(blockSize, blockCount - 1ULL, &window)) {
         return 0;
     }
     return window;
@@ -343,6 +364,11 @@ static km_pw_walk_result physwindow_walk(km_pw_text *t, uint64_t pmapTtep, uint6
      *      (0x0000007000000000 >> 36) + 1 = 8     与 KM_PW_16K_BLOCK_COUNT 相等 ✓
      *      (0x00007ff000000000 >> 36) + 1 = 2048  ← 当年就是这一版，✗
      * 本文件踩过这个坑（L1 掩码曾写成 11 位），所以留成判据而不是留成注释。
+     *
+     * **但这条判据自己也曾因为常量语义不一致而恒假**：那个 ✓ 标注写在这里的时候，
+     * KM_PW_16K_BLOCK_COUNT 的实际值是 7（最大索引），于是 8 != 7 永远成立、
+     * 探针一直在 `✗ 页表几何自相矛盾` 处终止。断言"覆盖几项"就该和"表项数"比 ——
+     * 这一点写在常量定义处（文件头），此处只是提醒：**改常量语义要先看这一行**。
      *
      * L2/L3 用"位移差"表达，同样把位数钉死：L1→L2 与 L2→L3 各跨 11 位索引，
      * 即两级各有 2^11 = 2048 个表项（与 Dopamine info.c:384-390 的 16K 取值一致）。
