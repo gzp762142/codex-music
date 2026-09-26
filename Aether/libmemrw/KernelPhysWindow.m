@@ -448,9 +448,39 @@ static km_pw_walk_result physwindow_walk(km_pw_text *t, uint64_t pmapTtep, uint6
      * 遍历就会在层与层之间**悄悄换基准**，而报告里看不出这一点。
      */
     uint64_t tableKva = 0;
+    /*
+     * PA→KVA 换算表**按需建立**，不要求用户先去点「Slide」。
+     *
+     * 2026-09-26 改：这里原先是 `if (!km_phystokv_ready()) { 报「先点 Slide」; return; }`。
+     * 那个写法与 KernelPhysMap.m:1584-1608 的同一处**刚好相反**——那边走的是
+     * `km_phystokv_ensure()`，注释写明理由是「面板上只有一个按钮是"我这个动作"，
+     * 用户不该知道实现里分成几步」。真机症状就是那次「只点建窗 → 遍历中断：
+     * PA→KVA 换算不可用（先跑「Slide」）」，而用户按提示点了 Slide 之后一切正常，
+     * 说明**能力本来就有，缺的只是这一句调用**。
+     *
+     * ensure 内部：已就绪则空操作；否则自己 km_xpf_init + 跑完那套自检
+     * （KernelSlide.h 写了为什么换算表与 slide 分不开）。本模块是**只读**探针，
+     * 但 ensure 会 kread —— 那是允许的：只读的定义是"不写内核内存"，不是"不发 kread"。
+     * 面板侧已经把本探针放在串行队列上（与读取链不并发），前置条件满足。
+     *
+     * 耗时：首次要解压解析几十 MB 的 kernelcache，几十秒是预期耗时不是卡死 ——
+     * 面板那侧按 `KernelPhysWindow.h` 的说明把按钮切成"计算中…"。
+     */
     if (!km_phystokv_ready()) {
-        pw_append(t, "✗ 换算表未就绪：km_phystokv_ready()=false，连顶层表都补不成 KVA。\n");
-        pw_append(t, "  先点面板上的「Slide」按钮（它要 kread + XPF，且必须与读取链串行）。\n");
+        pw_append(t, "PA→KVA 换算表未就绪 —— 调 km_phystokv_ensure() 按需建立\n");
+        pw_append(t, "  （首次要解压解析几十 MB 的 kernelcache，几十秒是预期耗时，不是卡死）\n");
+    }
+    if (!km_phystokv_ensure()) {
+        /*
+         * 失败就只说「建立失败 + 去看谁建立的」。**此处刻意不调 km_xpf_ready() /
+         * km_xpf_last_error()**：那两个声明在 XpfBridge.h，而本文件只包含
+         * KernelMemory.h / KernelSlide.h / 自己的头 —— 为了两行提示给一个 900 行、
+         * 一直只用两个头文件的模块引入新的 include 依赖，不划算（真编译代价由 CI 付，
+         * 而这里给的信息量几乎没有增加）。换算表由 KernelSlide 建立，失败原因
+         * 本来就在它的诊断里。
+         */
+        pw_append(t, "✗ 换算表建立失败：页表项里存的是**物理**地址，没有这条换算，\n");
+        pw_append(t, "  本模块连顶层表都补不成 KVA。失败原因见 KernelSlide 的诊断。\n");
         return KM_PW_WALK_NO_KVA;
     }
     tableKva = km_phystokv(pmapTtep);
@@ -791,7 +821,7 @@ km_physwindow_status km_physwindow_probe(void)
             break;
         case KM_PW_WALK_NO_KVA:
             status = KM_PW_NOT_READY;
-            summary = @"[建窗] 遍历中断：PA→KVA 换算不可用（先跑「Slide」）";
+            summary = @"[建窗] 遍历中断：PA→KVA 换算表建立失败（见列表）";
             break;
         case KM_PW_WALK_L3_ODD:
             status = KM_PW_L3_NOT_LEAF;
