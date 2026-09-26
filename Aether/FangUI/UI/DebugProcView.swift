@@ -128,7 +128,12 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         (btnSlide, "Slide", #selector(onSlideProbe)),
         (btnPhysWindow, "建窗", #selector(onPhysWindowProbe)),
         (btnPhysMapPre, "表预检", #selector(onPhysMapPre)),
-        (btnPhysMapBuild, "建表", #selector(onPhysMapBuild))
+        (btnPhysMapBuild, "建表", #selector(onPhysMapBuild)),
+        // 「测偏移」：在 task 结构里**实测** vm_map 字段的偏移（KernelStructScan，全程只读）。
+        // 为什么需要它：pmap 链路里 task->map 用的是版本表的 0x28，而真机上用它读出来的不是
+        // vm_map —— 该偏移在 iOS 16.x 各构建间会浮动、硬编码不可靠。本按钮把那个数变成实测值。
+        // 按钮实例不需要单独引用（不更新它的标题），所以直接内联构造，省一个属性声明。
+        (UIButton(type: .system), "测偏移", #selector(onScanMap))
     ]
 
     private let accent = UIColor.hex(0x185EE0)
@@ -1322,6 +1327,67 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         lines.append("== 对外接口 ==")
         lines.append("km_physmap_magic_pt() = 0x" + String(km_physmap_magic_pt(), radix: 16))
         lines.append("km_physmap_build() status = " + String(status.rawValue))
+        return lines.joined(separator: "\n")
+    }
+
+    // MARK: - 测偏移（KernelStructScan）：只读
+
+    /// 「测偏移」按钮：只读扫描 task 结构，**实测** vm_map 字段的偏移。
+    ///
+    /// 与「表预检」同一套写法、同一个理由：整个扫描会 kread 几十次，必须走
+    /// AutoTracker 那条串行队列（libkfd 的 kread 后端每次读都要改写自己 psemnode
+    /// 的 pinfo，与读取链并发就是互相踩），并且要在后台线程跑。
+    ///
+    /// **本按钮不做任何写操作**，所以它不需要「失败即终止本次会话」那条纪律：
+    /// 失败之后可以立刻再点一次。
+    private var scanMapBusy = false
+    private var scanMapStarted = Date.distantPast
+
+    @objc private func onScanMap() { runScanMap() }
+
+    private func runScanMap() {
+        if scanMapBusy {
+            // 与「建窗」同门槛：一次扫描只有几十次内核读，真卡住的话是内核层面的
+            // 事，30 秒足够判定，不必按 XPF 那种几十秒的门槛放行。
+            if Date().timeIntervalSince(scanMapStarted) <= 30 {
+                showReport("测偏移: 上一次扫描还没回来（内核可能被堵住了），等它")
+                return
+            }
+        }
+        scanMapBusy = true
+        scanMapStarted = Date()
+        probeLabel.text = "测偏移: 只读扫描中…"
+        probeLabel.textColor = idleText
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let text = AutoTracker.shared.syncExternal { DebugProcView.scanMapReport() }
+            DispatchQueue.main.async {
+                guard let s = self else { return }
+                s.scanMapBusy = false
+                s.showReport(text)
+            }
+        }
+    }
+
+    /// 真正碰 C 接口的部分。**必须在主线程之外执行**（见 runScanMap）。
+    private static func scanMapReport() -> String {
+        var lines: [String] = []
+        lines.append("== 实测 task->map 偏移（KernelStructScan 只读）==")
+        lines.append("本按钮不写内核内存：不经过任何 km_write / kwrite。")
+        lines.append("判据：某个候选对象的 +0x00 在内核地址域（pmap->tte 是 KVA）且 +0x08")
+        lines.append("是物理地址形态（pmap->ttep：非 0、< 2^48、16K 对齐）。物理地址高 16")
+        lines.append("位恒 0、内核 VA 高 16 位恒 0xffff，两个域对所有非零值互斥 —— 所以这个")
+        lines.append("组合与构建无关、与字段顺序无关，不是「某个偏移恰好如此」。")
+
+        let offset = km_scan_task_map_offset()
+        if let diagnostic = km_scan_diagnostic() {
+            lines.append(contentsOf: diagnostic.split(separator: "\n").map(String.init))
+        }
+        lines.append("== 对外接口 ==")
+        lines.append("km_scan_task_map_offset() = "
+                     + (offset == 0 ? "0（未命中或前置不成立 —— 见上面诊断第一行摘要）"
+                                    : "0x" + String(offset, radix: 16)))
+        lines.append("版本表里现在写的 task->map 偏移 = 0x" + String(km_task_map_offset(), radix: 16))
         return lines.joined(separator: "\n")
     }
 

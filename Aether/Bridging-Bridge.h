@@ -27,6 +27,12 @@
 // 所以面板上不必先点「Slide」（首次会花几十秒解析 kernelcache，按钮要先切到
 // "计算中…"）。调用同样要与读取链串行（AutoTracker.syncExternal）。
 #include "KernelPhysMap.h"
+// 「实测 task->map 偏移」的**只读**扫描探针（libmemrw，实现在 KernelStructScan.m）：
+// vm_map 字段在 task 结构里的偏移随 iOS 构建浮动，版本表里那个 0x28 在本机读出来的
+// 不是 vm_map。本模块把它从"抄来的常量"变成"在设备上测出来的值"——扫 task 的一段，
+// 用「pmap 头两个字段是 tte(KVA)/ttep(PA)」这个硬判据找出真 vm_map。
+// **全程一次内核写都不发**，所以它失败了可以直接重跑。
+#include "KernelStructScan.h"
 // 进程枚举需要 sysctl 与 kinfo_proc。iOS SDK 里有 <sys/sysctl.h>，
 // 但**没有 <libproc.h>**（那是 macOS 的手册），所以 proc_listpids / proc_pidpath
 // 无法在编译期声明，改在 Swift 里用 dlsym 运行时取。
