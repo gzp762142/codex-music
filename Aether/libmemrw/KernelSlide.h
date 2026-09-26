@@ -12,7 +12,8 @@
 //          那条路要用本模块算出的换算基准下钻，本模块不依赖它）。
 //
 //  依赖面只有三样，少一样都不成立：
-//    · KernelMemory.h —— kread 的 C 接口（km_read / km_read64 / km_is_kernel_address）
+//    · KernelMemory.h —— kread 的 C 接口（km_read / km_read64 / km_read_u32 /
+//                        km_is_kernel_address）
 //                        与两个只读访问器（km_current_proc / km_proc_fd_ofiles_offset）；
 //    · XpfBridge.h    —— 从设备上的 kernelcache 解出内核符号的链接期 vmaddr，
 //                        以及这份 kernelcache 自己的链接基址（km_xpf_kernel_base）；
@@ -85,26 +86,29 @@ bool km_phystokv_ready(void);
 /// 我不是没试过分开，是**分不开**，理由是数据依赖而不是代码摆放：
 ///   1. 读换算表要用符号的**运行时地址**，而符号地址 = 链接期 vmaddr + slide：
 ///      `slide_read_bases` 里是 `const uint64_t addr = symbol + slide;`
-///      （KernelSlide.m:1381），`slide_read_ptov_table` 里是
-///      `const uint64_t tableAddr = symbol + slide;`（KernelSlide.m:1073）。
+///      （KernelSlide.m:1852），`slide_read_ptov_table` 里是
+///      `const uint64_t tableAddr = symbol + slide;`（KernelSlide.m:1524）。
 ///      **没有 slide 就不知道去 kread 哪个地址。**
 ///   2. slide 唯一可信的来源就是 `slide_run_find_slide` 的自检，发布点在
-///      KernelSlide.m:1589-1597（`run.slideVerified` 只在自检通过后置位），
+///      KernelSlide.m:2118-2121（`run.slideVerified` 只在自检通过后置位），
 ///      只有那个值才会被写出来。**自检的实际判据是两条**（复查时对着代码改准过，
 ///      早先这里写成"五个链接期符号各自反推一致"，那与代码不符）：
-///        · `slide_verify_kernel_base`（KernelSlide.m:925-981）比对 Mach-O 头
-///          MH_MAGIC_64/cputype；
-///        · `slide_candidate_fits_image`（KernelSlide.m:604-650）做纯算术的映像窗口
+///        · `slide_verify_kernel_base`（KernelSlide.m:1109-1283）比对 kernel_base
+///          **页首**那两个 32 位字：MH_MAGIC_64 与 cputype（上游 perf.h:112-118
+///          的判据）。页首只能走**32 位读路径**（KernelMemory 的 km_read_u32，
+///          delta = 0x04）；64 位路径的源访问从 addr − 0x08 起，会踩前一页 ——
+///          前一页未映射就是整机 panic。两条路径的机制见那段注释，别简化。
+///        · `slide_candidate_fits_image`（KernelSlide.m:750-819）做纯算术的映像窗口
 ///          检查，外加**最多两个**符号（ptov_table / gVirtBase）的偏移自洽 ——
-///          取不到就跳过那一条（:636），所以缺符号时自检会降级成"只查头 + 算术"。
-///      "五个符号各自反推一致"只是 `slide_read_bases` 里的一句**注释**
-///      （KernelSlide.m:1360）与诊断文本（:1203-1249），代码里没有那条判据，
+///          取不到就跳过那一条（:797），所以缺符号时自检会降级成"只查头 + 算术"。
+///      "五个符号各自反推一致"只是 `slide_read_bases`（KernelSlide.m:1807 起）里
+///      的一句**注释**与诊断文本，代码里没有那条判据，
 ///      而且它发生在 slide 已经发布之后 —— 不能把它读成"自检更强"。
 ///      绕过上述两条去读表 = 在一个**未经验证**的地址上发 kread ——
 ///      那正是本工程两次彩屏的形态（KernelSlide.h:22-25 的血债那一段）。
 ///   3. `slide_run_load_tables` 的**这张表**只有一个提交点，且"全部到位才提交"
-///      （KernelSlide.m:1554-1558：memcpy g_ptov 与三个基准、置 g_convertReady），
-///      与 slide 的发布（:1594-1608）处在**同一个临界区**里 —— 中间状态对下游不可见。
+///      （KernelSlide.m:2072-2082：memcpy g_ptov 与三个基准、置 g_convertReady），
+///      与 slide 的发布（:2118-2139）处在**同一个临界区**里 —— 中间状态对下游不可见。
 ///      要单独建表就得再开一个提交点，而脱离这个临界区的第二个提交点意味着
 ///      "slide 有了、表只读了一半"这种中间状态有机会被下游看见。
 ///      （不说"唯一一处写全局"：本模块还写 g_slide / g_kernelBase / 诊断缓冲，
@@ -125,7 +129,7 @@ bool km_phystokv_ready(void);
 /// ptov_table），一个字节都不写，也不改任何内核状态 —— 所以失败不留残留，
 /// 重试是安全的。**但"可以重来"有一条边界，别说成无条件的**：
 ///   · kread 这一侧（读符号内容、读 ptov_table、读三个基准）—— 真的可以重来，
-///     `g_slideSettled` 只在整体成功时置位（KernelSlide.m:1608）。
+///     `g_slideSettled` 只在整体成功时置位（KernelSlide.m:2139）。
 ///   · **XPF finder 这一侧 —— 重来无效**：上游把 finder 的返回值（**包括 0**）
 ///     连同 cached 标志一起写在节点上（libxpf/xpf/xpf.c:702-705），只有
 ///     `xpf_stop()`（即 km_xpf_deinit()）才清链表，而 km_xpf_init() 在 ready 时

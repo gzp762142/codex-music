@@ -29,6 +29,27 @@ bool km_read(uint64_t addr, void *out, uint64_t len);
 /// 读一个 64 位字。失败返回 0（并置 *ok 为 false，ok 可为 NULL）。
 uint64_t km_read64(uint64_t addr, bool *ok);
 
+/// 读一个 32 位字，走**上游的 32 位读路径**（delta = 0x04）。
+///
+/// 与 km_read64 的差别**不是宽度，而是下溢量**，这条差别是本函数存在的唯一理由：
+///   · 64 位路径 delta = 0x0C，最低源访问地址 = addr − 0x08
+///     ⇒ addr 是页首（页内偏移 0）时那次访问落到**前一页**，未映射即整机 panic；
+///   · 32 位路径 delta = 0x04，最低源访问地址 = addr ⇒ **页首可读**。
+/// 机制（内核的 fill_pseminfo 不读 pinfo + 0、两个 delta 不同、上界来自 psem_name）
+/// 见 KernelMemory.m 里 KM_READ32_SOURCE_SPAN 那段注释。
+///
+/// 闸门按**整段源访问范围** [addr, addr + 0x30) 判，不是只判返回的那 4 个字节。
+/// addr 只需 **4 字节对齐**（自检要读 kernel_base + 4），不要求 8 字节对齐。
+///
+/// 返回值 / *ok 的语义：true（且 *ok = true）表示「闸门通过、且这一次读**已经发出**」；
+/// false（*ok 必为 false）表示**一次 kread 都没发** —— 地址形态不过、被页闸门拒、
+/// 或当前读后端不是 kread_sem_open（这条路径只存在于它之下）。
+///
+/// **`*ok` 不是可靠性校验**：底层 32 位路径是单次读、返回一个 u32，不提供
+/// 「两次读一致」那种校验（那是 km_read64 才做的）。所以它既不表示内核读成功，
+/// 也不表示读到的值正确 —— 判值必须靠调用方自己的判据（例如 MH_MAGIC_64）。
+bool km_read_u32(uint64_t addr, uint32_t *out, bool *ok);
+
 /// 往目标进程的一个地址写（len 必须是 8 的倍数）。
 bool km_write(uint64_t addr, const void *in, uint64_t len);
 

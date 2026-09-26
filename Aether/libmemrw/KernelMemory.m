@@ -894,6 +894,43 @@ uint64_t km_kernel_page_size(void)
 #define KM_PAGE_TAIL_WORD 0x08
 
 /*
+ * ── 32 位读路径的源访问包络（**不是** delta，也不是上面那两组的任何一项）──
+ *
+ * 底层有两条读路径，它们的 delta 不同：
+ *   · 64 位（kread_sem_open.h:147）`kaddr - offsetof(struct pseminfo, psem_uid)`
+ *     ⇒ delta = 0x0C（psem_mode 是 u16，psem_uid 因此按 4 字节对齐到 0x0C）
+ *   · 32 位（kread_sem_open.h:175）`kaddr - offsetof(struct pseminfo, psem_usecount)`
+ *     ⇒ delta = 0x04
+ *
+ * 光看 delta 就已经在页首处分出胜负，而**内核不读 `pinfo + 0`** 这件事把 32 位那条
+ * 彻底救了出来：公开 XNU 的 fill_pseminfo()（bsd/kern/posix_sem.c）逐字段读，第一个
+ * 字段 psem_flags 的检查被 `#if 0` 关掉，所以最低的源访问地址是 pinfo + 0x04。
+ *
+ *   32 位：pinfo = addr − 0x04 ⇒ 最低源访问地址 = addr
+ *          ⇒ **一格都不碰 addr 之前的字节，addr 是页首也能读**
+ *   64 位：pinfo = addr − 0x0C ⇒ 最低源访问地址 = addr − 0x08
+ *          （psem_usecount 在 pinfo + 0x04）⇒ addr 的页内偏移小于 0x08 时那次访问
+ *          落到**前一页**，前一页未映射就是整机 panic
+ *
+ * 上界：psem_name[32] 位于 pseminfo 偏移 0x14（static_info.h:556-567），内核要填满它
+ * 必须读到 pinfo + 0x14 + 0x20 = pinfo + 0x34 = addr + 0x30。
+ * 所以 32 位路径的**整段源访问包络是 [addr, addr + 0x30)** —— 下界与上界都在这一段里，
+ * 闸门按整段判（下面的 km_read_u32）。
+ *
+ * 一处容易搞反的地方，写在这里免得下一个人去把 delta 改成 0x70：返回结构里
+ * vst_size 位于 psem_fdinfo + 0x70，与**源的地址**无关 —— 那条赋值是
+ * `sb->vst_size = pinfo->psem_usecount;`，**源**是 pinfo + 0x04 = addr，
+ * **目标**才是返回结构的 0x70。delta 是 0x04。
+ */
+#define KM_READ32_SOURCE_SPAN 0x30
+/*
+ * 32 位路径的尾部余量：包络自己已经算到最后一个字节（addr + 0x2F），
+ * 所以除了「整段落在页内」之外不再预留任何余量。传给 km_page_access_safe 的
+ * up_low_limit 取 0，判据即 `(addr & 0x3fff) + 0x30 <= 0x4000`。
+ */
+#define KM_PAGE_TAIL_KREAD32 0x00
+
+/*
  * 页访问闸门：要求 [addr, addr+len) 内**每一个被实际访问的 8 字节字的地址**
  * 都满足「页内偏移 >= underflow 且 页内偏移 + 该字宽度 <= 页大小」。
  *
@@ -1045,6 +1082,82 @@ uint64_t km_read64(uint64_t addr, bool *ok)
     return first;
 }
 
+/*
+ * 读内核地址处的一个 **32 位字**，走**上游的 32 位路径**（delta = 0x04），
+ * 而不是「把 64 位路径的长度改成 4」—— 后者改的是宽度，改不了下溢量。
+ *
+ * 这条路径与 km_read64 的差别只有一个，但那个差别是致命的：
+ *   · 64 位路径（kread_sem_open.h:147）delta = 0x0C，最低源访问地址 = addr − 0x08；
+ *   · 32 位路径（kread_sem_open.h:175）delta = 0x04，最低源访问地址 = addr。
+ * 所以 **addr 是页首（页内偏移 0）时这条能读、那条会踩前一页**。
+ * 完整机制（fill_pseminfo 不读 pinfo + 0、psem_name 给出上界 0x30）见
+ * KM_READ32_SOURCE_SPAN 那段注释；调用点存在的理由见 KernelSlide.m 的 ⑤ 自检。
+ *
+ * 闸门按**整段源访问范围**判，不是只判返回的那 4 个字节（理由同上面那段注释：
+ * 内核为填满 psem_name 必须一路读到 addr + 0x30）。
+ *
+ * `*ok` 的语义要说清，不要把它当可靠性校验：底层 32 位路径是**单次读**、
+ * 直接返回一个 u32，它**没有**"两次读一致"那种校验（那是 km_read64 才做的）。
+ * 所以这里能给出的最强保证只有「闸门通过、且这一次读已经发出去了」——
+ * 它**不表示**内核真的读到了目标地址（kread 那一侧失败不返回错误），
+ * 也**不表示**读到的值是对的。判值必须由调用方自己的判据来做（例如 MH_MAGIC_64）。
+ */
+bool km_read_u32(uint64_t addr, uint32_t *out, bool *ok)
+{
+    if (ok) {
+        *ok = false;
+    }
+    if (out) {
+        *out = 0;
+    }
+    if (g_handle == 0 || out == NULL) {
+        return false;
+    }
+    if (!km_is_kernel_address(addr)) {
+        return false;
+    }
+    /*
+     * 只要求 4 字节对齐，**不要求 8 字节**：自检要读的是 kernel_base 与
+     * kernel_base + 4（mach_header_64 的 magic 与 cputype），后者的页内偏移是 4。
+     */
+    if ((addr & (sizeof(uint32_t) - 1ULL)) != 0) {
+        return false;
+    }
+
+    /*
+     * 页闸门：下界参数 0 —— 这条路径不需要页内偏移下限（源访问从 addr 本身开始，
+     * 一格都不往 addr 之前踩，这正是它存在的理由）；上界参数 KM_PAGE_TAIL_KREAD32 ——
+     * 包络 [addr, addr + 0x30) 必须整段落在一页内。
+     * 页大小取不到或不是 2 的幂时 km_page_access_safe 自己会拒（安全失败）。
+     */
+    if (!km_page_access_safe(addr, KM_READ32_SOURCE_SPAN, 0, KM_PAGE_TAIL_KREAD32)) {
+        return false;
+    }
+
+    /*
+     * 底层这一条只存在于 kread_sem_open 后端之下：它直接按 `struct krkw` 的
+     * krkw_object_id / krkw_method_data 去改写 psemnode 的 pinfo，而这两个字段在
+     * 别的后端里是另一套含义 —— 拿别的后端的句柄调它，等于让内核按错的 psemnode 解引用。
+     * 所以这里按**运行时实际装上的 ops** 判一次，而不是依赖 km_init 里那条
+     * "iOS >= 16 选 sem_open"的版本规则（那条规则写在另一个函数里，且后端是可配的）。
+     * 上游 perf.h:112 用的是同一个判据。
+     */
+    struct kfd *kfd = (struct kfd *)g_handle;
+    if (kfd->kread.krkw_method_ops.kread != kread_sem_open_kread) {
+        NSLog(@"[KernelMemory] km_read_u32: kread backend is not sem_open, refused addr=%#llx",
+              (unsigned long long)addr);
+        return false;
+    }
+
+    *out = (uint32_t)kread_sem_open_kread_u32(kfd, (u64)addr);
+
+    /* 到这一步读已经发出：见函数头那段对 `*ok` 的解释（它不是可靠性校验）。 */
+    if (ok) {
+        *ok = true;
+    }
+    return true;
+}
+
 bool km_write(uint64_t addr, const void *in, uint64_t len)
 {
     if (g_handle == 0 || in == NULL || len == 0) {
@@ -1173,6 +1286,14 @@ void km_self_test(char *out, size_t outSize)
      * 锚点校验：kernel base 处必须是小端 MH_MAGIC_64，且紧跟的 cputype 为 arm64。
      * 两项同时成立才能说明 kread 读到的确实是那个 Mach-O 头，
      * 而不是一串看起来合理的垃圾。
+     *
+     * ⚠ 下面这次读走的是 km_read（**64 位路径**），而 kernel base 是页首：
+     * 64 位路径的源访问从 addr − 0x08 起，页闸门会**必然拒掉**这个读 ——
+     * 所以它永远只会打出 "magic: read failed"。这不会 panic（闸门挡在前面了），
+     * 但也什么都没读到，别把那句话读成"地址不对"。将来若在这里读页首，
+     * 必须改用 32 位路径（km_read_u32，delta = 0x04），理由与 KernelSlide.m 的
+     * ⑤ 自检是同一条。当前 g_kernel_base 恒为 0（扫描已停用），走的是上面那条
+     * skipped 分支，所以这一段还没有真正被执行过。
      */
     if (outSize > used) {
         char line[192] = {};

