@@ -170,7 +170,7 @@ enum FangUIBridge {
         let w = FangUIOverlayWindow(frame: .zero)
         w.windowLevel = localLevel
         // 窗口只覆盖卡片本身（含阴影边距）：卡片不透明，
-        // 卡片之外透出桌面或下层 app —— 这才是外挂悬浮菜单的形态。
+        // 卡片之外透出桌面或下层 app —— 这才是覆盖层悬浮菜单的形态。
         w.backgroundColor = .clear
         w.isOpaque = false
         // 宿主 VC 只管窗口状态；面板视图直接挂在窗口上，

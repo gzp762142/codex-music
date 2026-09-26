@@ -30,7 +30,7 @@ final class RootViewController: UIViewController {
     /// 调试页：进程扫描列表（挂在「设置」页签下面，其他页签保持为空）。
     private let debugView = DebugProcView()
     /// 底部分段控件（切换页面用），贴面板底边居中。
-    private let tabs = SegmentedTabs(titles: ["透视", "追踪", "设置"])
+    private let tabs = SegmentedTabs(titles: ["人物", "光线", "设置"])
     /// 控件距面板底边的距离。
     private let tabsBottomInset: CGFloat = 20
 

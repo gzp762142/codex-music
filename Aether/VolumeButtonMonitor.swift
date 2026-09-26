@@ -55,7 +55,7 @@ final class VolumeButtonMonitor {
 
         // 这一句停的是**进程级共享**的音频会话，不是本类私有的：BackgroundKeepAlive
         // 那段静音循环正靠它维持后台执行权。会话一停，系统几秒内就会挂起整个进程，
-        // 而挂起可能落在外挂内核操作的中途 —— 那是最不该被打断的地方。
+        // 而挂起可能落在内核操作的中途 —— 那是最不该被打断的地方。
         //
         // 而且它**一定**会把会话停掉，跟返回值无关。AVAudioSession.h 的原话是：
         //     "Starting in iOS 8, if the session has running I/Os at the time that

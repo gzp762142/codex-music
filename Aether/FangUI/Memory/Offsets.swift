@@ -1,27 +1,26 @@
 import Foundation
 
-/// 从游戏模块读偏移所需的常量。
+/// 从目标模块读偏移所需的常量。
 ///
-/// 默认值取自 `和平精英_1.38.12_Offsets.hpp`（MobileDumper-7 全量 dump，
-/// 模块 ShadowTrackerExtra，dump 时模块基址 0x1047D0000，全部数值为 RVA）。
+/// 默认值是**占位值**，需按自己的 dump 结果替换（见下面 `default*` 的说明）。
+/// 全部数值为 RVA，模块基址取自 dump 时的记录。
 ///
 /// 可以在 App 的 Documents 目录放一个 `offsets.txt` 覆盖，格式：
 ///
-///     模块基址=0x1047D0000
-///     GObjects=0x111251B00
-///     GNames=0x111FBA198
-///     GWorld=0x11148B608
+///     模块基址=0x100000000
+///     GObjects=0x10000
+///     GNames=0x20000
+///     GWorld=0x30000
 ///
 /// **下面这三个 OFFSET 都是「静态 vmaddr 域地址」，不是 RVA**：
-/// dump 时 __TEXT.vmaddr 恒为 0x100000000，所以
-///     运行时地址 = slide + 静态地址,   slide = imageBase − 0x100000000
+/// dump 时 __TEXT.vmaddr 恒为一个固定常量（本机 dump 记录的是 0x100000000），所以
+///     运行时地址 = slide + 静态地址,   slide = imageBase − <dump 期 __TEXT.vmaddr>
 /// 换算只允许走 MemoryProbe.runtime()，别处不要自己加减。
 ///
-/// GNames 必须给**槽的静态域地址** 0x111FBA198
-/// （= dump 日志里 "GNames ptr addr 0x11678A198" − slide 0x47D0000）；
-/// 日志里那个 0x1176ED520 是 FNamePool 的**堆地址**，跨进程无效。
+/// GNames 必须给**槽的静态域地址**（= dump 日志里的 "GNames ptr addr" − slide）；
+/// 日志里另有一个 FNamePool 的**堆地址**，跨进程无效，不要拿它当槽地址。
 ///
-/// 换游戏版本时只改这个文件，不用重新编译 —— 偏移每次更新都会变。
+/// 换目标版本时只改这个文件，不用重新编译 —— 偏移每次更新都会变。
 struct Offsets {
 
     /// dump 时模块基址（会被 ASLR 改变，只作为读取起点参考）
@@ -33,10 +32,13 @@ struct Offsets {
     /// UWorld**
     var gWorld: UInt64
 
-    static let defaultModuleBase: UInt64 = 0x1047D0000
-    static let defaultGObjects: UInt64   = 0x111251B00
-    static let defaultGNames: UInt64     = 0x111FBA198
-    static let defaultGWorld: UInt64     = 0x11148B608
+    /// 以下四个是**占位默认值**，必须按自己的 dump 结果替换。
+    /// 保留具体数值的结构（便于理解换算关系），但数值本身不带任何版本信息。
+    /// 运行时优先读 Documents/offsets.txt，那里的值覆盖这几个。
+    static let defaultModuleBase: UInt64 = 0x100000000
+    static let defaultGObjects: UInt64   = 0x10000
+    static let defaultGNames: UInt64     = 0x20000
+    static let defaultGWorld: UInt64     = 0x30000
 
     static func load() -> Offsets {
         var o = Offsets(moduleBase: defaultModuleBase,

@@ -7,7 +7,7 @@ import Foundation
 /// 这正是"被内存杀了却看不到报告"的来源。
 ///
 /// **关键点二**：日志里 / 内核给的进程名可能是**截断**的（MAXCOMLEN=16），
-/// 所以搜目标必须用共同前缀 `ShadowTracker`，不能用完整名 ——
+/// 所以搜目标必须用共同前缀 `TargetExec`，不能用完整名 ——
 /// 上一版用完整名搜索，导致"目标不在日志中"这个结论不可信。
 ///
 /// 三种 reason：
@@ -22,8 +22,8 @@ final class JetsamLogReader {
         "/var/mobile/Library/Logs/CrashReporter/DiagnosticLogs"
     ]
 
-    /// 目标匹配前缀（内核名可能被截断成 ShadowTrackerExt）
-    static let targetPrefix = "ShadowTracker"
+    /// 目标匹配前缀（内核名可能被截断成 TargetExecExt）
+    static let targetPrefix = "TargetExec"
 
     static func findLogs() -> [(path: String, date: Date)] {
         let fm = FileManager.default

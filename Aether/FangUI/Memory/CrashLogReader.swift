@@ -112,7 +112,7 @@ final class CrashLogReader {
     /// 列出崩溃报告目录里的全部 .ips（按时间倒序），并标出是谁的。
     ///
     /// 为什么需要它：JetsamEvent 里**没有**游戏 → 游戏不是被内存杀的 →
-    /// 那它要么死于某个信号（会留下 ShadowTracker*.ips），要么被 SIGKILL
+    /// 那它要么死于某个信号（会留下 TargetExec*.ips），要么被 SIGKILL
     /// （不留下任何报告）。这两种情况的下一步完全不同，所以要先看目录里有什么。
     static func listReports(limit: Int = 24) -> [String] {
         let fm = FileManager.default
@@ -137,7 +137,7 @@ final class CrashLogReader {
         var rows: [String] = ["崩溃报告共 \(all.count) 份（按时间倒序）"]
         for item in all.prefix(limit) {
             var mark = ""
-            if item.name.hasPrefix("ShadowTracker") { mark = "  ◀ 游戏" }
+            if item.name.hasPrefix("TargetExec") { mark = "  ◀ 目标" }
             else if item.name.hasPrefix("Music") { mark = "  ◀ 我们" }
             else if item.name.lowercased().hasPrefix("jetsam") { mark = "  (jetsam)" }
             rows.append("  " + item.name.replacingOccurrences(of: ".ips", with: "") + mark)

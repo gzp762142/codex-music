@@ -98,7 +98,7 @@ final class AutoTracker {
 
     /// 状态行（主线程回调）
     var onStatus: ((String) -> Void)?
-    /// 目标列表（主线程回调）—— 以后 ESP 绘制从这儿取
+    /// 目标列表（主线程回调）—— 以后覆盖层渲染从这儿取
     var onTargets: (([RenderTarget], MemoryProbe.SelfSnapshot) -> Void)?
 
     // MARK: - 内部

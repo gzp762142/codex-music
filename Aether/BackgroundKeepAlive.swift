@@ -70,7 +70,7 @@ final class BackgroundKeepAlive {
     /// 目前唯一的调用点是 `VolumeButtonMonitor.stop()` —— 它调
     /// `setActive(false, options: .notifyOthersOnDeactivation)` 停掉的是**进程级共享**
     /// 的那个会话，而我们的静音循环正靠那个会话维持后台执行权。会话一停，系统几秒内
-    /// 就会挂起整个进程，而挂起可能落在外挂内核操作的中途 —— 那是最不该被打断的地方
+    /// 就会挂起整个进程，而挂起可能落在内核操作的中途 —— 那是最不该被打断的地方
     /// （写坏的 vm_map 只能靠重启设备恢复）。
     ///
     /// 【为什么必须由它来喊，而不是等通知】

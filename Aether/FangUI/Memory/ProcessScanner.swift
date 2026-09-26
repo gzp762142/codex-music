@@ -13,10 +13,10 @@ import Darwin
 ///    里有实现，所以用 dlsym 运行时取函数指针。取不到就跳过这条路。
 ///
 /// 匹配分两级（实机验证后定的策略）：
-/// - `exact`：p_comm 与已知游戏名完全相等 —— 这是唯一可信的判据
-/// - `loose`：小写子串包含 —— 只用于展示，**不**用来判断"找到游戏"
+/// - `exact`：p_comm 与已知目标名完全相等 —— 这是唯一可信的判据
+/// - `loose`：小写子串包含 —— 只用于展示，**不**用来判断"找到目标"
 ///   （实机踩过：`notificationserv` 因为 proc_pidpath 给出的路径里含
-///   "shadowtracker" 被误命中）
+///   匹配子串而被误命中）
 final class ProcessScanner {
 
     struct ProcEntry {
@@ -27,18 +27,20 @@ final class ProcessScanner {
         let path: String
         /// 宽松匹配（精确 或 子串）—— 仅用于列表高亮
         let matched: Bool
-        /// 精确匹配 —— 用于判定游戏主进程
+        /// 精确匹配 —— 用于判定目标主进程
         let exact: Bool
     }
 
-    /// 精确名：p_comm 被内核截到 MAXCOMLEN(16)，所以 "ShadowTrackerExtra"
-    /// 实际到达时是 "ShadowTrackerExt"，两个都留着。
-    static let exactNames: [String] = ["pubgmhd", "ShadowTrackerExt", "ShadowTracker"]
+    /// 精确名。这里是**占位默认值**，按实际目标替换即可。
+    ///
+    /// 为什么给两个：p_comm 被内核截到 MAXCOMLEN(16)，所以名字较长的目标进程
+    /// 到达这里时是截断形式，全名与截断名都要留着才判得准。
+    /// （`TargetExec` 作为占位就是 16 字符以内，`TargetExecExt` 演示截断前形态。）
+    static let exactNames: [String] = ["TargetExec", "TargetExecExt"]
     /// 宽松子串（仅展示用）
-    static let substrings: [String] = ["pubgmhd", "shadowtracker"]
+    static let substrings: [String] = ["targetexec"]
     /// 已知误报：p_comm 或路径里恰好含匹配词的系统进程，从宽松命中里剔除。
-    /// notificationserv 是实机抓到的 —— 它自己不含 "shadowtracker"，
-    /// 是 proc_pidpath 返回的路径里带了这个词。
+    /// 这些是实机抓到的 —— 它们自己不含匹配词，是 proc_pidpath 返回的路径里带了。
     static let denyList: [String] = ["notificationserv", "notificationserver"]
 
     /// libproc.h 里的 PROC_ALL_PIDS。iOS 上没有该头文件，只能自己写死。
@@ -48,7 +50,7 @@ final class ProcessScanner {
 
     private var cachedPID: Int32?
     private var cachedAt: Date = .distantPast
-    /// 缓存有效期：界面会反复调这个函数，全量枚举太贵；但游戏重启会换 pid，
+    /// 缓存有效期：界面会反复调这个函数，全量枚举太贵；但目标重启会换 pid，
     /// 所以必须有 TTL。
     private let cacheTTL: TimeInterval = 2.0
 
@@ -70,8 +72,8 @@ final class ProcessScanner {
 
     // MARK: - 对外
 
-    /// 找游戏进程 pid。只在精确命中时返回，找不到返回 nil。
-    func findGamePID(forceRefresh: Bool = false) -> Int32? {
+    /// 找目标进程 pid。只在精确命中时返回，找不到返回 nil。
+    func findTargetPID(forceRefresh: Bool = false) -> Int32? {
         if !forceRefresh, let pid = cachedPID, Date().timeIntervalSince(cachedAt) < cacheTTL {
             return pid
         }

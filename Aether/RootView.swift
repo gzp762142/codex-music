@@ -8,7 +8,7 @@ enum AppPhase {
 
 final class AppState: ObservableObject {
     @Published var phase: AppPhase = .loading
-    /// Default OFF — cheat UI must not appear until user explicitly turns it on.
+    /// Default OFF — overlay UI must not appear until user explicitly turns it on.
     @Published var isPoweredOn = false
     @Published var sessionStart: Date?
     @Published var cardMessage: String?

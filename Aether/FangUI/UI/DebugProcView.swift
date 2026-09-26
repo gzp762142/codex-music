@@ -551,7 +551,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     private func refreshProcess() {
         scanner.invalidate()
         entries = scanner.scan()
-        gpid = scanner.findGamePID(forceRefresh: true) ?? 0
+        gpid = scanner.findTargetPID(forceRefresh: true) ?? 0
 
         let exact = entries.filter { $0.exact }.count
         let loose = entries.filter { $0.matched && !$0.exact }.count
@@ -724,7 +724,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         runProbe("枚举: 读取中…") { MemoryProbe.stepRegionProbe(pid: $0) }
     }
 
-    /// 内存：游戏的内存账本（不碰游戏内存），用来看操作前后 footprint/compressed 的差值。
+    /// 内存：目标进程的内存账本（不碰目标进程内存），用来看操作前后 footprint/compressed 的差值。
     @objc private func onMemory() {
         guard gpid != 0 else { probeLabel.text = "先刷新拿到 pid"; return }
         runProbe("内存: 读取中…") { MemoryProbe.stepMemory(pid: $0) }
@@ -735,7 +735,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     /// 这个按钮原来要求"先刷新拿 pid、缺基址就自己找一次"，因为它当时做的是把游戏的
     /// 映像头 / `__DATA` 段 remap 进本进程。那条路现在停了（需要目标 task port），
     /// 而窗口与目标进程无关 —— 所以这里不再要求 pid，也不再「找村口」：
-    /// 那是白碰一次游戏内存，换不来任何东西。
+    /// 那是白碰一次目标进程内存，换不来任何东西。
     ///
     /// 与「窗口」按钮走**同一条路**，差别只有一行说明文字（跨进程那半边为什么没开）。
     @objc private func onMapProbe() {
@@ -1527,7 +1527,7 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         rows.append(contentsOf: stages.isEmpty ? ["(无记录)"] : stages)
         rows.append("")
         rows.append("══ 游戏最新崩溃 ══")
-        rows.append(contentsOf: CrashLogReader.crashDetail(for: "ShadowTrackerExtra"))
+        rows.append(contentsOf: CrashLogReader.crashDetail(for: "TargetExec"))
         rows.append("")
         rows.append("══ Music 最新崩溃 ══")
         if let s = CrashLogReader.latestSummary() {

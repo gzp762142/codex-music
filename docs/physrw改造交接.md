@@ -7,7 +7,7 @@
 
 ## 一、要做什么，为什么换路线
 
-Aether（注入 `com.apple.Music`）要读游戏进程内存。原路线是「页表翻译 + kread」：
+Aether（注入 `com.apple.Music`）要读目标进程内存。原路线是「页表翻译 + kread」：
 用 kread 遍历目标进程页表拿到 PA，再把 PA 转成内核 VA 去读。
 
 **这条路死在 `g_linear_delta`**：PA → KVA 需要一个可信的换算基准，而 Aether 拿不到。
@@ -18,7 +18,7 @@ Aether（注入 `com.apple.Music`）要读游戏进程内存。原路线是「�
 
 于是 `g_linear_delta` 无解，`km_translate` / `km_read_process` 全废。
 
-**换的路线**：商业样本（`D:\工作区\music样本\...\Music`，¥3500/月的吃鸡外挂）走的是
+**换的路线**：参考样本（下称"样本"，本地只读分析件，不随仓库分发）走的是
 **physrw**（物理读写）——不翻译虚拟地址，而是拿到页表页之后直接写 PTE，
 把任意物理页映射进自己的地址空间。这条路**不依赖 PA→KVA**，绕开了 Aether 的死结。
 
@@ -52,7 +52,7 @@ kread/kwrite 四个后端（`sem_open` / `kqueue_workloop_ctl` / `dup` / `IOSurf
   → 用符号算 kernel slide
   → 拿 ptov_table / gVirtBase / gPhysBase / gPhysSize
   → physrw：写 PTE 把物理页映射进自己地址空间
-  → 遍历物理内存找游戏数据
+  → 遍历物理内存找目标数据
 ```
 **它不识别目标进程**（437 个导入里没有 `task_for_pid` / `proc_pidinfo` / `kern.proc*`），
 **也不遍历页表**（全 `__text` 没有 `MRS TTBR0_EL1` / `TTBR1_EL1` / `TPIDR_EL1`）。
@@ -161,10 +161,10 @@ kernelSymbol.gPhysSize  = 0xfffffe0007a87fc8      kernelConstant.T1SZ_BOOT = 0x1
 |---|---|
 | 各路逆向报告与脚本 | `D:\工作区\_Aether_rev\_rev\`（`能力边界` / `数据平面上游` / `读进程层` / `内核常量来源` / `页表掩码用途` / `physrw页表页` / `XPF集成` / `XPF接线` / `Slide与phystokv`） |
 | XPF 上游源码（含 ChOma/img4lib 子模块） | `D:\工作区\_Aether_rev\xpf_src\` |
-| 样本本体（只读，勿改） | `D:\工作区\music样本\Music_unpack\Payload\Music.app\Music` |
+| 样本本体（只读，勿改） | `<本地样本可执行文件路径>` |
 | 样本 PUAFF 原理（上游作者 writeup） | `D:\工作区\kfd_ref\writeups\`（`landa.md` / `smith.md` / `physpuppet.md`） |
 | physrw 理论 | https://tin-z.github.io/ios-exploit-starterpack/en/physical-rw/ |
 | XPF 上游仓库 | https://github.com/opa334/XPF |
 
-**注意**：`D:\工作区\music样本\` 目录下的 `.md`/`.txt` 文档**不要读**——内容有大量错误言论，
+**注意**：`<本地样本目录>\` 目录下的 `.md`/`.txt` 文档**不要读**——内容有大量错误言论，
 逆向时必须只从二进制取证。上面表格里的 `kfd_ref/writeups` 是另一回事，那是权威原理材料。

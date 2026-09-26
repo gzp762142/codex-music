@@ -86,7 +86,7 @@ final class MemoryProbe {
 
     /// 记一次读取：先按节奏等一下，再计调用次数 + 触及的页。
     ///
-    /// **节流是防 CPU 自旋的**：我们的每一次读都要抢游戏 vm_map 的锁，
+    /// **节流是防 CPU 自旋的**：我们的每一次读都要抢目标进程 vm_map 的锁，
     /// 连续高频读最容易撞上争用 —— 而内核里争锁是**自旋**不是睡眠，
     /// 撞上就是 CPU 时间白白烧掉（我们被 cpu_resource_fatal 杀过两次）。
     /// 拉开节奏的代价是整条链慢几十毫秒，换来的是撞上的概率大幅下降。
@@ -104,9 +104,9 @@ final class MemoryProbe {
 
     /// 目标进程还在不在。只查进程表，一个字节的内存都不碰。
     ///
-    /// **这条检查是必须的**：游戏如果先崩了，我们继续读它会跟它销毁 vm_map
+    /// **这条检查是必须的**：目标进程如果先崩了，我们继续读它会跟它销毁 vm_map
     /// 的过程抢同一把锁 —— 那正是长时间自旋、CPU 被烧穿的典型场景。
-    /// 两次 cpu_resource_fatal 都发生在"游戏先闪退、我们随后被杀"之后。
+    /// 两次 cpu_resource_fatal 都发生在"目标进程先闪退、我们随后被杀"之后。
     static func targetAlive(_ pid: Int32) -> Bool {
         guard let fn = procPidPathFn else { return true }
         var buf = [UInt8](repeating: 0, count: 4096)
@@ -148,7 +148,7 @@ final class MemoryProbe {
     ///
     /// 为什么必须补这一步：`vm_remap` 的 cur/max protection 是**出参**，调用时指定不了；
     /// 而 `copy = FALSE` 的共享映射默认就带**写**权限
-    /// （man page：the region is mapped read-write）。我们只读，握着一块能改游戏内存的
+    /// （man page：the region is mapped read-write）。我们只读，握着一块能改目标进程内存的
     /// 窗口没有任何功能收益，只有风险。
     private typealias MachVmProtectFn = @convention(c) (
         UInt32,                              // target_task
@@ -222,11 +222,11 @@ final class MemoryProbe {
     /// 把一块刚建立的共享映射压到只读，**失败清理收在函数内部**。
     ///
     /// **第一步没有调用者**（跨进程映射已停用，见 mapRange 的注释）—— 这不是漏了，
-    /// 是它服务的那个场景（把游戏页映射进本进程）要等第二步接回目标 task port。
+    /// 是它服务的那个场景（把目标进程页映射进本进程）要等第二步接回目标 task port。
     /// 留着是因为它把"失败即丢弃、绝不放行"这条约束收在了一处，
     /// 第二步接回来时直接用，不要再写第二份。
     ///
-    /// `copy = FALSE` 的共享映射默认带写权限，不降权就等于握着一个能改游戏内存的窗口。
+    /// `copy = FALSE` 的共享映射默认带写权限，不降权就等于握着一个能改目标进程内存的窗口。
     /// 清理必须和 protect 写在同一处 —— 分成两份迟早漂移，而那条约束
     /// （失败即丢弃、绝不放行）只允许有一个实现。
     ///
@@ -248,14 +248,14 @@ final class MemoryProbe {
         let ok = kr == KERN_SUCCESS
         if !ok {
             // 失败原因只能从返回码看出来，记下来 —— 它决定往哪查。
-            // 游戏地址必须一起记：本地地址每次运行都不一样，只报它定位不到是哪个 region。
+            // 目标进程地址必须一起记：本地地址每次运行都不一样，只报它定位不到是哪个 region。
             let why = kr.map { describe($0) } ?? "mach_vm_protect 符号缺失"
             // 源 region 的属性是判据：它决定这块为什么降不下去。
             // **拆成两行**：面板宽度只放得下七十来个字符，一行装不下最后那几项，
             // 而尾巴上的 `源prot` 恰恰是唯一能定性的字段（截断过一次，白跑一轮）。
             var probe = src
             let (okSrc, srcSize, srcProt, _) = nextRegion(task: gamePort, addr: &probe)
-            let head = "游戏 0x\(String(src, radix: 16))"
+            let head = "目标进程 0x\(String(src, radix: 16))"
                 + " / 本地 0x\(String(target, radix: 16))"
                 + " +0x\(String(total, radix: 16))"
             let tail = okSrc
@@ -265,14 +265,14 @@ final class MemoryProbe {
                 : "源region查询失败"
                     + " max=0x\(String(maxProt, radix: 16)) \(why)"
             withLock { _lastProtectFailure = head + "\n" + tail }
-            // 降权失败 = 手上握着一块能改游戏内存的映射。宁可不要。
+            // 降权失败 = 手上握着一块能改目标进程内存的映射。宁可不要。
             _ = vmDeallocateFn?(mach_task_self_, UInt(target), total)
             withLock { _protectFailures += 1 }
         }
         return ok
     }
 
-    /// 已经建立起来的映射：游戏地址 → 我们的本地地址。
+    /// 已经建立起来的映射：目标进程地址 → 我们的本地地址。
     private static var mappedRanges: [(gameBase: UInt64, size: UInt64, localBase: UInt64)] = []
     /// mappedRanges 是否已按 gameBase 排好序 —— mappedRecord 走二分，靠这个标志决定先不先排。
     private static var rangesSorted = true
@@ -280,14 +280,14 @@ final class MemoryProbe {
     /// 释放本进程地址空间里**所有**已建立的映射。
     ///
     /// 原来两处都是 `mappedRanges.removeAll()` —— 只把记录清掉，那些映射还牢牢占着
-    /// 本进程的地址空间，而且再也找不回来了。游戏每次重启（pid 变）就漏掉一轮
+    /// 本进程的地址空间，而且再也找不回来了。目标进程每次重启（pid 变）就漏掉一轮
     /// `mapAllRegions` 的量，几十到几百 MB，反复重启一路累积。
     ///
     /// 第一个参数必须是 `mach_task_self_`：要释放的是**本进程**的映射，不是目标的 ——
-    /// 传目标端口等于让内核去游戏的 vm_map 里找一个根本不存在的地址，然后静默失败。
+    /// 传目标端口等于让内核去目标进程的 vm_map 里找一个根本不存在的地址，然后静默失败。
     ///
     /// 访问级别是 internal（不是 private）：`AutoTracker` 在 attach/detach 生命周期
-    /// 里必须能调到它，那是"游戏退出就释放"这条验收要求的落点。
+    /// 里必须能调到它，那是"目标进程退出就释放"这条验收要求的落点。
     static func releaseAllMappings() {
         if let fn = vmDeallocateFn {
             for m in mappedRanges {
@@ -298,7 +298,7 @@ final class MemoryProbe {
         mappedRanges.removeAll()
         rangesSorted = true
         // 窗口也在这里释放。**释放落点只能有一个** —— 分散到各处迟早漏掉一条入口
-        // （游戏退出 / pid 变化 / 服务停止），而漏掉的就是一块再也找不回来的本进程映射。
+        // （目标进程退出 / pid 变化 / 服务停止），而漏掉的就是一块再也找不回来的本进程映射。
         //
         // 代价是：`bind(pid:)` 在 pid 变化时也会把窗口拆掉（窗口本来与 pid 无关）。
         // 收益是永远不会漏释放。第一步的窗口是**按需重建**的（点一次建一次），
@@ -308,20 +308,20 @@ final class MemoryProbe {
 
     private static let vmFlagsAnywhere: Int32 = 0x0001
 
-    /// 把游戏的一段内存**映射进我们自己的地址空间**（`vm_remap`, copy = FALSE）——
+    /// 把目标进程的一段内存**映射进我们自己的地址空间**（`vm_remap`, copy = FALSE）——
     /// **第一步不启用，只留接入点。**
     ///
     /// 这一段原来是对本进程做 remap：`src_task` 与 `target_task` 都传 `mach_task_self_`，
-    /// 而 `srcAddress` 传的是**游戏地址**。那个组合只有两种结局，两种都不该留着：
+    /// 而 `srcAddress` 传的是**目标进程地址**。那个组合只有两种结局，两种都不该留着：
     ///
-    ///   · 游戏地址在本进程没有映射 → `KERN_INVALID_ADDRESS`：恒失败，白跑一次内核往返；
-    ///   · 游戏地址**恰好**落在本进程某个映射里 → 成功，并且把**我们自己的内存**
-    ///     登记成「游戏地址 → 本地地址」。之后 `readSmart` 命中它，拿我们自己的数据
-    ///     当游戏数据用 —— 不崩、不报错，只是全是错的。静默的错数据比崩溃贵得多。
+    ///   · 目标进程地址在本进程没有映射 → `KERN_INVALID_ADDRESS`：恒失败，白跑一次内核往返；
+    ///   · 目标进程地址**恰好**落在本进程某个映射里 → 成功，并且把**我们自己的内存**
+    ///     登记成「目标进程地址 → 本地地址」。之后 `readSmart` 命中它，拿我们自己的数据
+    ///     当目标进程数据用 —— 不崩、不报错，只是全是错的。静默的错数据比崩溃贵得多。
     ///
     /// 真正的跨进程映射缺一个我们没有的东西：**目标进程的 task port**。
     /// 样本里它是 `__DATA_CONST,__got+0x468`（54 个函数共用，包括全部窗口函数），
-    /// 由外挂自己拿到后一直持有。本工程在内核路径下不产生 port（见 attachPort 的注释），
+    /// 由本进程自身拿到后一直持有。本工程在内核路径下不产生 port（见 attachPort 的注释），
     /// 所以这条路要等**第二步**和「窗口页指向目标物理页」一起接回来 —— 接的时候
     /// 降权失败信息的写入点（详情见 `loadWindow` 类路径里那次 mach_vm_protect 复查）。
     ///
@@ -372,11 +372,11 @@ final class MemoryProbe {
     /// 绑定本次操作的目标进程。**每个动作开始前都要调** ——
     /// 上一版只在「找村口」/「映射」里绑定，于是直接点「对象」时 activePid 还是 0，
     /// 按需映射那段判断被跳过，读取全部退回 mach_vm_read（实测 38 次调用）。
-    /// pid 变了说明游戏重启过，旧的映射和基址一起作废。
+    /// pid 变了说明目标重启过，旧的映射和基址一起作废。
     static func bind(pid: Int32) {
         guard activePid != pid else { return }
         activePid = pid
-        // 旧映射要**释放**，不只是丢引用 —— 否则每次重启游戏都漏掉一整轮预映射的量
+        // 旧映射要**释放**，不只是丢引用 —— 否则每次重启目标进程都漏掉一整轮预映射的量
         releaseAllMappings()
         imageBase = 0
         imageSlide = 0
@@ -386,7 +386,7 @@ final class MemoryProbe {
     /// 把**包含 address 的那个 region** 整个映射进来 —— 跨进程路径，第一步不启用。
     ///
     /// 原来这里枚举的是**本进程**的 region（`nextRegion(task: mach_task_self_)`），
-    /// 而传进来的 `address` 是游戏地址 —— 枚举到的 region 与 `address` 根本不是同一件事，
+    /// 而传进来的 `address` 是目标进程地址 —— 枚举到的 region 与 `address` 根本不是同一件事，
     /// 所以下面那个 `address >= addr && address < addr + size` 的校验经常直接把它否掉，
     /// 偶尔通过也只是巧合（地址区间撞上了）。现在明确拒绝。
     ///
@@ -394,22 +394,22 @@ final class MemoryProbe {
     /// 第二步接回目标 task port 时从这里开始改。
     @discardableResult
     static func mapRegionContaining(pid: Int32, address: UInt64) -> String {
-        "按需映射未启用：需要目标 task port（要枚举的是游戏的 region，不是本进程的）"
+        "按需映射未启用：需要目标 task port（要枚举的是目标进程的 region，不是本进程的）"
     }
 
-    /// 把游戏进程里**所有值得映射的大 region** 一次性映射进来 —— 第一步不启用。
+    /// 把目标进程里**所有值得映射的大 region** 一次性映射进来 —— 第一步不启用。
     ///
-    /// 这个函数的设计意图（批量吃下游戏的几百个 region，把后续读取全变成本地访问）
+    /// 这个函数的设计意图（批量吃下目标进程的几百个 region，把后续读取全变成本地访问）
     /// 本身是对的，也正是样本的路子。但它需要目标 task port：没有 port 的话，
     /// `nextRegion` 只能枚举**本进程**的 region，然后把这些 region **自映射**一遍 ——
-    /// 那既不产出任何一个字节的游戏数据，又要白占几百块映射额度和几百 MB 地址空间
+    /// 那既不产出任何一个字节的目标进程数据，又要白占几百块映射额度和几百 MB 地址空间
     /// （`mappedRanges` 的上限是 2048 块，`readSmart` 的按需映射撞到它就会整条退化成内核读）。
     ///
     /// 所以第一步把它停掉，并把原因写在返回值里 —— 面板每次点「世界」都会看到这行字，
     /// 而不是一个"预映射: 0 块"的假结论。
     ///
-    /// 第二步接回来时，这里要动的是两处：`nextRegion` 换成游戏的 task、
-    /// `vm_remap` 的 src_task 换成游戏的 task（target 仍是我们自己）。
+    /// 第二步接回来时，这里要动的是两处：`nextRegion` 换成目标进程的 task、
+    /// `vm_remap` 的 src_task 换成目标进程的 task（target 仍是我们自己）。
     @discardableResult
     static func mapAllRegions(pid: Int32, minSize: UInt64 = 256 << 10,
                               budget: TimeInterval = 2.5, maxBlocks: Int = 600) -> String {
@@ -423,7 +423,7 @@ final class MemoryProbe {
     /*
      * 为什么先做这一步，以及这一步**不做什么**。
      *
-     * 样本（Music）读游戏内存走的是「窗口 + 本地读」：先建一块属于自己的虚拟地址窗口，
+     * 样本（Music）读目标进程内存走的是「窗口 + 本地读」：先建一块属于自己的虚拟地址窗口，
      * 让窗口的页指向目标物理页，然后**本地 `ldr` 读，零内核调用**。
      *
      * 本工程现在走的是另一条：页表翻译 → 拿到 PA → `pa + delta` 转内核 VA → kread。
@@ -608,7 +608,7 @@ final class MemoryProbe {
          * 写两遍（A 再 B）也不是折腾：只写一次的话，"本来就该是 0、写完还是 0"这种错位
          * 看不出来；写两个不同的值，一旦读到 A 或 B 就能立刻判断"这一页停在哪一步"。
          *
-         * 写的是**我们自己刚申请的内存**：不可能写到游戏或内核去（基址刚刚过了上面三条自检）。
+         * 写的是**我们自己刚申请的内存**：不可能写到目标进程或内核去（基址刚刚过了上面三条自检）。
          */
         if let p = UnsafeMutableRawPointer(bitPattern: UInt(base)) {
             memset(p, 0x41, Int(total))         // 'A'
@@ -655,8 +655,8 @@ final class MemoryProbe {
          *
          * 样本里能看到 prot = 3 被写进出参（@0x100f759a8 的 `stp w8/w9 = 7/3`），
          * 而它自己在 @0x100f75aa8 那次 mach_vm_protect 传的是 w4 = 1（只读）——
-         * 那是它**映射游戏页**之后把窗口压到只读：共享映射默认带写权限，
-         * 一个能写游戏内存的窗口只有风险没有收益。
+         * 那是它**映射目标进程页**之后把窗口压到只读：共享映射默认带写权限，
+         * 一个能写目标进程内存的窗口只有风险没有收益。
          *
          * 我们这一步反着来：自验证要写 pattern，所以先**显式**设成读写。
          * 显式设一次而不是"allocate 出来本来就是 RW"，是为了让后面的"压只读"有个已知起点：
@@ -735,10 +735,10 @@ final class MemoryProbe {
          * ⑧ 收尾：把窗口压到只读。
          *
          * 这一步**不是样本里的动作**，是我们自己加的一道保险，理由很直接：
-         * 第二步一旦把窗口的页指向目标物理页，"往窗口写"就等于"往游戏内存写"。
+         * 第二步一旦把窗口的页指向目标物理页，"往窗口写"就等于"往目标进程内存写"。
          * 而第二步里唯一没有样本证据的环节正是 PTE 改写 —— 出错概率不低。
          * 压到只读之后，就算后续代码误写了窗口，SIGSEGV 的是**我们自己**，
-         * 而不是游戏内存被改坏（那才是彩屏、封号那一类后果）。
+         * 而不是目标进程内存被改坏（那才是彩屏、目标进程被改坏那一类后果）。
          *
          * `set_maximum = 1` 是刻意的：只降 current 的话"上限"里还留着写权限，
          * 之后一句 mach_vm_protect 就能把 W 提回来。把上限本身压掉，写权限才真拿不回来
@@ -962,7 +962,7 @@ final class MemoryProbe {
 
     /// 走已建立映射、本地直读的次数。和 `hardReadCalls` 放一起看，一眼能分清
     /// 这一轮走的是映射还是内核降级读 —— `hardReadCalls` 必须长期保持在低位，
-    /// 它每涨一次游戏就多一次抢锁，那正是当初把游戏读崩的那条路。
+    /// 它每涨一次目标进程就多一次抢锁，那正是当初把目标进程读崩的那条路。
     static var mappedHitCalls: Int { mappedHits }
 
     /// 按需建立的映射块数 —— 它一直涨说明预映射没铺到，正在现场补。
@@ -980,7 +980,7 @@ final class MemoryProbe {
         //
         // 为什么：第一步里 `mappedRanges` 恒为空（跨进程映射没启用），
         // 而面板那一行"保护位"恰恰是最该一直挂着看的数 —— 窗口是不是真的只读，
-        // 决定第二步出问题时吃亏的是我们自己，还是游戏内存被写坏。
+        // 决定第二步出问题时吃亏的是我们自己，还是目标进程内存被写坏。
         // 返回"无映射"等于把这一格浪费掉。
         guard !mappedRanges.isEmpty else { return windowProtectionLine() }
         if protectionCursor >= mappedRanges.count { protectionCursor = 0 }
@@ -1002,7 +1002,7 @@ final class MemoryProbe {
     /// 与原来"每轮抽查一块映射"的成本完全一样。
     ///
     /// 判据只看 `VM_PROT_WRITE`(0x2) 这一位：窗口必须**不可写**。
-    /// 可写就意味着第二步一旦把页指到游戏物理页，任何一次误写都会直接落到游戏内存上。
+    /// 可写就意味着第二步一旦把页指到目标物理页，任何一次误写都会直接落到目标进程内存上。
     private static func windowProtectionLine() -> String {
         let win = withLock { localWindow }
         guard let w = win else { return "保护位: 无映射 · 窗口未建立（点「窗口」）" }
@@ -1036,13 +1036,13 @@ final class MemoryProbe {
          * 两层原因：
          *
          * 1）这条路的映射原本是**自映射**（mapRange 里 src_task / target_task 都是
-         *    mach_task_self_，srcAddress 却传游戏地址）。游戏那块内存在本进程的
-         *    vm_map 里并不存在，所以它既不产出游戏数据，又白占 mappedRanges
+         *    mach_task_self_，srcAddress 却传目标进程地址）。目标进程那块内存在本进程的
+         *    vm_map 里并不存在，所以它既不产出目标进程数据，又白占 mappedRanges
          *    的额度（上限 2048 块）。`mapRange` / `mapAllRegions` 现在都改成明确拒绝了，
          *    于是 `mappedRanges` 在第一步**恒为空** —— 这段代码即使打开也命中不了任何一块。
          *
          * 2）样本的自映射之所以成立，是因为它前面有 physrw / PTE 改写，已经先把
-         *    游戏的物理页挂进了自己的地址空间。我们这一步只做到「本地窗口」：
+         *    目标进程的物理页挂进了自己的地址空间。我们这一步只做到「本地窗口」：
          *    窗口建好、被 wire 住、能读写（点「窗口」按钮看自验证），但**还没有任何
          *    一页指向目标物理页** —— 那是第二步，也是唯一没有样本证据的环节。
          *
@@ -1492,7 +1492,7 @@ final class MemoryProbe {
     ///
     /// 这条链长（本机实测 13 个关卡合计约 650 个 actor），所以只在 1–2Hz 上跑。
     /// 两条硬要求：
-    ///   · **每一个关卡都要遍历** —— 之前只挑"最大的那个关卡"，结果玩家所在的
+    ///   · **每一个关卡都要遍历** —— 之前只挑"最大的那个关卡"，结果角色所在的
     ///     PersistentLevel 被跳过，角色数直接是 0
     ///   · 类名解析按 Class 指针**去重** —— 同类对象共享 Class，解析次数只跟
     ///     "有多少种类"有关，不跟 actor 数量有关
@@ -1683,7 +1683,7 @@ final class MemoryProbe {
     ///
     /// **每次 `task_for_pid` 都会新建一个 send right**，不释放就一直累积。
     /// 之前的版本从来没释放过：每点一次按钮泄漏一个 right，而每个 right 都让
-    /// 游戏的 task 对象多背一个引用 —— 游戏崩掉之后那个 task 对象也回收不掉，
+    /// 目标进程的 task 对象多背一个引用 —— 目标进程崩掉之后那个 task 对象也回收不掉，
     /// 反复"崩→重开→读"会把内核里堆一串收不掉的 task。
     /// 取端口的地方一律用 `defer { dropPort(p) }` 配对。
     // dropPort 已移除：不再持有 task port，没有 right 需要释放。
@@ -1696,14 +1696,14 @@ final class MemoryProbe {
     private static let staticImageBase: UInt64 = 0x100000000
 
     /// 本次运行找到的 image base 与 slide。
-    /// 由「找村口」写入；**只对这个 pid 有效** —— 游戏重启会换 pid，
+    /// 由「找村口」写入；**只对这个 pid 有效** —— 目标重启会换 pid，
     /// ASLR 也会把基址搬走，所以还要记住它是给哪个 pid 找的。
     private(set) static var imageBase: UInt64 = 0
     private(set) static var imageSlide: UInt64 = 0
     private(set) static var basePid: Int32 = 0
 
     /// 当前这个进程的基址是否已经准备好。
-    /// 少了 pid 这一条，游戏重启后会拿旧 slide 去拼地址 —— 算出来的东西看着像地址，
+    /// 少了 pid 这一条，目标重启后会拿旧 slide 去拼地址 —— 算出来的东西看着像地址，
     /// 读回来全是垃圾，白白消耗调用次数。
     static func baseReady(for pid: Int32) -> Bool {
         imageSlide != 0 && imageBase != 0 && basePid == pid
@@ -1936,7 +1936,7 @@ final class MemoryProbe {
     ///   clsIX  = *(class + 0x18)       类的 FName
     ///
     /// 为什么收着读：上一版逐个对象读 5 处字段 + 两次名字解析，16 个全解时
-    /// 触及约 80 页 —— 点完游戏闪退了。现在改成
+    /// 触及约 80 页 —— 点完目标进程闪退了。现在改成
     ///   ① items 数组一次读完（16×0x18 = 384 字节，1 页），拿到 16 个对象指针
     ///   ② 每批只详解 4 个，点一次往下走一批（游标存在 static 里）
     /// 每次点击的代价降到 1/4 以下，且报告里直接把触及页数打出来。
@@ -2034,15 +2034,15 @@ final class MemoryProbe {
     /// 世界链：GWorld → PersistentLevel → Actors（三次小读，个位数页）。
     ///
     /// 这条链刻意**绕开对象表**。理由在崩溃报告里：
-    ///   对象表那步触及约 80 页（对象字段多是冷页）→ 点完游戏 SIGSEGV，
-    ///   而 GWorld / UWorld / ULevel 是游戏每一帧都在用的热页，读取不改变驻留图。
+    ///   对象表那步触及约 80 页（对象字段多是冷页）→ 点完目标进程 SIGSEGV，
+    ///   而 GWorld / UWorld / ULevel 是目标进程每一帧都在用的热页，读取不改变驻留图。
     ///
     ///   UWorld = *(GWorld槽)
     ///   UWorld + 0xB8 → PersistentLevel (ULevel*)
     ///   ULevel + 0xA0 → Actors TArray { data*(8) count(4) max(4) }
     /// 世界链 + Actor 列表：GWorld → PersistentLevel → Actors，然后逐个认类名。
     ///
-    /// 这是通往玩家的正路 —— 完全不碰那 46 万个对象的对象表。
+    /// 这是通往角色的正路 —— 完全不碰那 46 万个对象的对象表。
     /// 偏移来自同一份 dump：
     ///   UWorld + 0xB8 → PersistentLevel (ULevel*)
     ///   ULevel + 0xA0 → Actors (TArray<AActor*>: 指针8 + count4 + max4)
@@ -2061,7 +2061,7 @@ final class MemoryProbe {
         var lines: [String] = []
 
         // ⓿ 读之前先把大块铺好。**这一步不能省**：遍历整张 actor 表是几千次读取，
-        //    只要有相当一部分没命中映射，就会退化成 mach_vm_read —— 那是会崩游戏的路。
+        //    只要有相当一部分没命中映射，就会退化成 mach_vm_read —— 那是会崩目标进程的路。
         if mappedBlockCount < 8 {
             stageMark("世界 · 预映射")
             lines.append(mapAllRegions(pid: pid))
@@ -2114,7 +2114,7 @@ final class MemoryProbe {
 
         // ③′ 关卡全景。**两次都卡在这里**：先只看了 PersistentLevel（44 个，全是框架对象），
         //     改看最大的子关卡后又只剩射击场物件 —— 因为场景内容分散在 UWorld::Levels 的
-        //     13 个关卡里，玩家在哪个关卡事先并不知道。
+        //     13 个关卡里，角色在哪个关卡事先并不知道。
         //       0x0AF0  Levels              TArray<ULevel*>  ← 所有关卡，每个各自持有 Actors
         //       0x0AB8  ActiveLevelActors   TArray<AActor*>  ← 实测客户端恒为 0，只记录不使用
         //     **所以这一版把每一个关卡都收进 sources，全都遍历** —— 不再挑一个。
@@ -2165,7 +2165,7 @@ final class MemoryProbe {
         // （同类对象共享 Class，命中率接近 100%），所以名字池的读取次数只跟「有多少种类」有关。
         stageMark("世界 · 遍历 Actor")
         // 第一次先只走 1200 个：本地读虽然不产生内核调用，但未映射过的页首次访问会有
-        // page fault（内核要在游戏名下记账一块物理页）。等确认预映射覆盖够、page fault
+        // page fault（内核要在目标进程名下记账一块物理页）。等确认预映射覆盖够、page fault
         // 不成问题，再把这个上限放开。
         let budget = 3000
         var classNames: [UInt64: String] = [:]
@@ -2180,9 +2180,9 @@ final class MemoryProbe {
             var cursor = 0
             while cursor < src.count {
                 // 预算闸门：一旦真的落回 mach_vm_read 太多次，立刻收手。
-                // 上一版没有这道闸门，一路读到底，游戏就没了。
+                // 上一版没有这道闸门，一路读到底，目标进程就没了。
                 if hardReadCalls > 200 {
-                    lines.append("⚠ 已用 \(hardReadCalls) 次内核读 —— 主动停止遍历，保住游戏")
+                    lines.append("⚠ 已用 \(hardReadCalls) 次内核读 —— 主动停止遍历，保住目标进程")
                     stopped = true
                     break sourceLoop
                 }
@@ -2237,7 +2237,7 @@ final class MemoryProbe {
             lines.append("  \(name) × \(c)")
         }
 
-        // 只把「像角色」的类名单独再列一遍 —— 122 种类里前 40 名排不进玩家角色时，
+        // 只把「像角色」的类名单独再列一遍 —— 122 种类里前 40 名排不进角色时，
         // 上面那张总表会把它淹掉。这一节不管数量多少都要出现。
         let pawnish = histogram.filter {
             $0.key.contains("Character") || $0.key.contains("Pawn") || $0.key.contains("Controller")
@@ -2349,7 +2349,7 @@ final class MemoryProbe {
         //   ASTExtraPlayerState + 0x16C0 CharacterOwner  → 那个人的身体
         //   ASTExtraPlayerState + 0x16D0 PlayerHealth    → 血量 / 上限
         //   APlayerState        + 0x05D8 PlayerName      → 名字
-        // 有名字 + 有血量 + 有身体的，才是真人玩家。
+        // 有名字 + 有血量 + 有身体的，才是真实角色。
         if !psActors.isEmpty {
             lines.append("PlayerState（\(psActors.count) 个）:")
             for (i, s) in psActors.prefix(16).enumerated() {
@@ -2403,14 +2403,14 @@ final class MemoryProbe {
                         tail = "  ★你  "
                         localCount += 1
                     } else if let my = myLoc {
-                        // 坐标单位是厘米，这里换算成米 —— 这就是 ESP 真正要用的那个数
+                        // 坐标单位是厘米，这里换算成米 —— 这就是 渲染真正要用的那个数
                         let dx = Double(x) - Double(my.0)
                         let dy = Double(y) - Double(my.1)
                         let dz = Double(z) - Double(my.2)
                         let dist = (dx * dx + dy * dy + dz * dz).squareRoot() / 100.0
                         tail = "  \(String(format: "%5.0f", dist))m"
                     }
-                    // 屏幕坐标：**这是 ESP 真正要画的那个点**。
+                    // 屏幕坐标：**这是 渲染真正要画的那个点**。
                     var scrTxt = ""
                     if let pt = project(x, y, z) {
                         let inView = pt.0 >= 0 && pt.0 <= scrW && pt.1 >= 0 && pt.1 <= scrH
@@ -2433,7 +2433,7 @@ final class MemoryProbe {
         return lines.joined(separator: "\n")
     }
 
-    // MARK: - 内存账本（验证读取是否在给游戏加内存）
+    // MARK: - 内存账本（验证读取是否在给目标进程加内存）
 
     private typealias TaskInfoFn = @convention(c) (UInt32, Int32,
                                                    UnsafeMutablePointer<Int32>,
@@ -2491,14 +2491,14 @@ final class MemoryProbe {
         lines.append("  compressed     = \(mb(comp)) MB   ← 读冷页会让它往下掉")
         lines.append("  resident       = \(mb(resi)) MB")
         lines.append("  virtual        = \(mb(virt)) MB")
-        lines.append("用法：动作前后各点一次这个按钮，差值直接说明读取给游戏加了多少内存")
+        lines.append("用法：动作前后各点一次这个按钮，差值直接说明读取给目标进程加了多少内存")
         lastMem = (phys, comp, resi)
         return lines.joined(separator: "\n")
     }
 
     /// 映射原语验证 —— 第一步验证的是**本地窗口**。
     ///
-    /// 这个按钮原来点的是"跨进程映射"：把游戏的映像头 / `__DATA` 段 remap 进本进程，
+    /// 这个按钮原来点的是"跨进程映射"：把目标进程的映像头 / `__DATA` 段 remap 进本进程，
     /// 然后从本地内存直接读 Mach-O 头与 GObjects。那条路现在走不通 ——
     /// 它需要**目标进程的 task port**，而本工程在内核路径下不产生 port（见 mapRange 的注释）。
     /// 原来那个"退化版"会返回一个看着像成功的映射，实际指向的是我们自己的内存：
@@ -2515,7 +2515,7 @@ final class MemoryProbe {
     static func stepRemapProbe(pid: Int32) -> String {
         var lines = [stepWindowProbe()]
         lines.append("")
-        lines.append("跨进程映射（把游戏页直接 remap 进来）：未启用 —— 需要目标 task port。")
+        lines.append("跨进程映射（把目标进程页直接 remap 进来）：未启用 —— 需要目标 task port。")
         lines.append("  第一步能做的只有「本地窗口」；让窗口页指向目标物理页是第二步。")
         return lines.joined(separator: "\n")
     }
@@ -2586,7 +2586,7 @@ final class MemoryProbe {
     /// 偏移全部来自同一份 dump：
     ///   UWorld + 0xB20        → OwningGameInstance (UGameInstance*)
     ///   UGameInstance + 0x48  → LocalPlayers (TArray<ULocalPlayer*>)
-    ///     ★ +0x80 是 bUseEncryptLocalPlayerPtr —— 这是和平精英加的反作弊：
+    ///     ★ +0x80 是 bUseEncryptLocalPlayerPtr —— 这是目标应用加的指针加密：
     ///       为 true 时 LocalPlayers 里的指针是加密的（明文那份在 +0x38
     ///       EncryptedLocalPlayers）。所以这一环必须先读标志，再决定怎么解析。
     ///   UPlayer + 0x30        → APlayerController*（ULocalPlayer 继承自 UPlayer）
@@ -2696,7 +2696,7 @@ final class MemoryProbe {
         return lines.joined(separator: "\n")
     }
 
-    /// 全场玩家：GWorld → GameState → PlayerArray → ASTExtraPlayerState → 位置 / 血量 / 角色
+    /// 全场角色：GWorld → GameState → PlayerArray → ASTExtraPlayerState → 位置 / 血量 / 角色
     ///
     /// **这一版的偏移全部回溯过类声明**（上一版把 `AController` 的 `Pawn` 当成了
     /// `APlayerState` 的字段 —— 那个 `0x5D8` 实际是 `FString PlayerName`；而
@@ -2716,15 +2716,15 @@ final class MemoryProbe {
     ///                                     = FVector Loc(0x0C) + FRotator Rot(0x0C)
     ///
     /// `PlayerState` 是 always-relevant 的，**位置就挂在它自己身上** —— 不需要遍历
-    /// actor 表，也不需要从一个不存在的 Pawn 字段反查。每个玩家 2 次读取。
+    /// actor 表，也不需要从一个不存在的 Pawn 字段反查。每个角色 2 次读取。
     ///
     /// 坐标走两条独立路径交叉验证：PlayerState 的 `SelfLocAndRot`，
     /// 以及 `CharacterOwner → RootComponent → ComponentToWorld`。两条一致才敢用。
     static func stepPlayers(pid: Int32) -> String {
         resetCounters()
-        stageMark("玩家")
+        stageMark("角色")
         guard baseReady(for: pid) else {
-            return "玩家: 没有当前进程的基址 —— 先点「世界」或「映射」"
+            return "角色: 没有当前进程的基址 —— 先点「世界」或「映射」"
         }
 
         let s = imageSlide
@@ -2763,7 +2763,7 @@ final class MemoryProbe {
             return (out, ok)
         }
 
-        /// 这个角色是不是本地玩家的：Character + 0x608 → AController，
+        /// 这个角色是不是本地角色的：Character + 0x608 → AController，
         /// 再读 APlayerController + 0xA8C 的 bIsLocalPlayerController。
         /// **这条路不碰 LocalPlayers**，所以不受 bUseEncryptLocalPlayerPtr 影响。
         /// 返回 nil 表示读不到 —— 那时调用方会退回 PlayerState 比对。
@@ -2777,11 +2777,11 @@ final class MemoryProbe {
 
         // ① UWorld
         let (rkW, world) = readRaw(pid: pid, address: MachVmAddress(runtime(off.gWorld, slide: s)))
-        guard rkW == KERN_SUCCESS, world != 0 else { return "玩家: 读 GWorld 失败 \(describe(rkW))" }
+        guard rkW == KERN_SUCCESS, world != 0 else { return "角色: 读 GWorld 失败 \(describe(rkW))" }
         lines.append("UWorld=\(hexOf(world))")
 
         // ② GameState
-        stageMark("玩家 · GameState")
+        stageMark("角色 · GameState")
         let (rkGS, gameState) = readRaw(pid: pid, address: MachVmAddress(world &+ 0xAD8))
         guard rkGS == KERN_SUCCESS, gameState != 0 else {
             return lines.joined(separator: "\n")
@@ -2789,11 +2789,11 @@ final class MemoryProbe {
         }
         lines.append("GameState=\(hexOf(gameState))")
 
-        // ②′ GameState 自己的玩家计数（ASTExtraGameStateBase，偏移同样回溯过类声明）：
+        // ②′ GameState 自己的角色计数（ASTExtraGameStateBase，偏移同样回溯过类声明）：
         //     0x0D98 TotalPlayerNum · 0x0D9C PlayerNum
         //     0x141C AlivePlayerNum · 0x1420 AliveRealPlayerNum
         //   这几个数是服务器给的**权威人数**。拿它和下面 PlayerArray.count 一比，
-        //   就能直接看出服务器把玩家列表裁剪了多少 —— 不用再靠推测。
+        //   就能直接看出服务器把角色列表裁剪了多少 —— 不用再靠推测。
         let (rkN1, n1) = readBytes(pid: pid, address: MachVmAddress(gameState &+ 0x0D98), count: 8)
         if rkN1 == KERN_SUCCESS, n1.count >= 8 {
             lines.append("  人数(总): TotalPlayerNum=\(i32le(n1, 0))   PlayerNum=\(i32le(n1, 4))")
@@ -2808,7 +2808,7 @@ final class MemoryProbe {
         }
 
         // ③ PlayerArray
-        stageMark("玩家 · PlayerArray")
+        stageMark("角色 · PlayerArray")
         let (rkPA, parr) = readBytes(pid: pid, address: MachVmAddress(gameState &+ 0x5E8), count: 16)
         guard rkPA == KERN_SUCCESS, parr.count >= 16 else {
             return lines.joined(separator: "\n") + "\n读 PlayerArray 失败 \(describe(rkPA))"
@@ -2826,7 +2826,7 @@ final class MemoryProbe {
             return lines.joined(separator: "\n")
         }
 
-        // ④ 逐个玩家：所有数据都挂在 PlayerState 自己身上
+        // ④ 逐个角色：所有数据都挂在 PlayerState 自己身上
         let n = min(Int(paCount), 8)
         let (rkList, list) = readBytes(pid: pid, address: MachVmAddress(paData), count: n * 8)
         guard rkList == KERN_SUCCESS, list.count >= n * 8 else {
@@ -2837,7 +2837,7 @@ final class MemoryProbe {
         // 顺带标出名单里"哪个是你"：任一环失败就静默跳过，不影响主流程
         let (selfPS, selfTrace) = findSelfPlayerState(pid: pid, world: world)
 
-        stageMark("玩家 · 遍历")
+        stageMark("角色 · 遍历")
         var withChar = 0
         var withCoord = 0
         var withLoc = 0
@@ -3018,7 +3018,7 @@ final class MemoryProbe {
     /// 命中后再读 4 字节校验 magic == 0xFEEDFACF、+12 的 filetype == 2。
     ///
     /// **不再调用 proc_regionfilename。** 它要走 vnode 查路径，是整个枚举里最贵的一步，
-    /// 而且会在游戏的 vm_map 上停很久 —— 实测直接把后台线程卡死在第一次调用上
+    /// 而且会在目标进程的 vm_map 上停很久 —— 实测直接把后台线程卡死在第一次调用上
     /// （面板停在"映射: 建立中…"再也不动，然后被 cpu_resource_fatal 杀掉）。
     /// 前两条判据是 vm_region_recurse 顺手带回来的，免费；Mach-O 那两次小读很便宜。
     ///
@@ -3028,31 +3028,31 @@ final class MemoryProbe {
         stageMark("找村口 开始")
         guard vmRegion64Fn != nil else { return "找基址: vm_region_64 符号缺失" }
 
-        // ---- 参数自检：先对自己进程枚举一次，参数错就停在这里，绝不碰游戏 ----
+        // ---- 参数自检：先对自己进程枚举一次，参数错就停在这里，绝不碰目标进程 ----
         stageMark("找村口 · 参数自检")
         var selfAddr: UInt64 = 0
         let selfCheck = nextRegion(task: mach_task_self_, addr: &selfAddr)
         guard selfCheck.ok else {
-            return "找基址: 参数自检失败（对自己枚举就不成功），未碰游戏"
+            return "找基址: 参数自检失败（对自己枚举就不成功），未碰目标进程"
         }
 
         // ---- 端口机制已移除 ----
-        // 原来这里要 `port(for: pid)` 拿游戏的 task port，再用 `defer { dropPort(p) }` 归还。
+        // 原来这里要 `port(for: pid)` 拿目标进程的 task port，再用 `defer { dropPort(p) }` 归还。
         // 内核路径不产生 port，所以这两步连同它们的 guard 一起删掉了。
         // 下面所有枚举/读取改走 pid（内核里自己定位 proc/task），见 km_read_process。
 
-        // ---- 不在这里预先校验"这是不是游戏" ----
+        // ---- 不在这里预先校验"这是不是目标进程" ----
         // 原来这里读 0x100000000 处的 Mach-O 头做 pid 校验，那是个错误假设：
         // 0x100000000 落在 __PAGEZERO 里（dump 里 [00] 段 0x047D0000~0x1047D0000），
         // 而 __PAGEZERO 是不可读的（prot = 0），在那儿读必然拿到 KERN_INVALID_ADDRESS。
         // 真正的 __TEXT 是 0x100000000 + slide（每次 ASLR 都不同）。
-        // 判断"这是不是游戏"交给下面枚举里的 Mach-O 校验 —— 那才是它该在的位置。
+        // 判断"这是不是目标进程"交给下面枚举里的 Mach-O 校验 —— 那才是它该在的位置。
 
         // 起点直接用 0x100000000，不从 0 开始。
         // 主可执行文件的 __TEXT 就在那儿 —— dump 里是，真机每次实测也是
         // （0x102ac4000 / 0x1027c8000 / 0x104708000… 全都是这个基址加 slide）。
         // 从 0 开始要白白走过几百个低地址 region，每一个都是一次内核调用、
-        // 一次对游戏 vm_map 的加锁 —— 既是我们的 CPU 开销，也是对游戏的打扰。
+        // 一次对目标进程 vm_map 的加锁 —— 既是我们的 CPU 开销，也是对目标进程的打扰。
         var addr: UInt64 = 0x100000000
         var scanned = 0
         var hitBase: UInt64 = 0
@@ -3082,7 +3082,7 @@ final class MemoryProbe {
             if scanned % 100 == 0 { stageMark("找村口 · 已枚举 \(scanned) 个 region") }
 
             // 这里不再调 proc_regionfilename：它要走 vnode 查路径，是整个枚举里最贵的一步，
-            // 而且会在游戏的 vm_map 上停很久。判定改成三条便宜条件 ——
+            // 而且会在目标进程的 vm_map 上停很久。判定改成三条便宜条件 ——
             // 可执行 + 从文件头映射 + 区域够大（主二进制的映像有几百 MB）——
             // 最后再用 Mach-O 头做裁决。三条里前两条是 vm_region_recurse 顺手带回来的，免费。
             if (prot & 0x4) != 0,          // VM_PROT_EXECUTE
@@ -3133,7 +3133,7 @@ final class MemoryProbe {
             lines.append("\(name)\(pad)0x\(String(staticAddr, radix: 16)) → 0x\(String(r, radix: 16)) "
                 + (inside ? "✓" : "✗越界"))
         }
-        lines.append("（找基址本身不读游戏内存，这里只统计 Mach-O 头校验：" + costLine() + "）")
+        lines.append("（找基址本身不读目标进程内存，这里只统计 Mach-O 头校验：" + costLine() + "）")
         return lines.joined(separator: "\n")
     }
 }
