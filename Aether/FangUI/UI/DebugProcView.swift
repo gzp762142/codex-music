@@ -108,6 +108,13 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
         (btnPhysWindow, "建窗", #selector(onPhysWindowProbe)),
         (btnPhysMapPre, "表预检", #selector(onPhysMapPre)),
         (btnPhysMapBuild, "建表", #selector(onPhysMapBuild)),
+        // 「读页」：把自映射那张页表页**当普通内存读一页回来**，并核对这一页的第 0 个
+        // 8 字节 —— 它是「建表」的下游，也是「窗口 + PTE 写入 + EL0 直访」这条链
+        // 第一次被真正读通的判据（C 侧契约见 KernelPhysMap.h:329-364）。
+        // 与「测偏移」同理：不需要更新标题，直接内联构造。
+        // 本次新增（面板从七个按钮变八个）：排版会自动多出一行 —— layoutSubviews
+        // 按 actionButtons 的数量算行数，不必改它。
+        (UIButton(type: .system), "读页", #selector(onReadPage)),
         // 「测偏移」：在 task 结构里**实测** vm_map 字段的偏移（KernelStructScan，全程只读）。
         // 为什么需要它：pmap 链路里 task->map 用的是版本表的 0x28，而真机上用它读出来的不是
         // vm_map —— 该偏移在 iOS 16.x 各构建间会浮动、硬编码不可靠。本按钮把那个数变成实测值。
@@ -1364,6 +1371,144 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
                      + (offset == 0 ? "0（未命中或前置不成立 —— 见上面诊断第一行摘要）"
                                     : "0x" + String(offset, radix: 16)))
         lines.append("版本表里现在写的 task->map 偏移 = 0x" + String(km_task_map_offset(), radix: 16))
+        return lines.joined(separator: "\n")
+    }
+
+    // MARK: - 读页（KernelPhysMap）：自映射页的直访核对
+
+    /*
+     * 这个按钮验证的是**刚刚打通的那一段**：窗口 + PTE 写入 + EL0 直访。
+     * 它是「建表」的下游 —— 建完表之后我们才第一次能"读一页物理内存"。
+     *
+     * 为什么偏偏读 magicPT 这一页（这是本按钮的全部价值，别当成随便读一页）：
+     *   magicPT 是自映射页表页的**物理地址**，而这一页已被自映射到我们自己的地址空间。
+     *   于是这一页的**第 0 个 8 字节**就是那条自映射页表项本身，它的值**必然等于**
+     *   `magicPT | 0x6000000000000e43`（叶模板）。
+     *   所以这一次读取的返回值同时钉住三件事：「PTE 已写入」「窗口可直访」
+     *   「窗口地址正确」—— 任何一件不成立，读回的值都对不上。
+     *
+     * 与「建表」「表预检」同一套写法、同一个理由：physreadbuf 走 km_read/km_write，
+     * 而 libkfd 的后端**不是线程安全的**，所以必须走 AutoTracker 那条串行队列，
+     * 并且要在后台线程跑。**本按钮不写内核内存**，失败之后可以立刻再点一次。
+     */
+
+    private var readPageBusy = false
+    private var readPageStarted = Date.distantPast
+
+    /// 「读页」按钮。
+    @objc private func onReadPage() { runReadPage() }
+
+    private func runReadPage() {
+        /*
+         * 前置：自映射得先建出来。`km_physmap_magic_pt()` 只读 C 侧一个静态变量
+         * （KernelPhysMap.m:3124 直接 `return g_physmapMagicPT`），一次内核访问都不发，
+         * 所以在主线程当场判它是合规的 —— 而这一步判掉之后，就不必为一个必然失败的
+         * 调用去占一趟串行队列（那会白等一次队列，还会把失败原因搅进读取链的节奏里）。
+         */
+        let magicPT = km_physmap_magic_pt()
+        guard magicPT != 0 else {
+            probeLabel.text = "先跑建表（magicPT=0）"
+            probeLabel.textColor = warnText
+            return
+        }
+
+        if readPageBusy {
+            // 与「建窗」「测偏移」同门槛：一次读页只有几次内核访问，真卡住的话是
+            // 内核层面的事，30 秒足够判定，不必按 XPF 那种几十秒的门槛放行。
+            if Date().timeIntervalSince(readPageStarted) <= 30 {
+                showReport("读页: 上一次读取还没回来（内核可能被堵住了），等它")
+                return
+            }
+        }
+        readPageBusy = true
+        readPageStarted = Date()
+        probeLabel.text = "读页: 直访自映射页中…"
+        probeLabel.textColor = idleText
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            // 必须与读取链串行：本调用会 kread/kwrite（physreadbuf → km_read/km_write），
+            // 而 libkfd 的后端每次读都要改写自己 psemnode 的 pinfo —— 并发就是互相踩。
+            let text = AutoTracker.shared.syncExternal {
+                DebugProcView.readPageReport(magicPT: magicPT)
+            }
+            DispatchQueue.main.async {
+                guard let s = self else { return }
+                s.readPageBusy = false
+                // showReport 把第一行（C 侧写的单行摘要）放进 probeLabel、整段进列表 ——
+                // 与「建表」「表预检」显示报告的方式完全一致，这里不覆盖它。
+                s.showReport(text)
+            }
+        }
+    }
+
+    /// 真正碰 C 接口的部分。**必须在主线程之外执行**（见 runReadPage）。
+    ///
+    /// 与 slideReport / physMapPreReport 同一条口径：报告的正文由 C 侧拼好，
+    /// 面板**不复算判据**。唯一的例外就是下面那条前 8 字节核对 —— 它是**纯本地的比较**，
+    /// 一次内核调用都不额外发（值取自已经读回来的这一页），而且只在读页成功时才算。
+    private static func readPageReport(magicPT: UInt64) -> String {
+        var lines: [String] = []
+
+        /*
+         * 一页 = 16384 字节，与 C 侧的判据一致（KernelPhysMap.h:344：out 至少 16384
+         * 字节，小于一页时它一个字节都不读）。
+         *
+         * Swift 没有 RAII，所以 `defer` 是这里的唯一保障：无论下面哪一条 return 走掉，
+         * 缓冲都会被 deallocate。
+         *
+         * 对齐取 8 有两个用处：C 侧按 8 字节粒度往 out 里写（本工程的读写粒度），
+         * 而下面 `load(as: UInt64.self)` 也要求 8 字节对齐 —— 一个参数同时满足两条。
+         */
+        let pageBytes = 16384
+        let page = UnsafeMutableRawPointer.allocate(byteCount: pageBytes, alignment: 8)
+        defer { page.deallocate() }
+
+        /*
+         * 摘要**显式标注成 String**：C 侧返回的是 `NSString *`，而 KernelPhysMap.h
+         * 没有 NS_ASSUME_NONNULL_BEGIN，所以 Swift 侧它是隐式解包可选（`String!`）。
+         * 写死类型标注让解包发生在这**一行**，而不是散在下面每一处使用点上。
+         * 条目契约是"永不返回 nil"（KernelPhysMap.h:353），所以这里不会踩空。
+         */
+        let summary: String = km_physmap_read_page_summary(magicPT, page, pageBytes)
+        // 第一行进状态行（showReport 取 first），整段进可滚动列表
+        lines.append(summary)
+
+        /*
+         * 只在**真读到了**的时候才对前 8 字节下断言。
+         *
+         * 判据用前缀：C 侧这段只有一个成功出口，它写的是「页读取 …」（成功但槽位轨迹
+         * 异常的那两种形态也是这个前缀，它们的 out 里同样有真实数据）；其余每一个出口
+         * 都是「读页失败…」（KernelPhysMap.m:3563-3641）。
+         *
+         * 失败时**不算、也不显示"不一致"** —— 那会把"没读到"误报成"读错了"，
+         * 而这两件事要查的方向完全不同。
+         */
+        if summary.hasPrefix("页读取") {
+            /*
+             * 小端读回前 8 字节。
+             *
+             * ARM64 是小端，`load` 给出的就是本机字节序的值；再显式过一遍
+             * `littleEndian` 只是把「小端」这个口径写进代码里（在模拟器上同样成立），
+             * 不是多一次转换。
+             */
+            let got = UInt64(littleEndian: page.load(as: UInt64.self))
+            let expected = magicPT | 0x6000000000000e43
+            if got == expected {
+                lines.append("✓ 自映射项核对一致：PTE 已写入、窗口可直访、窗口地址正确")
+            } else {
+                lines.append("✗ 不一致：读回 0x" + String(got, radix: 16)
+                             + "，期望 0x" + String(expected, radix: 16)
+                             + " —— 三件事里至少一件不成立")
+            }
+        } else {
+            lines.append("（本次没读到数据 —— 不做自映射项核对；失败在哪一环见上面的摘要）")
+        }
+
+        // 诊断紧接在摘要（与核对结论）之后：C 侧那块文本的第一行就是本次摘要，
+        // 之后整块复用窗口槽位诊断（KernelPhysMap.h:359-364）。
+        if let diagnostic = km_physmap_read_page_diag() {
+            lines.append(contentsOf: diagnostic.split(separator: "\n").map(String.init))
+        }
         return lines.joined(separator: "\n")
     }
 
