@@ -582,15 +582,13 @@ static uint64_t kpm_vtophys_lvl(const km_pm_ctx *ctx, uint64_t tte_ttep, uint64_
          * 上游 Dopamine 的 translation.c 全程 physread64(tte_pa) 后再 `& mask`，
          * 一次 UNSIGN_PTR 都没有。
          *
-         * 但把它按 raw / 解释后的值打出来仍然有价值：这一跳是读取链上第一次
-         * **由"上一次读的结果"决定下一次读的地址**，真机若在这里翻车，
-         * 需要一眼看出是读错了还是后面的解释错了。
+         * 这一跳的 raw 值本来值得打出来（它是读取链上第一次由"上一次读的结果"
+         * 决定下一次读的地址），但**本函数没有诊断出口**：签名里没有 km_pm_text，
+         * 这是刻意的 —— 它是个纯计算函数，断点信息通过 *err / *leaf_addr /
+         * *leaf_level 回传给调用方。所以这里**一次 kpm_append 都不能有**，
+         * 要打印就在调用方打。（CI 上真踩过：这里加了一句 kpm_append(t, ...)，
+         * 而 `t` 在本函数里未声明，整个 build 直接挂。）
          */
-        kpm_append(t, "  下钻 %llu：表 KVA=%#llx 表项 raw=%#llx（解释：PA=%#llx type=%#llx）\n",
-                   (unsigned long long)curLevel, (unsigned long long)tte_kva,
-                   (unsigned long long)tteEntry,
-                   (unsigned long long)(tteEntry & KM_PM_TTE_PA_MASK),
-                   (unsigned long long)(tteEntry & lvlp->typeMask));
 
         if ((tteEntry & lvlp->validMask) != lvlp->validMask) {
             if (err) {
