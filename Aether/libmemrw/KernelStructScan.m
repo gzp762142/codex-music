@@ -1,16 +1,16 @@
 //
 //  KernelStructScan.m
-//  实现见 KernelStructScan.h 的组织说明。这里只补「为什么这么写」与证据指针。
+//  实现见 KernelStructScan.h 的组织说明。这里只补「具体写法为什么这样」与证据指针。
 //
-//  English-only rule for this translation unit: tools/clex_check.py scans every
-//  .c/.h/.m under Aether/ (clex_check.py:28-30, :134) and fails the gate on ANY
-//  CJK codepoint outside a string literal or comment. So every comment here is
-//  ASCII -- including ones that would read more naturally in Chinese. The
-//  reasoning lives in KernelStructScan.h, written in Chinese.
+//  这个翻译单元里中文只出现在注释里，诊断正文保持英文（与这个模块既有的输出一致，
+//  面板原样显示）。tools/clex_check.py 的 CJK 判定（clex_check.py:134）只在
+//  「既不在字符串、也不在注释里」的位置报错，状态机在 in_string / in_block_comment
+//  内直接 continue（clex_check.py:91-121），所以中文注释是过闸的。
 //
 
 #import <Foundation/Foundation.h>
 #include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "KernelMemory.h"
@@ -20,118 +20,69 @@
 #pragma mark - Scan geometry
 
 /*
- * Byte window scanned inside struct task.
+ * 一级读允许的唯一窗口：task+0x00 … task+0xF8，步长 8（32 个槽）。
  *
- * The authoritative offsets seen in the wild sit in 0x28..0x40, and the head of
- * struct task (the refcount/active word, the map pointer) is well inside the
- * first 0x100 bytes. Scanning 0x00..0x100 costs at most 32 word reads, all
- * inside the task object -- which is the one structure we already know is
- * mapped, since task = proc + proc__object_size was confirmed on device by two
- * independent checks (see KernelStructScan.h).
+ * 为什么只能是这一段：这些地址全部落在 task 结构自身内部，而 task 那个地址本身
+ * 已被证明可读 —— 上一版读过 task+0x28 没有崩（读到的值 0x52bc7e10023e93c0 不在
+ * 内核地址域：指针字段带 PAC 签名，还原之后落在哪一类由 km_unsign_ptr 的结果决定，
+ * 这正是本版要在分类前做还原、并把原始值与还原值一起打印的原因）。窗口以外的任何
+ * 地址都不在本模块的读取范围内，因为「读一个未经确认的地址」在现有 kread 路径下没有
+ * 安全形式：kread 让内核替我们解引用，EL1 的 data abort 默认致命（证据在 .h 里）。
  */
 #define KM_SS_SCAN_BEGIN 0x00ULL
 #define KM_SS_SCAN_END 0x100ULL
 
-/*
- * Same window inside the candidate vm_map.
- *
- * vm_map's own pointer fields (lock[2], the vm_map_links pair, rbh_root) all sit
- * below 0x40 -- offsetof(struct _vm_map, pmap) == 0x40 per static_info.h:198-206.
- * 0x100 is generous on purpose: this window must never be the reason a real
- * pmap is missed.
- */
-#define KM_SS_CAND_BEGIN 0x00ULL
-#define KM_SS_CAND_END 0x100ULL
+/// 小整数上界。用来把「引用计数 / 标志位」这类值单独标一类 —— 纯分类，不解引用。
+#define KM_SS_SMALL_INT 0x10000ULL
 
 /*
- * The two pmap head fields. Layout: static_info.h:255-257 (struct pmap begins
- * with `u64 tte; u64 ttep;`). KernelPhysWindow.m:663-665 reads this same pair,
- * so a candidate accepted here means exactly what that probe means by it.
+ * 读预算。km_read64 每次发两次 kread（KernelMemory.m:881-885 的复读确认），
+ * 本模块最坏 = 1 次前置读 + 32 个槽 = 33 次 km_read64 = 66 次 kread，所以 64 这个
+ * 预算在真实路径上不会被打到。它留着是为了让「窗口没走完就停下」有一个明确的状态
+ * （STATE=partial），而不是被静默截断成一次看起来干净的 no_bsd_info —— 半程扫描
+ * 读起来像完整结论，是这份诊断唯一不能犯的错。
  */
-#define KM_SS_PMAP_TTE_OFF 0x00ULL
-#define KM_SS_PMAP_TTEP_OFF 0x08ULL
+#define KM_SS_READ_BUDGET 64
+
+/// 能同时记录的槽位数。窗口一共 32 个槽，第 33 个不可能存在。
+#define KM_SS_MAX_SLOTS 32
 
 /*
- * Read transaction budget. Each km_read64 issues TWO kread calls
- * (KernelMemory.m:881-885), and a candidate costs two of them for its head
- * pair, so a bad-luck run of 32 candidates x 32 slots would otherwise be a few
- * thousand kernel reads. The probe is read-only, so this budget is about
- * runtime and observability, not safety. Hitting it is reported as a limitation
- * in the summary -- never as a silent truncation, because a partial scan that
- * reads like a clean miss is the one outcome this file must not produce.
+ * 文本缓冲。正文最坏 = 32 行槽 + 固定若干段（1KB 量级），16KB 留足余量。
+ * finalText 比正文再多留 KM_SS_SUMMARY_MAX，因为最终文本 = 摘要行 + 正文，
+ * 两个来源各自在自己的缓冲里限长，拼接处就不会再出现第三个截断点。
  */
-#define KM_SS_READ_BUDGET 512
-
-/*
- * Physical-address domain. Deliberately the SAME criterion the project already
- * uses for a physical address (KernelSlide.m:1588 for gPhysBase: non-zero,
- * < 2^48, 16K aligned). If this file invented a looser one, a value accepted
- * here would be rejected by the slide code and the two would disagree about
- * what "looks like a PA" means.
- *
- * Why 16K alignment is hardcoded instead of derived from km_kernel_page_size():
- * page tables are kernel pages, and every iOS device this project supports uses
- * 16K kernel pages (geometry table in KernelPhysWindow.m:21-23). Deriving it
- * would add a sysctl dependency to a judgement that must also hold when sysctl
- * is unavailable, and a 4K-derived mask would be looser, not safer. The device's
- * real page size is printed in the diagnostic, so a 4K device shows up as a
- * known limitation rather than as a quietly wrong answer.
- */
-#define KM_SS_PA_LIMIT (1ULL << 48)
-#define KM_SS_PA_ALIGN_MASK 0x3fffULL
-
-/*
- * The offsetof value 0x40 for struct _vm_map's pmap (static_info.h:198-206:
- * lock[2] = 16 bytes, then vm_map_header = vm_map_links 4x8 + i32 + u16 +
- * bitfield + rb_head_store 8 = 48 bytes) is NOT redefined as a macro here --
- * km_vm_map_pmap_offset() is the project's single source for it
- * (KernelMemory.m:790-798), and a second copy in this file would be exactly the
- * kind of duplicated constant that drifts. It is used for corroboration
- * reporting only, never as a criterion.
- */
-
-/// Text buffer. The design-review worst case is about 5KB (64 candidate lines +
-/// 32 slot lines + the fixed blocks); 16KB leaves room for a future line to be
-/// added without silently rewriting the tail.
 #define KM_SS_TEXT_SIZE 16384
-
-/// Maximum number of slots that can qualify simultaneously. 32 = the number of
-/// slots in the scan window; a 33rd is impossible by construction.
-#define KM_SS_MAX_CANDIDATES 32
+#define KM_SS_SUMMARY_MAX 320
 
 #pragma mark - State
 
-/// Last diagnostic text. Written once per scan, read by km_scan_diagnostic().
-/// Same discipline as KernelPhysWindow.m:114 and KernelSlide.m's g_diagText: the
-/// caller keeps both calls on one serial path (AutoTracker.syncExternal),
-/// because the kread backend is not thread safe.
+/// 上一次扫描的诊断文本。一次扫描写一次，km_scan_diagnostic() 读。
+/// 与 KernelPhysWindow.m 的 g_diagText 同一套纪律：调用方把两次调用放在同一条串行
+/// 路径上（AutoTracker.syncExternal），因为 libkfd 的 kread 后端不是线程安全的。
 static NSString *g_scanText = nil;
 
-/// Read counter and budget flag for the current scan.
+/// 当前这次扫描已发出的 km_read64 次数，以及「预算被打到」的标记。
 static uint64_t g_scanReads = 0;
 static bool g_scanBudgetHit = false;
 
 #pragma mark - Helpers
 
 /*
- * Shape gate -- the ONLY door every kread target must pass.
+ * 形态门 —— 本文件里每一个交给 km_read64 的地址都必须先过它。
  *
- * Two conditions, both required, and both deliberately identical to what
- * km_read64 itself enforces (KernelMemory.m:877 calls km_is_kernel_address):
- *   (1) kernel address domain: top 16 bits all ones. Same predicate as
- *       km_is_kernel_address (KernelMemory.m:241-244). Deliberately NOT
- *       stricter than km_read64's own gate -- if it were, a read rejected here
- *       would look different from a read rejected by km_read64, and the
- *       diagnostic would stop describing what actually happened.
- *   (2) 8-byte alignment: an 8-byte read at a misaligned address returns two
- *       neighbouring fields spliced together. That value "looks like a
- *       legitimate pointer" and sails through every later check -- the exact
- *       failure mode this project paid for twice: zero is caught by the shape
- *       gate, a plausible wrong value is not (KernelMemory.m:1580,
- *       KernelMemory.m:1695).
+ *   (1) 非 0：0 同时是「读失败」与「合法值」的哨兵，不能当读目标。
+ *   (2) 内核地址域（高 16 位全 1）：与 km_is_kernel_address（KernelMemory.m:241-244）
+ *       同一口径，也与 km_read64 自己的闸门（KernelMemory.m:877）同口径。
+ *       刻意不更严：更严的话，被本函数拒掉的读在诊断里会显示成"我拒了"，
+ *       而实际上是 km_read64 会拒，诊断就不再描述真实发生了什么。
+ *   (3) 8 字节对齐：非对齐的 8 字节读会把相邻两个字段拼成一个值，而那个值
+ *       「形如合法指针」，能穿过后面所有形态检查 —— 本工程为此付过两次代价
+ *       （KernelMemory.m:1580、KernelMemory.m:1695 记的两次彩屏）。
  *
- * Every address this file hands to km_read64 -- including ones computed from a
- * value we just read -- comes through here first.
+ * 本次改动之后唯一的读目标是 `task + N`（N ∈ [0x00, 0xF8] 且为 8 的倍数），
+ * 这条检查在当前路径上恒真。保留它是因为它是不变式，不是因为现在能挡住什么：
+ * 它还负责把「task 本身没对齐」这件事变成一行诊断，而不是一次形态可疑的读。
  */
 static bool km_ss_readable(uint64_t addr)
 {
@@ -147,26 +98,23 @@ static bool km_ss_readable(uint64_t addr)
     return true;
 }
 
-/// Kernel virtual address domain. Spelled out rather than delegating to
-/// km_is_kernel_address: that function also gates reads, and "is this value in
-/// the KVA domain" and "may I read this address" are different questions.
+/// 内核虚拟地址域。单独写出来而不是委托给 km_is_kernel_address：那个函数同时是
+/// 读闸门，而「这个值在不在 KVA 域」与「我能不能读这个地址」是两个问题 ——
+/// 本文件用它只做分类打印。**判据一律作用在 km_unsign_ptr 还原之后的值上**：
+/// 原始读数可能整片落在域外（PAC 签名），拿它分类只会把所有内核指针标成 other。
 static bool km_ss_is_kva(uint64_t v)
 {
     return (v >> 48) == 0xFFFF;
 }
 
-/// Physical address domain: non-zero, < 2^48, 16K aligned. See KM_SS_PA_* above.
-static bool km_ss_is_pa(uint64_t v)
+/// 小整数分类。判据只有这一条，不带任何结构假设。
+static bool km_ss_is_small_int(uint64_t v)
 {
-    if (v == 0 || v >= KM_SS_PA_LIMIT) {
-        return false;
-    }
-    return (v & KM_SS_PA_ALIGN_MASK) == 0;
+    return v < KM_SS_SMALL_INT;
 }
 
-/// km_read64 wrapper that (a) enforces the shape gate, (b) counts the budget.
-/// Returns false once the budget is exhausted, so the caller stops cleanly
-/// instead of issuing reads whose results it cannot account for.
+/// km_read64 包装：(a) 强制过形态门，(b) 记预算。预算用尽后返回 false，
+/// 让调用方干净地停下，而不是发出结果无法记账的读。
 static uint64_t km_ss_read64(uint64_t addr, bool *ok)
 {
     if (ok != NULL) {
@@ -182,11 +130,10 @@ static uint64_t km_ss_read64(uint64_t addr, bool *ok)
     g_scanReads++;
 
     /*
-     * *ok from km_read64 means "address shape is legal AND two consecutive reads
-     * agreed" (KernelMemory.m:863-870) -- NOT "kread reported success", because
-     * kread returns void and cannot report anything. Two reads of a live kernel
-     * field agree with overwhelming probability, so !ok is a real signal: the
-     * value is untrustworthy and must never be used as a pointer.
+     * km_read64 的 *ok 含义是「地址形态合法 且 两次读到了同一个值」
+     * （KernelMemory.m:863-870），不是"kread 报告成功"—— kread 返回 void，
+     * 什么都报告不了。活着的内核字段两次读必然相同，所以 !ok 是真信号：
+     * 这个值不可信，既不能当指针，也不能算成一个正常的值参与分类。
      */
     bool inner = false;
     const uint64_t v = km_read64(addr, &inner);
@@ -197,18 +144,11 @@ static uint64_t km_ss_read64(uint64_t addr, bool *ok)
 }
 
 /*
- * Text builder. Accounting by ACTUAL bytes written (vsnprintf + strlen), never
- * by vsnprintf's return value.
- *
- * This project has a real crash from getting it wrong (KernelMemory.m's
- * km_self_test): on truncation vsnprintf returns "how much WOULD have been
- * written", i.e. more than the room left, so `size - used` wraps on size_t into
- * an astronomical number and the next append writes past the buffer. Here the
- * buffer is static, so an overrun smashes neighbouring static data.
- *
- * The printed text is Chinese on purpose: the panel renders it verbatim and the
- * operators on this project read Chinese. That CJK lives inside string literals
- * only, which is exactly what clex_check.py:52-64 permits.
+ * 文本构建器。按**实际写入的字节数**记账（vsnprintf + strlen），绝不按 vsnprintf
+ * 的返回值。本工程在这上面真崩过（KernelMemory.m 的 km_self_test）：截断时
+ * vsnprintf 返回的是"本该写多少"，大于剩余空间，于是 `size - used` 在 size_t 上
+ * 回绕成一个天文数字，下一次追加就写到缓冲外面。这里的缓冲是 static，越界会砸
+ * 掉相邻的静态数据。
  */
 typedef struct {
     char *buf;
@@ -237,566 +177,512 @@ static void km_ss_append(km_ss_text *t, const char *fmt, ...)
 }
 
 /*
- * Replace the first line in place with `summary`.
+ * 被记录下来的一个槽。两类槽共用它：落在内核地址域的（kvaSlots）、等于
+ * current_proc 的（procSlots）。
  *
- * The placeholder summary is written before any work so the panel always has a
- * first line, and this overwrites it once the verdict exists. memcpy, not a
- * second snprintf: the summary only owns line 1, so replacing it neither shifts
- * later lines nor changes t.used. Shorter summaries are space-padded to the
- * placeholder's width so no placeholder characters survive at the line end
- * ("...running == 1. preconditions ==" is the bug this prevents).
+ * rawValue 与 value 两个都要留：没有 raw 就无从判断还原有没有生效，没有还原后的
+ * value 就不知道该按什么分类 —— 真机上 task+0x28 的 raw 是 0x52bc7e10023e93c0
+ * （高 16 位 0x52bc），只拿它去看形态，看到的只是「它不在内核地址域」这一件事，
+ * 而它究竟是别的什么、还原之后落在哪一类，要靠两个值并排才读得出来。
+ *
+ * 这里刻意没有旧版的 hitOffset / firstHit 之类字段 —— 那些字段描述的是
+ * "读出来的值指向的对象里第几个字段像 pmap"，只有做二级读时才存在，
+ * 随二级读一起删除，不留占位。
  */
-static void km_ss_set_summary(char *buf, size_t bufSize, const char *summary)
-{
-    if (buf == NULL || bufSize == 0 || summary == NULL) {
-        return;
-    }
-    const size_t len = strlen(summary);
-    if (len + 1 > bufSize) {
-        return;
-    }
-    memcpy(buf, summary, len);
-    buf[len] = '\n';
-    for (size_t i = len + 1; i < 64 && i < bufSize - 1 && buf[i] != '\n'; i++) {
-        buf[i] = ' ';
-    }
-}
-
-#pragma mark - Candidate inspection
-
-/*
- * Does this value look like `struct pmap *`?
- *
- * The criterion is one pairing, stated once:
- *
- *     read64(p + 0x00) must be a KERNEL VIRTUAL address   (pmap->tte  == KVA)
- *     read64(p + 0x08) must be a PHYSICAL address         (pmap->ttep == PA)
- *
- * This is the whole hard judgement, and the reason it is hard is that the two
- * domains are mutually exclusive for every non-zero value: a physical address
- * has its top 16 bits clear (ARM_TTE_PA_MASK == 0x0000fffffffff000,
- * static_info.h:54-55), a kernel virtual address has them set. Two adjacent
- * 8-byte words with one shape each is therefore not "some field happens to sit
- * at this offset" -- it is a signature that survives field renames.
- *
- * What can fool it is written down in the header and repeated here: any object
- * whose first two words are one KVA and one page-aligned PA. The second gate --
- * uniqueness across the 32 slots of struct task -- is what actually settles
- * that; see km_scan_task_map_offset().
- *
- * `evidence` receives the branch that decided, so a failure path reads as "why
- * it did not look like a pmap" instead of just "no".
- */
-static bool km_ss_pmap_like(uint64_t cand, char *evidence, size_t evidenceSize)
-{
-    evidence[0] = '\0';
-
-    if (!km_ss_readable(cand)) {
-        /*
-         * Should be unreachable: the caller only passes values read out of a
-         * slot, already shaped. Kept because this address came FROM a read, and
-         * "a plausible-looking wrong value" is precisely how unmapped addresses
-         * get dereferenced in this project (KernelMemory.m:1580).
-         */
-        snprintf(evidence, evidenceSize, "candidate address fails the shape gate");
-        return false;
-    }
-
-    bool ok0 = false;
-    const uint64_t tte = km_ss_read64(cand + KM_SS_PMAP_TTE_OFF, &ok0);
-    if (!ok0) {
-        snprintf(evidence, evidenceSize, "pmap+0x00 read failed (two consecutive reads disagreed)");
-        return false;
-    }
-    if (!km_ss_is_kva(tte)) {
-        snprintf(evidence, evidenceSize, "pmap->tte=%#llx is not in the kernel domain",
-                 (unsigned long long)tte);
-        return false;
-    }
-
-    bool ok1 = false;
-    const uint64_t ttep = km_ss_read64(cand + KM_SS_PMAP_TTEP_OFF, &ok1);
-    if (!ok1) {
-        snprintf(evidence, evidenceSize, "pmap+0x08 read failed (two consecutive reads disagreed)");
-        return false;
-    }
-    if (!km_ss_is_pa(ttep)) {
-        snprintf(evidence, evidenceSize,
-                 "pmap->ttep=%#llx is not PA-shaped (need !=0, <2^48, 16K aligned)",
-                 (unsigned long long)ttep);
-        return false;
-    }
-
-    /*
-     * Accepted. The line carries both measured values plus one corroboration
-     * that is printed but NOT part of the criterion:
-     *
-     *   km_phystokv(ttep) vs tte -- two independent sources (the pmap field vs
-     *   the ptov_table / gPhysBase mapping) describing the same page table.
-     *   Informative when it agrees, silent when it does not:
-     *   KernelPhysWindow.m:678-691 already settled that reading, and using it as
-     *   a criterion would reject the correct answer whenever the conversion
-     *   table is not loaded, because km_phystokv returns 0 by contract then
-     *   (KernelSlide.h:150).
-     */
-    if (km_phystokv_ready()) {
-        const uint64_t kv = km_phystokv(ttep);
-        snprintf(evidence, evidenceSize,
-                 "tte=%#llx (KVA) ttep=%#llx (PA) | kv(ttep)=%#llx %s",
-                 (unsigned long long)tte, (unsigned long long)ttep, (unsigned long long)kv,
-                 (kv == tte) ? "(agrees with tte: same page table)"
-                             : "(differs from tte: sources differ, not a failure)");
-    } else {
-        snprintf(evidence, evidenceSize,
-                 "tte=%#llx (KVA) ttep=%#llx (PA) | conversion table not ready: no corroboration "
-                 "(not a failure)",
-                 (unsigned long long)tte, (unsigned long long)ttep);
-    }
-    return true;
-}
-
-/// One slot that passed every criterion. Kept so the ambiguity path can list
-/// them in full instead of reporting a bare count.
 typedef struct {
-    uint64_t offset;      // offset inside struct task
-    uint64_t value;       // the slot's value == the vm_map candidate
-    uint64_t hitOffset;   // offset inside the candidate where the pmap was found
-    uint64_t firstHit;    // that pmap candidate's value
-    char evidence[192];   // longest branch text is under 160 chars
-} km_ss_candidate;
-
-/*
- * Inspect one candidate vm_map: walk its slots, count kernel-shaped values, and
- * record the first pmap-like hit. Returns the number of hits found.
- *
- * The loop guard is cheap and specific: some kernels keep a self-referencing
- * pointer inside struct task, and proc sits at task - object_size, so a
- * candidate that equals task or proc would make us re-walk a structure we have
- * already walked or are about to. Skipping it is recorded, never hidden.
- */
-static uint64_t km_ss_inspect_candidate(const km_ss_candidate *slot, uint64_t task, uint64_t proc,
-                                        km_ss_text *t, uint64_t *shapedOut,
-                                        km_ss_candidate *firstHitOut)
-{
-    const uint64_t cand = slot->value;
-    uint64_t shaped = 0;
-    uint64_t hits = 0;
-
-    if (cand == task || cand == proc) {
-        km_ss_append(t, "  candidate %#llx equals task/proc -- not descended (loop guard)\n",
-                     (unsigned long long)cand);
-        *shapedOut = 0;
-        return 0;
-    }
-
-    for (uint64_t co = KM_SS_CAND_BEGIN; co < KM_SS_CAND_END; co += 8) {
-        if (UINT64_MAX - cand < co) {
-            break;
-        }
-        const uint64_t fieldAddr = cand + co;
-        if (!km_ss_readable(fieldAddr)) {
-            /*
-             * Defensive: cand passed the shape gate, so cand+offset can only
-             * fail it by overflowing into another domain -- in which case we
-             * read nothing and say so.
-             */
-            km_ss_append(t, "  candidate+%#llx fails the shape gate -- not read\n",
-                         (unsigned long long)co);
-            break;
-        }
-
-        bool ok = false;
-        const uint64_t v = km_ss_read64(fieldAddr, &ok);
-        if (!ok) {
-            if (g_scanBudgetHit) {
-                break;
-            }
-            continue;
-        }
-        if (!km_ss_is_kva(v)) {
-            continue;
-        }
-        shaped++;
-
-        char evidence[192];
-        if (km_ss_pmap_like(v, evidence, sizeof(evidence))) {
-            hits++;
-            km_ss_append(t, "  HIT task+%#llx -> candidate+%#llx = %#llx : pmap-like {%s}\n",
-                         (unsigned long long)slot->offset, (unsigned long long)co,
-                         (unsigned long long)v, evidence);
-            if (hits == 1) {
-                firstHitOut->offset = slot->offset;
-                firstHitOut->value = cand;
-                firstHitOut->hitOffset = co;
-                firstHitOut->firstHit = v;
-                snprintf(firstHitOut->evidence, sizeof(firstHitOut->evidence), "%s", evidence);
-            }
-        }
-        /*
-         * Candidates that fail are counted, not printed one by one: with 32
-         * slots x 32 candidates a full listing would bury the lines that matter.
-         * The shaped count keeps "there were pointers inside it, none of them a
-         * pmap" visible, which is the difference between "not a vm_map" and
-         * "a vm_map I could not confirm".
-         */
-    }
-
-    *shapedOut = shaped;
-    return hits;
-}
+    uint64_t offset;      // 相对 task 的偏移
+    uint64_t rawValue;    // 该槽读出来的原始值（含 PAC 签名）
+    uint64_t value;       // km_unsign_ptr 还原之后的值
+} km_ss_slot;
 
 #pragma mark - Probe
 
 uint64_t km_scan_task_map_offset(void)
 {
-    static char buffer[KM_SS_TEXT_SIZE];
-    memset(buffer, 0, sizeof(buffer));
+    /*
+     * 正文与最终文本都是 static：诊断文本要活到 km_scan_diagnostic() 被调用
+     * 之后才被读，栈上的缓冲做不到。
+     */
+    static char body[KM_SS_TEXT_SIZE];
+    static char finalText[KM_SS_TEXT_SIZE + KM_SS_SUMMARY_MAX];
+    memset(body, 0, sizeof(body));
+    memset(finalText, 0, sizeof(finalText));
 
-    km_ss_text t = { buffer, sizeof(buffer), 0, false };
+    km_ss_text t = { body, sizeof(body), 0, false };
     g_scanReads = 0;
     g_scanBudgetHit = false;
 
-    // Placeholder first line; replaced in place at the end (km_ss_set_summary).
-    km_ss_append(&t, "[structscan] STATE=running\n");
-
     /*
-     * `summary` is the single source for line 1 on every exit path, including
-     * the two that would otherwise compute it separately (truncation and read
-     * budget). One buffer, one writer.
-     *
-     * It is declared and initialised HERE, before the first `goto done`, and not
-     * further down next to the other locals: every early exit jumps to the
-     * `done:` label past this point, and jumping over an array declaration's
-     * scope is at best a diagnostic and at worst an error. Everything else in
-     * this function that a `goto` can skip is a plain scalar, which is harmless.
+     * 摘要与全部状态都在第一个 `goto done` 之前声明并初始化。`done:` 之后的代码
+     * 要读它们，而 goto 跳过带初始化器的声明只会留下不确定值 —— 旧实现里那段
+     * 「为什么 summary 声明在这里」的注释说的就是同一件事，这里把它扩到全部变量。
      */
-    char summary[160];
+    char summary[192];
     snprintf(summary, sizeof(summary), "[structscan] STATE=not_ready");
 
-    const uint64_t knownMapOff = km_task_map_offset();
-    const uint64_t pmapOff = km_vm_map_pmap_offset();
-
-    uint64_t hitSlot = 0;
-    bool haveHit = false;
-    bool ambiguous = false;
-    const char *state = "not_ready";
-
+    uint64_t proc = 0;
+    uint64_t objectSize = 0;
+    uint64_t task = 0;
+    uint64_t hitOffset = 0;      // 等于 current_proc 的槽（不止一个时取最低的那个）
+    uint64_t procCount = 0;      // 有多少个槽（还原后）等于 current_proc
+    uint64_t kvaCount = 0;       // 有多少个槽（还原后）落在内核地址域（**一个都不解引用**）
     uint64_t scannedSlots = 0;
-    uint64_t slotReadFail = 0;
-    uint64_t slotNonKva = 0;
-    uint64_t slotKvaNoHit = 0;
-    uint64_t totalHits = 0;
+    uint64_t readFail = 0;
+    uint64_t smallInts = 0;
+    uint64_t otherValues = 0;
+    uint64_t unsignChanged = 0;  // 还原改动了值的槽位数
+    uint64_t unsignLive = 0;     // 还原改动后落进内核地址域的槽位数（还原是否真的在工作的证据）
+    bool scanAborted = false;    // 窗口没走完（地址溢出守卫），与预算耗尽同一种结果
 
-    km_ss_candidate candidates[KM_SS_MAX_CANDIDATES];
-    uint64_t candidateCount = 0;
-    memset(candidates, 0, sizeof(candidates));
+    km_ss_slot kvaSlots[KM_SS_MAX_SLOTS];
+    km_ss_slot procSlots[KM_SS_MAX_SLOTS];
+    memset(kvaSlots, 0, sizeof(kvaSlots));
+    memset(procSlots, 0, sizeof(procSlots));
 
-    /* ---- 1. Preconditions. Nothing below this block runs unless it holds. ---- */
+    const uint64_t knownMapOff = km_task_map_offset();
+
+    /* ---- 1. 前置。这一段不成立时，下面一行代码都不执行。 ---- */
     km_ss_append(&t, "== 1. preconditions ==\n");
     if (!km_ready()) {
         km_ss_append(&t, "km_ready()=false: the kernel read/write layer is not up. "
                          "Zero kreads issued.\n");
+        snprintf(summary, sizeof(summary), "[structscan] STATE=not_ready (km_ready()=false)");
         goto done;
     }
     km_ss_append(&t, "km_ready()=true\n");
 
-    {
-        const uint64_t pageSize = km_kernel_page_size();
-        const uint64_t proc = km_current_proc();
-        const uint64_t objectSize = km_proc_object_size();
+    proc = km_current_proc();
+    objectSize = km_proc_object_size();
 
-        km_ss_append(&t, "km_kernel_page_size()=%#llx%s\n", (unsigned long long)pageSize,
-                     (pageSize == 0x4000)
-                         ? " (16K: the PA alignment criterion applies as written)"
-                         : " (NOT 16K: the 16K alignment criterion is a known limitation here)");
-        km_ss_append(&t, "km_current_proc()=%#llx  km_proc_object_size()=%#llx  "
-                         "km_task_map_offset()=%#llx [version table]  "
-                         "km_vm_map_pmap_offset()=%#llx [offsetof]\n",
-                     (unsigned long long)proc, (unsigned long long)objectSize,
-                     (unsigned long long)knownMapOff, (unsigned long long)pmapOff);
+    km_ss_append(&t, "km_current_proc()=%#llx  km_proc_object_size()=%#llx  "
+                     "km_task_map_offset()=%#llx [version table, printed for reference only: "
+                     "never used as a criterion]\n",
+                 (unsigned long long)proc, (unsigned long long)objectSize,
+                 (unsigned long long)knownMapOff);
 
-        if (proc == 0 || objectSize == 0) {
-            km_ss_append(&t, "current_proc or proc__object_size is 0: the version table did not "
-                             "match, or the kernel layer is half up. Without task there is "
-                             "nothing to scan.\n");
-            goto done;
-        }
-        if (UINT64_MAX - proc < objectSize) {
-            km_ss_append(&t, "proc + proc__object_size overflows\n");
-            goto done;
-        }
-
-        const uint64_t task = proc + objectSize;
-        if (!km_ss_readable(task)) {
-            km_ss_append(&t, "task=%#llx fails the shape gate (kernel domain + 8-byte aligned + "
-                             "non-zero)\n",
-                         (unsigned long long)task);
-            goto done;
-        }
-
-        /*
-         * proc -> task is NOT what this probe questions: task = proc +
-         * object_size was confirmed on device by two independent checks (a
-         * public chain derives proc as task - object_size and validates it
-         * against p_pid; and on the target device task - proc equals the version
-         * table constant 0x730). It is printed as the fixed premise, and nothing
-         * below touches it.
-         */
-        km_ss_append(&t, "== 2. task (fixed premise, not under test) ==\n");
-        km_ss_append(&t, "proc=%#llx + object_size=%#llx = task=%#llx (shape gate OK)\n",
-                     (unsigned long long)proc, (unsigned long long)objectSize,
-                     (unsigned long long)task);
-
-        /* ---- 2. Every 8-byte slot of the task prefix. ---- */
-        km_ss_append(&t, "== 3. slot scan: task+%#llx .. task+%#llx, step 8 ==\n",
-                     (unsigned long long)KM_SS_SCAN_BEGIN,
-                     (unsigned long long)KM_SS_SCAN_END);
-
-        for (uint64_t off = KM_SS_SCAN_BEGIN; off < KM_SS_SCAN_END; off += 8) {
-            if (UINT64_MAX - task < off) {
-                break;
-            }
-            const uint64_t addr = task + off;
-            if (!km_ss_readable(addr)) {
-                km_ss_append(&t, "  task+%#llx fails the shape gate -- not read\n",
-                             (unsigned long long)off);
-                continue;
-            }
-
-            bool ok = false;
-            const uint64_t value = km_ss_read64(addr, &ok);
-
-            if (g_scanBudgetHit) {
-                /*
-                 * The budget cut this read off, so the slot was NOT read: it must
-                 * not be counted as scanned. A partial scan that reports full
-                 * coverage is the one accounting error that would make the
-                 * verdict below look trustworthy.
-                 */
-                km_ss_append(&t, "  read budget %llu exhausted at task+%#llx -- scan stops here\n",
-                             (unsigned long long)KM_SS_READ_BUDGET, (unsigned long long)off);
-                break;
-            }
-            scannedSlots++;
-            if (!ok) {
-                slotReadFail++;
-                km_ss_append(&t, "  task+%#llx read failed (two consecutive reads disagreed) -- "
-                                 "not treated as zero, not scanned\n",
-                             (unsigned long long)off);
-                continue;
-            }
-            if (!km_ss_is_kva(value)) {
-                slotNonKva++;
-                /*
-                 * Non-kernel values are counted, not listed: printing 32 of them
-                 * would bury the slots that matter, and the summary count keeps
-                 * "nothing here looked like a kernel pointer" visible.
-                 */
-                continue;
-            }
-
-            km_ss_candidate slot;
-            memset(&slot, 0, sizeof(slot));
-            slot.offset = off;
-            slot.value = value;
-
-            uint64_t shaped = 0;
-            km_ss_candidate hit;
-            memset(&hit, 0, sizeof(hit));
-            const uint64_t hits = km_ss_inspect_candidate(&slot, task, proc, &t, &shaped, &hit);
-            totalHits += hits;
-
-            if (hits == 0) {
-                slotKvaNoHit++;
-                km_ss_append(&t, "  task+%#llx = %#llx [KVA]  kernel-shaped slots inside=%llu  "
-                                 "pmap-like=0\n",
-                             (unsigned long long)off, (unsigned long long)value,
-                             (unsigned long long)shaped);
-                continue;
-            }
-
-            km_ss_append(&t, "  task+%#llx = %#llx [KVA]  kernel-shaped slots inside=%llu  "
-                             "pmap-like=%llu  first at candidate+%#llx\n",
-                         (unsigned long long)off, (unsigned long long)value,
-                         (unsigned long long)shaped, (unsigned long long)hits,
-                         (unsigned long long)hit.hitOffset);
-
-            if (candidateCount < KM_SS_MAX_CANDIDATES) {
-                candidates[candidateCount++] = hit;
-            }
-            if (!haveHit) {
-                haveHit = true;
-                hitSlot = off;
-            } else {
-                /*
-                 * Second qualifying slot: remember it for the listing and let
-                 * the verdict below refuse to choose. A tie means the
-                 * discriminator is the problem, not the data.
-                 */
-                ambiguous = true;
-            }
-        }
+    if (proc == 0 || objectSize == 0) {
+        km_ss_append(&t, "current_proc or proc__object_size is 0: the version table did not match, "
+                         "or the kernel layer is half up. Without both there is no task address to "
+                         "scan, so nothing is read.\n");
+        snprintf(summary, sizeof(summary),
+                 "[structscan] STATE=not_ready (current_proc or proc__object_size is 0)");
+        goto done;
+    }
+    if (UINT64_MAX - proc < objectSize) {
+        km_ss_append(&t, "proc + proc__object_size overflows\n");
+        snprintf(summary, sizeof(summary),
+                 "[structscan] STATE=not_ready (proc + proc__object_size overflows)");
+        goto done;
     }
 
-    /* ---- 3. Verdict. ---- */
-    km_ss_append(&t, "== 4. verdict ==\n");
-    km_ss_append(&t, "slots scanned=%llu  read failures=%llu  non-kernel values=%llu  "
-                     "kernel-shaped without pmap=%llu  pmap-like hits=%llu%s\n",
-                 (unsigned long long)scannedSlots, (unsigned long long)slotReadFail,
-                 (unsigned long long)slotNonKva, (unsigned long long)slotKvaNoHit,
-                 (unsigned long long)totalHits,
-                 g_scanBudgetHit ? "  [read budget hit: results are PARTIAL]" : "");
+    task = proc + objectSize;
+    if (!km_ss_readable(task)) {
+        km_ss_append(&t, "task=%#llx fails the shape gate (kernel domain + 8-byte aligned + "
+                         "non-zero)\n",
+                     (unsigned long long)task);
+        snprintf(summary, sizeof(summary),
+                 "[structscan] STATE=not_ready (task fails the shape gate)");
+        goto done;
+    }
 
-    if (candidateCount == 0) {
-        state = "miss";
-        km_ss_append(&t, "No slot of struct task holds a value that looks like vm_map. Reported as a "
-                         "MISS on purpose: no fallback offset is substituted, because a guessed "
-                         "offset is exactly what made task+0x28 return 0x52bc7e10023e93c0 on the "
-                         "target device.\n");
-        km_ss_append(&t, "How to read the lines above: if every kernel-shaped value shows "
-                         "inside=0, the candidate was not a vm_map at all; if inside>0 but "
-                         "pmap-like=0, the candidate had pointer fields but its head was not a "
-                         "tte/ttep pair; if non-kernel values dominate, no slot in the window "
-                         "held a pointer in the first place.\n");
-        snprintf(summary, sizeof(summary), "[structscan] STATE=miss (no vm_map candidate)");
-    } else if (g_scanBudgetHit) {
+    /*
+     * ---- 2. 被测对象：task 地址的算术，以及它「是不是真 object」这件事 ----
+     *
+     * 本节只交代地址怎么来的与可读性；「这个对象是不是真 task」由第 5 节判。
+     * 旧版在这里写「proc -> task 是前提」；本版不把任何一边的结论写进标题，
+     * 因为本探针不对 proc -> task 这个推导表态（见 KernelStructScan.h）。
+     */
+    km_ss_append(&t, "== 2. task address under test ==\n");
+    km_ss_append(&t, "proc=%#llx + object_size=%#llx = task=%#llx (shape gate OK) -- whether this "
+                     "object really is a struct task is what section 5 decides\n",
+                 (unsigned long long)proc, (unsigned long long)objectSize,
+                 (unsigned long long)task);
+
+    /* ---- 3. task 自身可读性：一次读，一个地址（task+0x00）。 ---- */
+    km_ss_append(&t, "== 3. task readability (single read at task+%#llx) ==\n",
+                 (unsigned long long)KM_SS_SCAN_BEGIN);
+
+    bool okHead = false;
+    const uint64_t head = km_ss_read64(task + KM_SS_SCAN_BEGIN, &okHead);
+
+    if (g_scanBudgetHit) {
+        km_ss_append(&t, "read budget %llu exhausted before the readability read at task+%#llx\n",
+                     (unsigned long long)KM_SS_READ_BUDGET,
+                     (unsigned long long)KM_SS_SCAN_BEGIN);
+        snprintf(summary, sizeof(summary),
+                 "[structscan] STATE=partial (read budget exhausted before the first slot)");
+        goto done;
+    }
+    if (!okHead) {
+        km_ss_append(&t, "task+%#llx read failed: two consecutive reads disagreed. This is a "
+                         "PRECONDITION failure, not a result -- no slot is scanned and nothing is "
+                         "concluded about bsd_info. Candidate causes, in the order worth checking: "
+                         "the object_size used to compute task does not land on a live object, "
+                         "current_proc is stale, or the read path itself is broken.\n",
+                     (unsigned long long)KM_SS_SCAN_BEGIN);
+        snprintf(summary, sizeof(summary),
+                 "[structscan] STATE=task_unreadable (task+0x00: two reads disagreed)");
+        goto done;
+    }
+    km_ss_append(&t, "task+%#llx = %#llx (read twice, agreed): the task object is readable, so "
+                     "walking its own slots is safe\n",
+                 (unsigned long long)KM_SS_SCAN_BEGIN, (unsigned long long)head);
+
+    /* ---- 4. 槽扫描：本模块唯一的一级读循环。 ---- */
+    /*
+     * task+0x00 会在下面被再读一次（第 3 节已经读过它）。这是刻意的：「前置可读性」
+     * 与「这个槽里是什么」是两个问题，复用同一个变量会让两处逻辑耦合，而代价只是
+     * 每槽一次的复读开销 —— 窗口一共 32 个槽。
+     */
+    km_ss_append(&t, "== 4. slot scan: task+%#llx .. task+%#llx, step 8 (single-level reads only) "
+                     "==\n",
+                 (unsigned long long)KM_SS_SCAN_BEGIN,
+                 (unsigned long long)(KM_SS_SCAN_END - 8));
+    km_ss_append(&t, "each slot is printed as `raw <value> -> <value>`: the second value is the raw "
+                     "read after km_unsign_ptr (PAC restore), and classification uses THAT value. The "
+                     "restore only rewrites bits; it issues no read and dereferences nothing.\n");
+    km_ss_append(&t, "read addresses in this section are `task + <compile-time constant>` only. No "
+                     "value read here is ever used as an address, before or after the restore.\n");
+
+    for (uint64_t off = KM_SS_SCAN_BEGIN; off < KM_SS_SCAN_END; off += 8) {
+        if (UINT64_MAX - task < off) {
+            /*
+             * 守卫，正常内核对象地址到不了这里（task 高 16 位是 0xffff，加 0xf8 不会
+             * 回绕）。真触发时窗口就是没走完，所以按 partial 报，不按 no_bsd_info 报。
+             */
+            scanAborted = true;
+            km_ss_append(&t, "  task+%#llx would overflow the address -- scan stops here\n",
+                         (unsigned long long)off);
+            break;
+        }
+        const uint64_t addr = task + off;
+        if (!km_ss_readable(addr)) {
+            km_ss_append(&t, "  task+%#llx fails the shape gate -- not read\n",
+                         (unsigned long long)off);
+            continue;
+        }
+
+        bool ok = false;
+        const uint64_t value = km_ss_read64(addr, &ok);
+
+        if (g_scanBudgetHit) {
+            /*
+             * 预算把这个读切断了，所以这一槽**没有**被读到，不能算进 scannedSlots。
+             * 半程扫描报成完整覆盖，是这份诊断里唯一能让结论看起来可信的记账错误。
+             */
+            km_ss_append(&t, "  read budget %llu exhausted at task+%#llx -- scan stops here\n",
+                         (unsigned long long)KM_SS_READ_BUDGET, (unsigned long long)off);
+            break;
+        }
+        scannedSlots++;
+        if (!ok) {
+            readFail++;
+            km_ss_append(&t, "  task+%#llx read failed (two consecutive reads disagreed) -- not "
+                             "treated as zero, not classified\n",
+                         (unsigned long long)off);
+            continue;
+        }
+
         /*
-         * The read budget stopped the scan short. Whatever qualified so far is
-         * NOT a unique answer -- uniqueness is a property of the WHOLE window,
-         * and the window was not fully walked. Returning the one early hit here
-         * would be a guess dressed as a measurement, which is the failure this
-         * file exists to avoid. The count and the STATE make it recoverable.
+         * PAC 还原 —— 必须在分类**之前**做，这是本次改动的第一件事。
+         *
+         * 内核结构里的指针字段带 PAC 签名，高 17 位是签名而不是地址，所以原始读数
+         * 常常整片落在内核地址域之外。真机样本：task+0x28 的 raw 是 0x52bc7e10023e93c0
+         * （高 16 位 0x52bc）。拿 raw 去跟 0xffff 比，只能得出「不在内核域」这一个
+         * 结果；先还原再分类，才有资格说这个槽到底是什么。
+         *
+         * km_unsign_ptr 对内核地址幂等、对用户态地址会清高位，而这里处理的全是
+         * 「刚从内核读出来的槽值」，正落在允许的那一侧（KernelSlide.h:162-177）。
+         * 它**纯还原**：不读取、不解引用、不发 kread，所以零二级读那条铁律不受影响。
+         *
+         * raw 与 unsign 都留着：raw 进诊断（还原有没有生效要看得出来），unsign 进
+         * 分类（这个槽到底是什么要判得准）。**两者都不参与任何地址运算** —— 本文件
+         * 里没有任何一处把 value 或 unsign 当读目标，除了下面这个函数的入参地址
+         * （它是 `task + <编译期常量>`，与任何读到的值无关）。
          */
-        state = "partial";
-        km_ss_append(&t, "Read budget exhausted before the window was fully walked, so the scan is "
-                         "PARTIAL and no offset is returned. This is not a miss: %llu slot(s) "
-                         "qualified so far, and unnamed slots remain unexamined.\n",
-                     (unsigned long long)candidateCount);
-        for (uint64_t i = 0; i < candidateCount; i++) {
-            km_ss_append(&t, "  #%llu task+%#llx = %#llx  pmap at candidate+%#llx (pmap=%#llx)\n",
-                         (unsigned long long)(i + 1), (unsigned long long)candidates[i].offset,
-                         (unsigned long long)candidates[i].value,
-                         (unsigned long long)candidates[i].hitOffset,
-                         (unsigned long long)candidates[i].firstHit);
-            km_ss_append(&t, "      %s\n", candidates[i].evidence);
+        const uint64_t raw = value;
+        const uint64_t unsign = km_unsign_ptr(raw);
+        if (unsign != raw) {
+            unsignChanged++;
+            if (km_ss_is_kva(unsign)) {
+                unsignLive++;
+            }
+        }
+
+        /*
+         * 分类，仅此而已。下面四个分支没有一个把还原后的值当地址再读一次 ——
+         * 任何一级读之外的读都会把「未确认的地址」交给内核去解引用，那正是上一版
+         * 真机 panic 的成因（证据见 KernelStructScan.h 与第 6 节）。
+         */
+        if (unsign == proc) {
+            km_ss_append(&t, "  task+%#llx = raw %#llx -> %#llx  [== current_proc -> bsd_info]\n",
+                         (unsigned long long)off, (unsigned long long)raw,
+                         (unsigned long long)unsign);
+            if (procCount < KM_SS_MAX_SLOTS) {
+                procSlots[procCount].offset = off;
+                procSlots[procCount].rawValue = raw;
+                procSlots[procCount].value = unsign;
+            }
+            if (procCount == 0) {
+                hitOffset = off;
+            }
+            procCount++;
+            continue;
+        }
+        if (km_ss_is_kva(unsign)) {
+            km_ss_append(&t, "  task+%#llx = raw %#llx -> %#llx  [kernel-domain value -- NOT "
+                             "dereferenced]\n",
+                         (unsigned long long)off, (unsigned long long)raw,
+                         (unsigned long long)unsign);
+            if (kvaCount < KM_SS_MAX_SLOTS) {
+                kvaSlots[kvaCount].offset = off;
+                kvaSlots[kvaCount].rawValue = raw;
+                kvaSlots[kvaCount].value = unsign;
+            }
+            kvaCount++;
+            continue;
+        }
+        if (km_ss_is_small_int(unsign)) {
+            smallInts++;
+            km_ss_append(&t, "  task+%#llx = raw %#llx -> %#llx  [small int]\n",
+                         (unsigned long long)off, (unsigned long long)raw,
+                         (unsigned long long)unsign);
+            continue;
+        }
+        otherValues++;
+        km_ss_append(&t, "  task+%#llx = raw %#llx -> %#llx  [other]\n",
+                     (unsigned long long)off, (unsigned long long)raw,
+                     (unsigned long long)unsign);
+    }
+
+    /* ---- 5. 结论。 ---- */
+    km_ss_append(&t, "== 5. verdict ==\n");
+    km_ss_append(&t, "slots scanned=%llu  read failures=%llu  kernel-domain values=%llu  "
+                     "small ints=%llu  other=%llu%s\n",
+                 (unsigned long long)scannedSlots, (unsigned long long)readFail,
+                 (unsigned long long)kvaCount, (unsigned long long)smallInts,
+                 (unsigned long long)otherValues,
+                 (g_scanBudgetHit || scanAborted) ? "  [scan incomplete: results are PARTIAL]" : "");
+    km_ss_append(&t, "slots == current_proc=%llu  values changed by km_unsign_ptr=%llu  of those, "
+                     "landing in the kernel address domain=%llu\n",
+                 (unsigned long long)procCount, (unsigned long long)unsignChanged,
+                 (unsigned long long)unsignLive);
+
+    if (g_scanBudgetHit || scanAborted) {
+        /*
+         * 窗口没走完。已经有槽命中也不能返回：命中数是窗口全体的性质，而窗口没走完。
+         * 返回那个早就命中的偏移，等于把猜测包装成测量。
+         */
+        if (scanAborted) {
+            km_ss_append(&t, "The scan stopped early on the address-overflow guard, so the window "
+                             "was not fully walked and no offset is returned. This is NOT the same "
+                             "as no_bsd_info: %llu slot(s) equalling current_proc were seen so far, "
+                             "and the slots after the stop point were never read.\n",
+                         (unsigned long long)procCount);
+        } else {
+            km_ss_append(&t, "Read budget exhausted before the window was fully walked, so this run "
+                             "is PARTIAL and no offset is returned. This is NOT the same as "
+                             "no_bsd_info: %llu slot(s) equalling current_proc were seen so far, and "
+                             "the slots after the stop point were never read.\n",
+                         (unsigned long long)procCount);
+        }
+        for (uint64_t i = 0; i < procCount && i < KM_SS_MAX_SLOTS; i++) {
+            km_ss_append(&t, "  #%llu task+%#llx = %#llx\n", (unsigned long long)(i + 1),
+                         (unsigned long long)procSlots[i].offset,
+                         (unsigned long long)procSlots[i].value);
         }
         snprintf(summary, sizeof(summary),
-                 "[structscan] STATE=partial (%llu qualified, scan incomplete, reads budget-limited)",
-                 (unsigned long long)candidateCount);
-    } else if (ambiguous || candidateCount > 1) {
-        state = "ambiguous";
-        km_ss_append(&t, "MORE THAN ONE slot qualifies, so no offset is returned: the criterion "
-                         "set is not selective enough on this kernel. Listed in full:\n");
-        for (uint64_t i = 0; i < candidateCount; i++) {
-            km_ss_append(&t, "  #%llu task+%#llx = %#llx  pmap at candidate+%#llx (pmap=%#llx)\n",
-                         (unsigned long long)(i + 1), (unsigned long long)candidates[i].offset,
-                         (unsigned long long)candidates[i].value,
-                         (unsigned long long)candidates[i].hitOffset,
-                         (unsigned long long)candidates[i].firstHit);
-            km_ss_append(&t, "      %s\n", candidates[i].evidence);
-        }
-        km_ss_append(&t, "Refusing to pick one of %llu.\n", (unsigned long long)candidateCount);
-        snprintf(summary, sizeof(summary), "[structscan] STATE=ambiguous (%llu candidates)",
-                 (unsigned long long)candidateCount);
+                 "[structscan] STATE=partial (%llu slot(s) == current_proc so far, window not fully "
+                 "walked)",
+                 (unsigned long long)procCount);
+    } else if (procCount == 0) {
+        /*
+         * 这一段只报一件事：这个窗口里没有槽等于 current_proc。**不**给上游的
+         * proc -> task 推导下结论 —— 那条等式在上游成立（libkfd 两个方向都在用：
+         * info.h:137 正方向，kread_sem_open.h:100-101 反方向），所以"没命中"只能
+         * 是关于这个窗口的观测。第一行摘要里也必须写出来（面板只读第一行的人很多）。
+         */
+        km_ss_append(&t, "NO slot of struct task equals current_proc (%#llx) after km_unsign_ptr, "
+                         "and %llu of the window's slots were read successfully.\n",
+                     (unsigned long long)proc, (unsigned long long)scannedSlots);
+        km_ss_append(&t, "  What that observation covers, exactly: struct task carries a reverse "
+                         "pointer to its own struct proc (bsd_info), and within "
+                         "task+0x00 .. task+0xF8 no slot holds current_proc. That is a statement "
+                         "about THIS window on THIS run -- it is not a verdict on the derivation "
+                         "task = proc + km_proc_object_size(), and this probe draws no such verdict.\n");
+        km_ss_append(&t, "  Why the derivation is not the suspect: the upstream library uses that "
+                         "same identity in BOTH directions and does not contradict itself -- "
+                         "forward at libkfd/info.h:137 (current_task = current_proc + "
+                         "dynamic_info(proc__object_size)) and backward at "
+                         "libkfd/krkw/kread/kread_sem_open.h:100-101 (task_kaddr = static_kget("
+                         "struct semaphore, owner, ...), then proc_kaddr = task_kaddr - "
+                         "dynamic_info(proc__object_size)). Both directions in one library means the "
+                         "identity is load-bearing upstream; nothing here says otherwise.\n");
+        km_ss_append(&t, "  Candidates that would explain a miss, listed as candidates and not as "
+                         "conclusions: the object_size taken from the version table does not match "
+                         "this kernel; current_proc is stale by the time the window is walked; or "
+                         "what sits at task+<bsd_info offset> is not a plain proc pointer on this "
+                         "version. This probe reports the window; ranking those candidates is not "
+                         "its job.\n");
+        km_ss_append(&t, "  The restore ran: %llu of %llu slots changed value under km_unsign_ptr and "
+                         "%llu of those landed in the kernel address domain. So no kernel-domain "
+                         "reading was hidden by a missing PAC restore -- the values that were signed "
+                         "were classified by their restored form.\n",
+                     (unsigned long long)unsignChanged, (unsigned long long)scannedSlots,
+                     (unsigned long long)unsignLive);
+        km_ss_append(&t, "  Note what was NOT read: the vm_map pointer at the version table's "
+                         "task__map offset (%#llx) points outside this window, so the probe never "
+                         "followed it -- that is a second-level read and it stays deleted. The "
+                         "offsets themselves are not the suspect either: task__map = %#llx is "
+                         "confirmed by three independent sources -- Dopamine "
+                         "BaseBin/libjailbreak/src/info.c:67 (`kernelStruct.task.map = 0x28`), "
+                         "Dopamine Application/Exploits/kfd/kfd.m:175 (fed into the kfd table), and "
+                         "this project's kfd/libkfd/info/dynamic_info.h (every entry says "
+                         ".task__map = 0x0028).\n",
+                     (unsigned long long)knownMapOff, (unsigned long long)knownMapOff);
+        snprintf(summary, sizeof(summary),
+                 "[structscan] STATE=no_bsd_info (no slot == current_proc in this window)");
     } else {
-        state = "hit_unique";
-        km_ss_append(&t, "== 5. version table comparison ==\n");
-        km_ss_append(&t, "measured task->map = %#llx   version table task__map = %#llx\n",
-                     (unsigned long long)hitSlot, (unsigned long long)knownMapOff);
-        if (knownMapOff == 0) {
-            km_ss_append(&t, "the version table has no task__map for this kernel (dynamic_info did "
-                             "not match), so there is nothing to compare against\n");
-        } else if (hitSlot == knownMapOff) {
-            km_ss_append(&t, "SAME: the hardcoded value is correct on this build. If the pmap "
-                             "chain still fails downstream, the cause is elsewhere -- do not "
-                             "start editing offsets.\n");
-        } else {
-            const uint64_t delta = (hitSlot > knownMapOff) ? (hitSlot - knownMapOff)
-                                                           : (knownMapOff - hitSlot);
-            km_ss_append(&t, "DIFFERENT: measured %#llx vs hardcoded %#llx, difference %#llu bytes "
-                             "(%s). The hardcoded value is wrong on this build, which is why "
-                             "task+%#llx returned a non-kernel value on device.\n",
-                         (unsigned long long)hitSlot, (unsigned long long)knownMapOff,
-                         (unsigned long long)delta,
-                         (hitSlot > knownMapOff) ? "measured is larger" : "measured is smaller",
-                         (unsigned long long)knownMapOff);
+        km_ss_append(&t, "A slot of struct task equals current_proc: task+%#llx = %#llx (raw "
+                         "%#llx -> %#llx under km_unsign_ptr).\n",
+                     (unsigned long long)hitOffset, (unsigned long long)proc,
+                     (unsigned long long)procSlots[0].rawValue, (unsigned long long)proc);
+        km_ss_append(&t, "  That slot is struct task's bsd_info -- the reverse pointer to the "
+                         "struct proc this task belongs to -- so the object at "
+                         "proc + proc__object_size = %#llx carries a back-reference to this process, "
+                         "which is the same direction libkfd/info.h:137 uses.\n",
+                     (unsigned long long)task);
+        km_ss_append(&t, "  Measured bsd_info offset = %#llx. Use it as bsd_info, nothing else.\n",
+                     (unsigned long long)hitOffset);
+        if (procCount > 1) {
+            km_ss_append(&t, "%llu slots equal current_proc (all of them are listed in section 4; "
+                             "the value returned is the LOWEST offset, %#llx). Nothing is hidden by "
+                             "picking that one, but the \"exactly one bsd_info\" reading is not "
+                             "confirmed by this run: a second slot holding the same proc would mean "
+                             "this object carries two back-references.\n",
+                         (unsigned long long)procCount, (unsigned long long)hitOffset);
         }
+        km_ss_append(&t, "What this does NOT answer: the task->map offset. Measuring it requires "
+                         "reading inside the candidate vm_map, which is the dereference class this "
+                         "version no longer performs (see section 6).\n");
+        km_ss_append(&t, "version table task__map = %#llx [reference only]: comparing it with the "
+                         "measured bsd_info offset proves nothing -- bsd_info and map are different "
+                         "fields, and an equality here would be a coincidence.\n",
+                     (unsigned long long)knownMapOff);
+        snprintf(summary, sizeof(summary),
+                 "[structscan] STATE=hit_bsd_info offset=%#llx (bsd_info == current_proc)",
+                 (unsigned long long)hitOffset);
+    }
 
-        km_ss_append(&t, "== 6. corroboration (NOT used to decide) ==\n");
-        km_ss_append(&t, "pmap found at candidate+%#llx; offsetof(struct _vm_map, pmap)=%#llx "
-                         "[static_info.h:198-206]\n",
-                     (unsigned long long)candidates[0].hitOffset, (unsigned long long)pmapOff);
-        if (candidates[0].hitOffset == pmapOff) {
-            km_ss_append(&t, "  agree: the pmap field sits exactly where the struct layout says, "
-                             "so the layout is unchanged and only task->map moved.\n");
-        } else {
-            km_ss_append(&t, "  differ: the pmap field is NOT at the layout offset. Either the "
-                             "layout differs on this build, or the accepted candidate is not a "
-                             "vm_map. Treat the offset as measured but unconfirmed.\n");
+    /*
+     * ---- 6. 落在内核地址域（还原之后）的槽：只列出，永不读取。 ----
+     *
+     * 这一节是写给下一个读这段代码的人看的：他会想知道"这些指针为什么不跟下去"。
+     * 所以理由连着真机证据一起摆在这里，而不是只留一句"不安全"。
+     */
+    km_ss_append(&t, "== 6. kernel-domain slots: listed, never dereferenced ==\n");
+    km_ss_append(&t, "a slot belongs here when its PAC-restored value falls in the kernel address "
+                     "domain (top 16 bits 0xffff). The raw read is printed next to the restored value "
+                     "so a signed read is never mistaken for a garbage one -- and neither form is ever "
+                     "used as an address.\n");
+    if (kvaCount == 0) {
+        km_ss_append(&t, "none of the %llu scanned slots holds a kernel-domain value after "
+                         "km_unsign_ptr\n",
+                     (unsigned long long)scannedSlots);
+    } else {
+        km_ss_append(&t, "%llu slot(s) hold a kernel-domain value (top 16 bits 0xffff). They are "
+                         "listed so the next reader sees exactly what was NOT followed:\n",
+                     (unsigned long long)kvaCount);
+        for (uint64_t i = 0; i < kvaCount && i < KM_SS_MAX_SLOTS; i++) {
+            km_ss_append(&t, "  task+%#llx = raw %#llx -> %#llx  [not dereferenced]\n",
+                         (unsigned long long)kvaSlots[i].offset,
+                         (unsigned long long)kvaSlots[i].rawValue,
+                         (unsigned long long)kvaSlots[i].value);
         }
-        km_ss_append(&t, "  the known map offset (offsetof) %#llx was never a criterion; the "
-                         "task-side value printed above is %s it.\n",
-                     (unsigned long long)pmapOff,
-                     (hitSlot == pmapOff) ? "coincidentally equal to" : "unrelated to");
-
-        snprintf(summary, sizeof(summary), "[structscan] STATE=hit_unique offset=%#llx (version table %#llx)",
-                 (unsigned long long)hitSlot, (unsigned long long)knownMapOff);
+        km_ss_append(&t, "Why not one of them is dereferenced -- on-device panic, not caution for "
+                         "its own sake. The previous version of this probe read such a value as an "
+                         "address and the whole device panicked:\n");
+        km_ss_append(&t, "    esr = 0x96000007   (EC = 0b100101 data abort from the same EL; "
+                         "DFSC = 0b000111 level-3 translation fault)\n");
+        km_ss_append(&t, "    far = 0xfffffe1009577ffc   x8 = 0xfffffe1009577ff4   (far == x8 + 8)\n");
+        km_ss_append(&t, "    Zone map: 0xfffffe10f10e4000 - 0xfffffe16f10e4000\n");
+        km_ss_append(&t, "    Kernel text base: 0xfffffe0022084000\n");
+        km_ss_append(&t, "    Panicked task: 3603 pages, 10 threads: pid 370: Music\n");
+        km_ss_append(&t, "  The candidate was shaped like a kernel address but sat in a hole of "
+                         "physmap. physmap maps real DRAM only: device MMIO, DRAM bank gaps and "
+                         "firmware-reserved ranges have no physical page behind them, so the L2 "
+                         "table covers that VA while the L3 entry does not exist -- which is exactly "
+                         "what DFSC level-3 reports.\n");
+        km_ss_append(&t, "  And our kread makes the KERNEL do the dereference: psemnode->pinfo is "
+                         "repointed at the target address, then proc_info(PROC_INFO_CALL_PIDFDINFO) "
+                         "reads the content back. An EL1 data abort is fatal by default -- only code "
+                         "that registers a fault-recovery handler (copyin/copyout) turns a fault into "
+                         "an error return, and this path is not that code.\n");
+        km_ss_append(&t, "  Conclusion: under this kread path there is no safe form of \"read an "
+                         "address I have not confirmed\", so second-level reads were deleted from "
+                         "this module as a class. Do not reintroduce one. The PAC restore above is "
+                         "not an exception to that rule: km_unsign_ptr rewrites bits and reads "
+                         "nothing, so the restored value is printed and classified and never "
+                         "followed.\n");
     }
 
 done:
     /*
-     * `state` is read by the truncation branch below on every path that reaches
-     * it (not_ready / miss / partial / ambiguous / hit_unique), so the
-     * not_ready early exits are not leaving it unread -- this cast only keeps
-     * that explicit for a reader who wonders why the variable exists when the
-     * summary already carries the verdict text.
+     * 状态机的落地就是上面那几个 summary 赋值：每一个分支写一次，没有第二个写入点，
+     * 所以不会出现"两个地方各写一遍、然后互相不一致"的那种旧毛病。这里没有额外的
+     * state 变量：多个副本就是多个会漂移的真相。
+     *
+     * 截断与预算都是**限制**，不是结论，两者都不许读成一次干净的 no_bsd_info。
+     * 结论在文本写完之前就已经得出、也不依赖文本，所以结论保留，限制折进第一行 ——
+     * 只读摘要的消费者也能看到它。
+     *
+     * 与旧实现的区别：摘要不再是"覆盖第一行占位符"，而是"摘要行 + 正文"整体拼出。
+     * 旧写法用 memcpy 往正文头部写摘要，而摘要比占位符
+     * （"[structscan] STATE=running"，24 字节）长得多，于是每次都把正文开头几十字节
+     * 覆盖掉，诊断第一段就消失了。拼接版本没有这个坑：两块各自限长，加起来仍小于
+     * finalText 的容量。
      */
-    (void)state;
-
-    /*
-     * Truncation and budget are LIMITATIONS, not conclusions, and neither may
-     * read as a clean miss. The verdict itself was reached before the text was
-     * finished and does not depend on the text, so it is kept; the limitation is
-     * folded into line 1 so a consumer that only parses the summary still sees
-     * it. This is the one place that writes the summary on these two paths --
-     * the earlier draft wrote it in two places and they disagreed.
-     */
+    char finalSummary[KM_SS_SUMMARY_MAX];
+    snprintf(finalSummary, sizeof(finalSummary), "%s", summary);
     if (t.truncated || g_scanBudgetHit) {
-        char bounded[160];
-        const bool uniqueAnswer = haveHit && !ambiguous && candidateCount == 1 && !g_scanBudgetHit;
-        if (uniqueAnswer) {
-            snprintf(bounded, sizeof(bounded), "[structscan] STATE=%s offset=%#llx (text %s, reads %s)",
-                     state, (unsigned long long)hitSlot, t.truncated ? "truncated" : "complete",
-                     g_scanBudgetHit ? "budget-limited" : "within budget");
-        } else {
-            snprintf(bounded, sizeof(bounded), "[structscan] STATE=%s (text %s, reads %s)", state,
+        const size_t used = strlen(finalSummary);
+        if (used + 96 < sizeof(finalSummary)) {
+            snprintf(finalSummary + used, sizeof(finalSummary) - used, " (text %s, reads %s)",
                      t.truncated ? "truncated" : "complete",
                      g_scanBudgetHit ? "budget-limited" : "within budget");
         }
-        snprintf(summary, sizeof(summary), "%s", bounded);
     }
-    km_ss_set_summary(buffer, sizeof(buffer), summary);
-
-    g_scanText = [NSString stringWithUTF8String:buffer];
 
     /*
-     * Return contract: the offset, or 0 for "no unique answer". 0 is a safe
-     * sentinel here because offset 0 inside struct task is never the map field
-     * (the first qword is struct task's refcount/active word), and because every
-     * consumer treats 0 as "unknown" -- see the header for the three distinct
-     * reasons 0 can be returned and the STATE line that separates them.
+     * 返回值只用于显式确认「这里不可能截断」这个前提：摘要小于 KM_SS_SUMMARY_MAX、
+     * 正文小于 KM_SS_TEXT_SIZE，而 finalText 是两者之和 —— 万一常量被改坏，
+     * written 会立刻超过缓冲，而 snprintf 仍保证写了终结符、不会越界。
      */
-    if (!haveHit || ambiguous || candidateCount > 1 || g_scanBudgetHit) {
+    const int written = snprintf(finalText, sizeof(finalText), "%s\n%s", finalSummary, body);
+    (void)written;
+
+    g_scanText = [NSString stringWithUTF8String:finalText];
+
+    /*
+     * 返回契约：等于 current_proc 的那个槽的偏移；0 表示「没有可用的偏移」。
+     * 0 在这里是安全哨兵：窗口里偏移 0 是 task 的引用计数/状态字，不可能是
+     * bsd_info；而且每一种退回 0 的情形都由一个 STATE 单独表达、不许互相冒充 ——
+     * 见 KernelStructScan.h 的状态机一节。
+     */
+    if (procCount == 0 || g_scanBudgetHit || scanAborted) {
         return 0;
     }
-    return hitSlot;
+    return hitOffset;
 }
 
 NSString *km_scan_diagnostic(void)
 {
     if (g_scanText == nil) {
         return @"== struct scan ==\n"
-                "not run yet. This probe is READ-ONLY: it issues no kernel writes.\n"
+                "not run yet. This probe performs SINGLE-LEVEL reads only: every read address is "
+                "`task + <compile-time constant>`, no value it read is ever used as an address "
+                "(before or after the km_unsign_ptr PAC restore, which itself reads nothing), and it "
+                "issues no kernel writes at all.\n"
                 "Call km_scan_task_map_offset() (or the panel button) to run it.\n";
     }
     return g_scanText;

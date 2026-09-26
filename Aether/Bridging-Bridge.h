@@ -27,10 +27,12 @@
 // 所以面板上不必先点「Slide」（首次会花几十秒解析 kernelcache，按钮要先切到
 // "计算中…"）。调用同样要与读取链串行（AutoTracker.syncExternal）。
 #include "KernelPhysMap.h"
-// 「实测 task->map 偏移」的**只读**扫描探针（libmemrw，实现在 KernelStructScan.m）：
-// vm_map 字段在 task 结构里的偏移随 iOS 构建浮动，版本表里那个 0x28 在本机读出来的
-// 不是 vm_map。本模块把它从"抄来的常量"变成"在设备上测出来的值"——扫 task 的一段，
-// 用「pmap 头两个字段是 tte(KVA)/ttep(PA)」这个硬判据找出真 vm_map。
+// 「这块内存到底是不是 task」的**只读**探针（libmemrw，实现在 KernelStructScan.m）：
+// 上一版会对 task 里每个「形如内核地址」的槽再做一次读（二级读），真机上让整机内核
+// panic（physmap 空洞 + kread 借内核解引用，证据写在 KernelStructScan.h 开头），
+// 所以二级读整类删除。现在它只读 task 自身窗口内的 32 个槽，判据是
+// 「有没有哪个槽等于 current_proc」—— bsd_info 是 task 指回 proc 的反向指针，
+// 因此没命中就说明 `task = proc + proc__object_size` 这个上游推导不成立。
 // **全程一次内核写都不发**，所以它失败了可以直接重跑。
 #include "KernelStructScan.h"
 // 进程枚举需要 sysctl 与 kinfo_proc。iOS SDK 里有 <sys/sysctl.h>，
