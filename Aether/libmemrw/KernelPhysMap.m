@@ -570,6 +570,27 @@ static uint64_t kpm_vtophys_lvl(const km_pm_ctx *ctx, uint64_t tte_ttep, uint64_
             }
             return 0;
         }
+        /*
+         * 这一条**刻意不还原 PAC**，理由是可执行的而不是手感：
+         *   · 读出来的是一张 **PTE（页表项）**，不是指针字段。签名只作用于内核结构里
+         *     的指针字段（task->map / vm_map->pmap 那一类），不会签在页表项上；
+         *   · 下面用的是 `entry & mask`（低位 PA、类型位、下一级表 PA），而
+         *     km_unsign_ptr 对高位做的是 `| PAC_MASK` —— 对页表项来说那等于把
+         *     bits 47..63 **全部置 1**，会把 km_phystokv(pa) 打进一段不存在的物理
+         *     范围。也就是说这里加还原**不是保守，而是主动制造错值**。
+         * 同一条推理适用于 physwindow_walk 里的表项读（KernelPhysWindow.m）：
+         * 上游 Dopamine 的 translation.c 全程 physread64(tte_pa) 后再 `& mask`，
+         * 一次 UNSIGN_PTR 都没有。
+         *
+         * 但把它按 raw / 解释后的值打出来仍然有价值：这一跳是读取链上第一次
+         * **由"上一次读的结果"决定下一次读的地址**，真机若在这里翻车，
+         * 需要一眼看出是读错了还是后面的解释错了。
+         */
+        kpm_append(t, "  下钻 %llu：表 KVA=%#llx 表项 raw=%#llx（解释：PA=%#llx type=%#llx）\n",
+                   (unsigned long long)curLevel, (unsigned long long)tte_kva,
+                   (unsigned long long)tteEntry,
+                   (unsigned long long)(tteEntry & KM_PM_TTE_PA_MASK),
+                   (unsigned long long)(tteEntry & lvlp->typeMask));
 
         if ((tteEntry & lvlp->validMask) != lvlp->validMask) {
             if (err) {
@@ -692,9 +713,14 @@ static bool kpm_write_u64_kva(km_pm_text *t, uint64_t kva, uint64_t value, const
         return false;
     }
 
+    /*
+     * 回读核对的这个值**不还原 PAC**，这是判定而不是遗漏：它核对的是"刚写进去的
+     * 那个数有没有落地"，而写进去的是页表项 / 标量字段（`value` 本身），不是签名指针。
+     * 对它做 km_unsign_ptr 会让回读值与被写入的期望值比较不上 —— 那正是"主动制造错值"。
+     */
     const uint64_t back = km_read64(kva, &ok);
     if (!ok || back != value) {
-        kpm_append(t, "  [写入中止] %s：%#llx 回读不符 —— 期望 %#llx，回读 %#llx%s\n", what,
+        kpm_append(t, "  [写入中止] %s：%#llx 回读不符 —— 期望 %#llx，回读 raw=%#llx%s\n", what,
                    (unsigned long long)kva, (unsigned long long)value, (unsigned long long)back,
                    ok ? "" : "（且两次读不一致）");
         return false;
@@ -743,6 +769,12 @@ static bool kpm_write_u16_kva(km_pm_text *t, uint64_t kva, uint16_t value, const
 
     bool ok = false;
     const uint64_t old = km_read64(kva, &ok);
+    /*
+     * 本函数的两次 km_read64（写前读旧值、回读核对）**都不还原 PAC**：它们读的是
+     * refcount 那个标量所在的 8 字节，做的是 `& 0xFFFF` 的读-改-写。
+     * 对它做 km_unsign_ptr 会把 bits 47..63 全置 1，于是下面 `old & ~0xFFFFULL`
+     * 保留的高 6 字节就被改了 —— 那是主动制造错值，不是保守。
+     */
     if (!ok) {
         kpm_append(t, "  [写入中止] %s：目标 %#llx 写前读失败（两次读不一致）\n", what,
                    (unsigned long long)kva);
@@ -1146,11 +1178,28 @@ static km_physmap_status kpm_load(km_pm_ctx *ctx, km_pm_text *t)
         return KM_PM_PMAP_UNRESOLVED;
     }
     bool ok = false;
-    ctx->map = km_read64(ctx->task + mapOff, &ok);
-    kpm_append(t, "  task=%#llx +%#llx → vm_map=%#llx%s\n", (unsigned long long)ctx->task,
-               (unsigned long long)mapOff, (unsigned long long)ctx->map,
+    const uint64_t mapRaw = km_read64(ctx->task + mapOff, &ok);
+    /*
+     * task->map 是 **PAC 签名的内核指针**，读出来不能直接当地址用 ——
+     * 真机现场：raw=0x52bc7e10023e93c0，高 16 位 0x52bc 而形态判据要 0xFFFF，
+     * 于是链路断在这里。还原必须在形态检查**之前**做（KernelSlide.m:435 的那条
+     * 纪律），还原后 0xfffffe10023e93c0 才落在内核域。
+     *
+     * 对内核地址 km_unsign_ptr 幂等（bit 55 已置位，`| PAC_MASK` 不改动它），
+     * 所以对"其实没被签名"的内核指针过一遍是无害的 —— 正因如此这里可以无条件调用，
+     * 而不需要先猜这个字段有没有签名。ctx->map 写回的是**还原值**。
+     */
+    ctx->map = km_unsign_ptr(mapRaw);
+    kpm_append(t, "  task=%#llx +%#llx → vm_map raw=%#llx → %#llx%s\n",
+               (unsigned long long)ctx->task, (unsigned long long)mapOff,
+               (unsigned long long)mapRaw, (unsigned long long)ctx->map,
                ok ? "" : "  ← 读失败（两次不一致）");
     if (!ok || ctx->map == 0) {
+        return KM_PM_PMAP_UNRESOLVED;
+    }
+    if (!kpm_shape_ok(ctx->map)) {
+        kpm_append(t, "✗ vm_map=%#llx（raw=%#llx）还原 PAC 后形态仍不过 —— 中止。\n",
+                   (unsigned long long)ctx->map, (unsigned long long)mapRaw);
         return KM_PM_PMAP_UNRESOLVED;
     }
 
@@ -1160,14 +1209,26 @@ static km_physmap_status kpm_load(km_pm_ctx *ctx, km_pm_text *t)
                    (unsigned long long)mapPmapAddr);
         return KM_PM_PMAP_UNRESOLVED;
     }
-    ctx->pmap = km_read64(mapPmapAddr, &ok);
-    kpm_append(t, "  vm_map=%#llx +%#llx → pmap=%#llx%s\n", (unsigned long long)ctx->map,
-               (unsigned long long)pmapOff, (unsigned long long)ctx->pmap,
+    const uint64_t pmapRaw = km_read64(mapPmapAddr, &ok);
+    /* vm_map->pmap 与 task->map 同类：内核结构里的签名指针字段，还原口径完全一致。 */
+    ctx->pmap = km_unsign_ptr(pmapRaw);
+    kpm_append(t, "  vm_map=%#llx +%#llx → pmap raw=%#llx → %#llx%s\n",
+               (unsigned long long)ctx->map, (unsigned long long)pmapOff,
+               (unsigned long long)pmapRaw, (unsigned long long)ctx->pmap,
                ok ? "" : "  ← 读失败（两次不一致）");
     if (!ok || ctx->pmap == 0 || !kpm_shape_ok(ctx->pmap)) {
         return KM_PM_PMAP_UNRESOLVED;
     }
 
+    /*
+     * pmap->tte 与 pmap->ttep **都不还原 PAC**，判定依据是这两个字段存的东西：
+     *   · ttep 是顶层表的**物理地址**（下面那条 `& 0xf000000000000000` 判据就是在
+     *     核这件事），PA 没有签名，还原只会把高 16 位污染成 0xFFFF；
+     *   · tte 是同一张表的内核**虚拟别名**（下面用来与 km_phystokv(ttep) 交叉核对）。
+     *     上游 Dopamine 的 info.h:151 只对 read `pmap` 字段那一次做 UNSIGN_PTR，
+     *     拿到 pmap 之后读它的 mmu 结构字段（tte/ttep）一次都没还原 ——
+     *     mmu 结构由内核自己初始化、存的是裸地址，不是签名指针字段。
+     */
     const uint64_t tte = km_read64(ctx->pmap + KM_PM_PMAP_OFF_TTE, &ok);
     const bool tteOk = ok;
     ctx->ttep = km_read64(ctx->pmap + KM_PM_PMAP_OFF_TTEP, &ok);
@@ -1225,6 +1286,14 @@ static km_physmap_status kpm_load(km_pm_ctx *ctx, km_pm_text *t)
      *   kernel.c:109  pai_to_pvh 里 kread64(ksymbol(pv_head_table)) → 表的基址
      *   kernel.c:104  pa_index 里   kread64(ksymbol(vm_first_phys)) → 物理基址
      *   info.c:289    cpuTTEP =     kread64(ksymbol(cpu_ttep))       → TTBR1 的值
+     *
+     * 这三处**都不还原 PAC**，依据与那几个指针字段正相反：读的是**符号的内容**，
+     * 也就是内核在数据段里放的一个裸值。其中两处还有可执行的旁证 ——
+     * pv_head_table 的内容会被当内核地址用（下面 shape 判据要它落内核域），
+     * vm_first_phys / cpu_ttep 的内容会被下面判据要求"高位为 0 的物理地址"。
+     * 对这三者做 km_unsign_ptr 会把 bits 47..63 全置 1，后两条判据当场就会不过 ——
+     * 也就是说"加了反而立刻失败"，不是"加了更保险"。
+     * 上游依据：Dopamine 这三处全是裸 kread64(ksymbol(...))，一次 UNSIGN_PTR 都没有。
      */
     ctx->pvHeadTableValue = km_read64(ctx->pvHeadTable, &ok);
     kpm_append(t, "  · pv_head_table 内容 = %#llx%s\n", (unsigned long long)ctx->pvHeadTableValue,
@@ -1334,9 +1403,12 @@ static void kpm_probe_window(km_pm_ctx *ctx, km_pm_text *t)
                        (unsigned long long)leafAddr, (unsigned long long)kva);
         } else {
             bool ok = false;
-            ctx->windowLeafEntry = km_read64(kva, &ok);
-            kpm_append(t, "  表项旧值：PA=%#llx → KVA=%#llx → %#llx%s\n",
+            const uint64_t rawLeafEntry = km_read64(kva, &ok);
+            /* 同上：页表项不是指针字段，不做 PAC 还原；raw 与解释值一起打出来只为诊断。 */
+            ctx->windowLeafEntry = rawLeafEntry;
+            kpm_append(t, "  表项旧值：PA=%#llx → KVA=%#llx → raw=%#llx → %#llx%s\n",
                        (unsigned long long)leafAddr, (unsigned long long)kva,
+                       (unsigned long long)rawLeafEntry,
                        (unsigned long long)ctx->windowLeafEntry,
                        ok ? "" : "  ← 读失败（两次不一致）");
         }
@@ -1458,6 +1530,12 @@ static bool kpm_verify_pmap_layout(const km_pm_ctx *ctx, km_pm_text *t)
         kpm_append(t, "✗ ③ pmap->wx_allowed 地址 %#llx 形态不过。\n", (unsigned long long)wxAddr);
         return false;
     }
+    /*
+     * ②③ 两处读的是 pmap 里的**标量字段**（type / wx_allowed 的字节），不还原 PAC：
+     * 判据只看低 8 位（`& 0xFF`），而这里关心的正是"偏移有没有落在那个字段上"。
+     * 过一遍 km_unsign_ptr 只会改动 bits 47..63 —— 那几位与判据无关，加它除了
+     * 掩盖问题没有任何作用。
+     */
     const uint64_t wxWord = km_read64(wxAddr, &ok);
     const uint8_t wxValue = (uint8_t)(wxWord & 0xFFULL);
     kpm_append(t, "  ③ pmap+%#llx 读出的字节 = %#x（bool，期望 0 或 1）\n",
@@ -1557,6 +1635,15 @@ static km_pm_alloc_result kpm_alloc_page_table_unassigned(km_pm_ctx *ctx, km_pm_
         }
 
         bool ok = false;
+        /*
+         * pvh 表项**不还原 PAC**。它不是一个指针字段，而是 `类型(低 2 位) | 描述符地址`
+         * 的打包值（kpm_pvh_ptd 做 `entry & ~3 | HIGH_FLAGS`，见下面那条类型判据）。
+         * 对它做 km_unsign_ptr 有两种坏法，都不是理论上的：
+         *   · 取 `| PAC_MASK` 支 → 类型位虽在低 2 位不受影响，但地址字段的高位被污染；
+         *   · 取 `& PTR_MASK` 支 → 直接清掉描述符地址的高位。
+         * 上游 Dopamine kernel.c:109-115 的 pai_to_pvh / pvh_ptd 全程裸读 + 掩码，
+         * 一次 UNSIGN_PTR 都没有。
+         */
         const uint64_t pvhEntry = km_read64(pvh, &ok);
         if (!ok) {
             kpm_append(t, "  ✗ pvh 表项 %#llx 读失败\n", (unsigned long long)pvh);
@@ -1596,6 +1683,18 @@ static km_pm_alloc_result kpm_alloc_page_table_unassigned(km_pm_ctx *ctx, km_pm_
             free(freeLvl2);
             return KM_PM_ALLOC_ACCOUNTING_FAILED;
         }
+        /*
+         * pt_desc->pinfo **不还原 PAC** —— 如实说明这一条是"判定 + 未确证的部分"，
+         * 不是遗漏：
+         *   · 它确实是块级 vm_page 记帐对象的指针字段，但**上游 Dopamine 对读出来的
+         *     pinfo 不做还原**（util.c:159 之后直接用它定位 refcount 并 physwrite16），
+         *     而上面所有做了还原的地方都有上游同源代码与真机现场两重依据；
+         *   · 本文件目前没有任何证据说明这个字段被签名（真机现场只覆盖到 task->map
+         *     与 vm_map->pmap 这两跳）。
+         * 本轮的边界是"确证过的还原 + 其余处写清理由"，所以这里不凭手感加。
+         * 若真机在 ptdp/pinfo 这一跳失败，判据是：pinfo 读出来高 16 位不是 0xFFFF
+         * 而低 47 位像内核地址 —— 那时它就是被签名了，改成 km_unsign_ptr 即可。
+         */
         const uint64_t pinfo = km_read64(pinfoAddr, &ok);
         kpm_append(t, "  ptdp=%#llx ptd_info@+%#llx → pinfo=%#llx%s\n", (unsigned long long)ptdp,
                    (unsigned long long)ctx->ptDescOffPtdInfo, (unsigned long long)pinfo,
@@ -1711,6 +1810,7 @@ static uint64_t kpm_pmap_alloc_page_table(km_pm_ctx *ctx, km_pm_text *t, uint64_
         return 0;
     }
     bool ok = false;
+    /* 与 kpm_alloc_page_table_unassigned 里那条同源：pvh 表项是打包值，不是指针字段，不还原。 */
     const uint64_t pvhEntry = km_read64(pvh, &ok);
     if (!ok || (pvhEntry & KM_PM_PVH_TYPE_MASK) != KM_PM_PVH_TYPE_PTDP) {
         kpm_append(t, "  ✗ 新表的 pvh 表项 %#llx 不是 PTDP（或读失败）—— 不给它挂链\n",

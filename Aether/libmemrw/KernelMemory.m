@@ -824,12 +824,107 @@ uint64_t km_kernel_page_size(void)
     return (uint64_t)value;
 }
 
+/*
+ * ── 页下溢闸门 ──
+ *
+ * kread/kwrite 都不是"直接读那个地址"：它们先把一个**内核结构体的指针字段**
+ * 改写成 `目标地址 − 某个字段偏移`，再让内核按它自己的语义去解引用。于是内核
+ * 实际访问的**最低地址**是 `目标地址 − delta`；只要目标地址的**页内偏移小于
+ * delta**，那个减法就落到**前一页**上。
+ *
+ * 前一页未映射时，内核在 same-EL 的 data abort 上默认没有 fault-recovery
+ * handler —— 结果不是本进程崩，而是**整机 panic**。实测形态：esr = 0x96000007
+ * （EC 0b100101 same-EL data abort、DFSC 0b000111 level-3 translation fault）、
+ * `far == x8 + 8`，其中 x8 就是那个被改写过的结构体指针，且它的低 4 位非 0
+ * （说明它是内核自己算出来的 pinfo，不是我们送进去的地址）。
+ * 关键一点：**这与"目标地址自己是否映射"无关 —— 目标是页对齐就一定会中招。**
+ *
+ * 读路径 delta 的两个来源：
+ *   · kread_sem_open.h:147 —— `u64 new_pinfo = kaddr - offsetof(struct pseminfo, psem_uid);`
+ *   · static_info.h:556-567 —— struct pseminfo { u32 psem_flags; u32 psem_usecount;
+ *     u16 psem_mode; u32 psem_uid; ... }。psem_mode 是 u16，psem_uid 因此按
+ *     4 字节对齐到 0x0C（不是 0x0A）。
+ * 上游自己也记着这件事：kread_sem_open.h:163-166 只声明 32 位那条
+ * "guaranteed to not underflow a page"，言下之意 64 位这条会下溢页。
+ */
+#define KM_PAGE_UNDERFLOW_KREAD 0x0C
+
+/*
+ * 写路径 delta 的两个来源（**与读路径不同，不是 0x0C**）：
+ *   · kwrite_dup.h:126 —— `u64 new_fp_guard = kaddr - offsetof(struct fileproc_guard, fpg_guard);`
+ *   · static_info.h:311-314 —— struct fileproc_guard { u64 fpg_wset; u64 fpg_guard; }，
+ *     两个字段都是 u64，故 offsetof(fpg_guard) = 0x08。
+ * 写路径改的是 fp_guard（fileproc 的内联字段，见 static_info.h:316-324），
+ * 内核随后按 struct fileproc_guard 的语义从 `kaddr − 0x08` 起访问。
+ * 但写路径并不只下溢 0x08：kwrite_dup.h:110 在真正写入之前，先用**同一个 kaddr**
+ * 走了一次 8 字节 kread → 那一步仍按 KM_PAGE_UNDERFLOW_KREAD 下溢。
+ * 所以 km_write 的闸门取两者较大者（见该函数内的取值处），
+ * 只按 0x08 放行会在页内偏移 0x08..0x0B 的地址上漏掉那次 kread。
+ */
+#define KM_PAGE_UNDERFLOW_KWRITE 0x08
+
+/*
+ * 页下溢闸门：要求 [addr, addr+len) 内**每一个被实际访问的 8 字节字的地址**
+ * 都满足「页内偏移 >= underflow」。
+ *
+ * 为什么按字而不是只看首地址：krkw.h:8-31 的 kread_from_method / kwrite_from_method
+ * 都是按 sizeof(u64) 步进逐个字搬的，每个字的地址各自可能落在页首 delta 以内；
+ * 只验首地址会漏掉后面那些字（len > 8 时尤其明显）。
+ *
+ * 页大小一律取 km_kernel_page_size()（iOS 上 0x4000），不硬编码 —— 页大小取不到、
+ * 或不是 2 的幂（掩码法就不成立）时返回 false：这是安全失败，
+ * 少读一次远好过一次整机 panic。
+ */
+static bool km_is_page_underflow_safe(uint64_t addr, uint64_t len, uint64_t underflow)
+{
+    const uint64_t page_size = km_kernel_page_size();
+    if (page_size == 0 || (page_size & (page_size - 1)) != 0) {
+        NSLog(@"[KernelMemory] page underflow gate: page size unavailable (%llu), refused addr=%#llx len=%llu",
+              (unsigned long long)page_size, (unsigned long long)addr, (unsigned long long)len);
+        return false;
+    }
+
+    const uint64_t page_mask = page_size - 1;
+
+    for (uint64_t offset = 0; offset < len; offset += sizeof(uint64_t)) {
+        const uint64_t word_addr = addr + offset;
+
+        /* 地址在区间顶部回绕时按不合法处理（内层循环不再可信）。 */
+        if (word_addr < addr) {
+            NSLog(@"[KernelMemory] page underflow gate: address wrap at addr=%#llx offset=%llu, refused",
+                  (unsigned long long)addr, (unsigned long long)offset);
+            return false;
+        }
+
+        const uint64_t page_offset = word_addr & page_mask;
+        if (page_offset < underflow) {
+            NSLog(@"[KernelMemory] page underflow gate: addr=%#llx page_offset=%#llx underflow=%#llx page_size=%#llx"
+                  " refused (kernel would touch addr - underflow = the previous page)",
+                  (unsigned long long)word_addr,
+                  (unsigned long long)page_offset,
+                  (unsigned long long)underflow,
+                  (unsigned long long)page_size);
+            return false;
+        }
+    }
+
+    return true;
+}
+
 bool km_read(uint64_t addr, void *out, uint64_t len)
 {
     if (g_handle == 0 || out == NULL || len == 0) {
         return false;
     }
     if (!km_is_kernel_address(addr)) {
+        return false;
+    }
+    /*
+     * 页下溢闸门（理由与两个 delta 的来源见 KM_PAGE_UNDERFLOW_KREAD 那段注释）。
+     * 一次覆盖整个 [addr, addr+len)：kread 内部按 8 字节步进，中途任何一个字的
+     * 地址都可能踩到前一页，所以必须在发第一个 kread 之前就整段判掉。
+     */
+    if (!km_is_page_underflow_safe(addr, len, KM_PAGE_UNDERFLOW_KREAD)) {
         return false;
     }
 
@@ -877,6 +972,10 @@ uint64_t km_read64(uint64_t addr, bool *ok)
     if (g_handle == 0 || !km_is_kernel_address(addr)) {
         return 0;
     }
+    /* 页下溢闸门：单字读，*ok 保持 false 即既有失败语义。 */
+    if (!km_is_page_underflow_safe(addr, sizeof(uint64_t), KM_PAGE_UNDERFLOW_KREAD)) {
+        return 0;
+    }
 
     uint64_t first = 0;
     kread((u64)g_handle, addr, &first, sizeof(first));
@@ -900,6 +999,18 @@ bool km_write(uint64_t addr, const void *in, uint64_t len)
     }
     /* kwrite 按 8 字节粒度写入，长度不是 8 的倍数就没有定义。 */
     if ((len % sizeof(uint64_t)) != 0) {
+        return false;
+    }
+
+    /*
+     * 页下溢闸门。取读/写两个下溢量的**较大者**：写路径自身是
+     * KM_PAGE_UNDERFLOW_KWRITE，但 kwrite_dup.h:110 在写入前会先用同一个 kaddr
+     * 做一次 8 字节 kread，那一步是 KM_PAGE_UNDERFLOW_KREAD。
+     */
+    const uint64_t underflow = (KM_PAGE_UNDERFLOW_KREAD > KM_PAGE_UNDERFLOW_KWRITE)
+                                   ? KM_PAGE_UNDERFLOW_KREAD
+                                   : KM_PAGE_UNDERFLOW_KWRITE;
+    if (!km_is_page_underflow_safe(addr, len, underflow)) {
         return false;
     }
 

@@ -368,6 +368,32 @@ static uint64_t slide_unsign_ptr(uint64_t p, uint64_t t1sz)
 }
 
 /*
+ * 跨线程共享的 T1SZ_BOOT 缓存 —— km_unsign_ptr 专用的那一份（另一份在 g_slideLinkBase
+ * 那条 resolve 链上，由 g_slideLock 保护）。
+ *
+ * 取值与 slide_t1sz() 同源：XPF 的 kernelConstant.T1SZ_BOOT，取不到按目标机
+ * （iPad14,3 / iPadOS 16.4.1）实测值 17 兜底，两边都不写死 —— 理由见上面
+ * slide_unsign_ptr 的注释（T1SZ = 25 的机型上写死会把内核地址高位切错）。
+ *
+ * 0 = 还没解析过（哨兵）。这里是**无锁**的，所以它必须是 volatile，以免编译器把
+ * 热路径上那次读优化掉之后再也看不到别的线程写进来的值。
+ */
+static volatile uint64_t g_unsignT1szCache = 0;
+
+/// PAC_MASK 的形状来源，首次调用才解析并缓存。返回值恒落在 1..63。
+static uint64_t slide_unsign_t1sz_cached(void)
+{
+    uint64_t value = g_unsignT1szCache;
+    if (value != 0) return value;
+
+    value = km_xpf_resolve_symbol(@"kernelConstant.T1SZ_BOOT");
+    if (value < 1 || value > 63) value = 17;
+
+    g_unsignT1szCache = value;
+    return value;
+}
+
+/*
  * 换算核心的无锁版本：**调用者必须已持有 g_slideLock**。
  * 前向声明在这里，是因为 resolve 内部的抽样验证（slide_report_phystokv_probe）
  * 要用它 —— 那一处若改成调用公开的 km_phystokv()，就会在同一把锁上再取一次锁，
@@ -2062,6 +2088,44 @@ uint64_t km_phystokv(uint64_t pa)
     const uint64_t kva = slide_phystokv_locked(pa);
     pthread_mutex_unlock(&g_slideLock);
     return kva;
+}
+
+/*
+ * ═══ 导出的 PAC 还原（读取链上的第二个闸门）═══
+ *
+ * 为什么这个函数必须存在、且必须导出：kread 从内核结构里读回来的**指针字段**
+ * 是 PAC 签名的，高 17 位是签名而不是地址。真机上实测到的形态（本文件写这条注释
+ * 时的现场）：
+ *      task+0x28（vm_map）读回 0x52bc7e10023e93c0
+ *      形态判据看高 16 位（km_is_kernel_address 口径）→ 0x52bc ≠ 0xFFFF → 不过
+ *      还原后                    0xfffffe10023e93c0 → 高 16 位 0xFFFF → 过
+ * 于是"读到了正确的值、却在形态检查那一关被枪毙"变成了整条链上的唯一断点。
+ *
+ * 上游同样每次都还原（libkfd/info.h:144-145 / 151-152 / 166-167 / 173-174），
+ * 本文件自己也一直在做（slide_read_kernel_ptr，.m:432-436 的注释写了完整的
+ * 推导与纪律）。缺的只是**一个给别的模块用的入口** —— 这就是本函数。
+ *
+ * 幂等性（调用方最该记住的一条）：
+ *   · 内核地址的 bit 55 恒为 1（内核 VA 从 0xfffffe… 起），走 `p | pacMask` 那一支，
+ *     而 pacMask 的每一位本来就是 1 —— **不会改动已经置位的位，结果等于入参**。
+ *     所以"从内核读出来、后面当地址用"的值可以无脑过一遍。
+ *   · 用户态地址的 bit 55 为 0，走 `p & ptrMask` 那一支 —— 它会把 bit 47 以上
+ *     **全部清掉**。所以**绝对不要拿本函数处理用户态地址**（例如 posix_memalign
+ *     返回的那类指针）：那不是"没变化"，那是把地址改坏。
+ *
+ * 不加锁是刻意的，不是遗漏：调用点（KernelPhysWindow / KernelPhysMap 的读取链）
+ * 已经持有自己的锁，而 km_slide_resolve / km_phystokv 都要取 g_slideLock ——
+ * 在这里再取一次就是同一把锁上的自锁死（本工程已经在 slide_phystokv 的前向声明
+ * 注释里记着同一个坑）。所以这里用无锁的缓存读。
+ *
+ * 首次解析发生在调用方已经持有别的锁的时候，而 km_xpf_resolve_symbol 自身不取
+ * g_slideLock（slide_t1sz 就是这么调的，见 .m:514-524），所以不会构成锁序反转。
+ * 并发首调最坏的结果是两个线程各解析一次、缓存里留下同一个值 ——
+ * 解析是幂等的，没有任何副作用。
+ */
+uint64_t km_unsign_ptr(uint64_t p)
+{
+    return slide_unsign_ptr(p, slide_unsign_t1sz_cached());
 }
 
 NSString *km_slide_diagnostic(void)

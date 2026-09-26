@@ -472,6 +472,17 @@ static km_pw_walk_result physwindow_walk(km_pw_text *t, uint64_t pmapTtep, uint6
         }
 
         bool ok = false;
+        /*
+         * 这一条**刻意不还原 PAC**，理由是可执行的而不是手感：
+         *   · 读出来的是一张 **PTE（页表项）**，不是指针字段。签名作用于内核结构里的
+         *     指针字段（task->map / vm_map->pmap 那一类），不会签在页表项上；
+         *   · 下面用的是 `entry & KM_PW_TTE_ADDR_MASK`（低位 PA）与类型位，而
+         *     km_unsign_ptr 对高位做的是 `| PAC_MASK` —— 对 PTE 来说那等于把
+         *     bits 47..63 全部置 1，紧接着 km_phystokv(nextPa) 就会打进一段
+         *     不存在的物理范围。在这里加还原**不是保守，而是主动制造错值**。
+         * 但 raw 值仍然值得打出来：这一跳是建窗链上第一次由"上一次读的结果"决定
+         * 下一次读的地址，真机翻车时要能一眼分出是读错了还是解释错了。
+         */
         const uint64_t entry = km_read64(entryAddr, &ok);
         if (!ok) {
             pw_append(t, "✗ %s 表项读失败（addr=%#llx，两次读到不同的值）—— 终止\n",
@@ -480,7 +491,7 @@ static km_pw_walk_result physwindow_walk(km_pw_text *t, uint64_t pmapTtep, uint6
         }
 
         const km_pw_entry_kind kind = physwindow_classify(level, entry);
-        pw_append(t, "%s：表KVA=%#llx 索引=%llu 表项地址=%#llx 表项=%#llx  → %s\n",
+        pw_append(t, "%s：表KVA=%#llx 索引=%llu 表项地址=%#llx 表项 raw=%#llx  → %s\n",
                   levelNames[level], (unsigned long long)tableKva,
                   (unsigned long long)index, (unsigned long long)entryAddr,
                   (unsigned long long)entry, physwindow_kind_name(kind));
@@ -628,13 +639,30 @@ km_physwindow_status km_physwindow_probe(void)
             goto done;
         }
         bool ok = false;
-        const uint64_t map = km_read64(task + mapOff, &ok);
-        pw_append(&t, "task=%#llx → task+%#llx 读出 map=%#llx%s\n",
+        const uint64_t mapRaw = km_read64(task + mapOff, &ok);
+        /*
+         * task->map 是 **PAC 签名的内核指针** —— 直接当地址用会死在形态检查上
+         * （真机现场：raw=0x52bc7e10023e93c0，高 16 位 0x52bc 而判据要 0xFFFF）。
+         * 还原必须在形态检查**之前**：带签名时高 17 位是签名不是地址，先卡形态
+         * 会把合法指针误判成垃圾（这条纪律原本只落在 KernelSlide.m:435，
+         * 这里补上同一道）。对内核地址 km_unsign_ptr 是幂等的，所以不会改坏
+         * "其实没被签名"的值；对用户态地址不是 —— 但这里读的是内核结构字段。
+         */
+        const uint64_t map = km_unsign_ptr(mapRaw);
+        pw_append(&t, "task=%#llx → task+%#llx 读出 map raw=%#llx → %#llx%s\n",
                   (unsigned long long)task, (unsigned long long)mapOff,
-                  (unsigned long long)map, ok ? "" : "  ← 读失败（两次不一致）");
+                  (unsigned long long)mapRaw, (unsigned long long)map,
+                  ok ? "" : "  ← 读失败（两次不一致）");
         if (!ok || map == 0) {
             status = KM_PW_PMAP_UNRESOLVED;
             summary = @"[建窗] pmap 取不到：vm_map 读失败或为 0";
+            goto done;
+        }
+        if (!physwindow_shape_ok(map)) {
+            pw_append(&t, "✗ map=%#llx（raw=%#llx）还原 PAC 后形态仍不过 —— 终止\n",
+                      (unsigned long long)map, (unsigned long long)mapRaw);
+            status = KM_PW_PMAP_UNRESOLVED;
+            summary = @"[建窗] pmap 取不到：vm_map 还原后形态不过";
             goto done;
         }
         uint64_t mapPmap = 0;
@@ -645,13 +673,22 @@ km_physwindow_status km_physwindow_probe(void)
             summary = @"[建窗] pmap 取不到：pmap 字段地址形态不过";
             goto done;
         }
-        const uint64_t pmap = km_read64(mapPmap, &ok);
-        pw_append(&t, "     map+%#llx 读出 pmap=%#llx%s\n",
-                  (unsigned long long)pmapOff, (unsigned long long)pmap,
-                  ok ? "" : "  ← 读失败（两次不一致）");
+        const uint64_t pmapRaw = km_read64(mapPmap, &ok);
+        /* vm_map->pmap 同样是签名指针字段，还原口径与上一处完全一致。 */
+        const uint64_t pmap = km_unsign_ptr(pmapRaw);
+        pw_append(&t, "     map+%#llx 读出 pmap raw=%#llx → %#llx%s\n",
+                  (unsigned long long)pmapOff, (unsigned long long)pmapRaw,
+                  (unsigned long long)pmap, ok ? "" : "  ← 读失败（两次不一致）");
         if (!ok || pmap == 0) {
             status = KM_PW_PMAP_UNRESOLVED;
             summary = @"[建窗] pmap 取不到：pmap 读失败或为 0";
+            goto done;
+        }
+        if (!physwindow_shape_ok(pmap)) {
+            pw_append(&t, "✗ pmap=%#llx（raw=%#llx）还原 PAC 后形态仍不过 —— 终止\n",
+                      (unsigned long long)pmap, (unsigned long long)pmapRaw);
+            status = KM_PW_PMAP_UNRESOLVED;
+            summary = @"[建窗] pmap 取不到：pmap 还原后形态不过";
             goto done;
         }
 
@@ -660,6 +697,15 @@ km_physwindow_status km_physwindow_probe(void)
         pw_append(&t, "pmap=%#llx（上游 info.h:151 的 static_kget(struct _vm_map, pmap, ...) 同源）\n",
                   (unsigned long long)pmap);
 
+        /*
+         * tte / ttep **都不还原 PAC**（与上面 map / pmap 两处相反，这是判定不是遗漏）：
+         *   · ttep 是顶层表的**物理地址** —— 这个模块紧接着就拿它去 km_phystokv()
+         *     走页表（physwindow_walk 的起点），PA 上没有签名；还原会把高位污染成 0xFFFF；
+         *   · tte 是同一张表的内核虚拟别名，只用来与 km_phystokv(ttep) 做交叉核对，
+         *     两个值形态一致与否本身就是判据，动它反而毁掉判据。
+         * 上游一致：Dopamine info.h:151 只对 `pmap` 那一次做 UNSIGN_PTR，读 pmap 的
+         * mmu 结构字段（tte/ttep）一次都没还原。
+         */
         const uint64_t tte = km_read64(pmap + 0x00, &ok);
         const bool tteOk = ok;
         const uint64_t ttep = km_read64(pmap + 0x08, &ok);
