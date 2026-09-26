@@ -152,6 +152,7 @@
 
 #import <Foundation/Foundation.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /*
@@ -324,6 +325,43 @@ bool km_physmap_physwritebuf(uint64_t pa, const void *in, uint64_t size);
 /// `km_physmap_precheck()` 报告里的第 ⑩ 段。
 /// 全是只读，一次内核访问都不发。
 NSString *km_physmap_window_diag(void);
+
+#pragma mark - 对外：读一页物理内存（诊断入口）
+
+/*
+ * 这一段是「窗口槽位」那套机制的最下游**演示入口**：一次读一整页，并把这次读的
+ * 结果写成一行给人看的摘要。它不改槽位选择、不改数据通道档位、不新增任何状态 ——
+ * 槽位与「复用还是新写」直接取自 km_physmap_window_diag() 背后的同一条轨迹。
+ */
+
+/// 读一页（16K）物理内存到调用方缓冲，并返回一份**给面板显示用**的单行摘要。
+///
+/// 这是一个**诊断入口**，不是量产接口：它存在的意义是让面板上一个按钮就能验证
+/// 「窗口 + PTE 写入 + EL0 直访」这条链第一次真正通了。
+///
+/// - `pa` 必须是页对齐的（内部核对；**不做静默圆整** —— 圆整会让"传进来的是页内
+///   地址"这种错安静生效）。
+/// - `out` 至少 16384 字节；`outSize` 是它的实际大小，小于一页时直接返回失败摘要，
+///   一个字节都不读。
+/// - 成功时摘要里写：页地址、用的槽位、读回的前 16 字节的十六进制、以及
+///   「这次是复用已有映射还是新写了一条」。
+/// - 失败时摘要写清**失败在哪一环**：参数拒 / 自映射未就绪（acquire 环）/
+///   acquire 环失败 / 数据读取环失败。失败的详细记录在
+///   `km_physmap_window_diag()` 里（本入口不覆盖它）。
+///
+/// 实际读取走 `km_physmap_physreadbuf(pa, out, 0x4000)`，一次恰好一页。
+/// **永不返回 nil**（本工程硬约束 4：诊断路径），没跑过/读失败也返回一句话。
+///
+/// 调用纪律与其它入口相同：必须与读取链串行（libkfd 后端不是线程安全的），
+/// 且只有在 `km_physmap_build()` 之后（自映射就绪）才有意义。
+NSString *km_physmap_read_page_summary(uint64_t pa, void *out, size_t outSize);
+
+/// 上面那次调用的多行诊断，**永不返回 nil**。
+///
+/// 第一行是那次调用的摘要（没调过就如实说没调过），之后**整块复用**
+/// `km_physmap_window_diag()` 的内容 —— 不另开缓冲，也不覆盖
+/// `km_physmap_diagnostic()` 里那份预检/执行的结论文本（那块有面板状态行的契约）。
+NSString *km_physmap_read_page_diag(void);
 
 /// 预检（**只读**）：把建表要用的每一个输入读出来并核对，一次内核写都不发。
 ///
