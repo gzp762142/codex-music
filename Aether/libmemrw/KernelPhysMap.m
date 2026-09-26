@@ -24,6 +24,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+/*
+ * pthread 必须显式 include。Foundation 间接带进来的那些声明**不是**这一层能用的：
+ * 只写 pthread_mutex_lock 而不 include，clang 报的是 "declaration of
+ * 'pthread_mutex_lock' must be imported from module
+ * 'Darwin.POSIX.pthread.pthread' before it is required"，不是"未声明"，
+ * 读起来像是模块问题、其实是一行 include 的问题。
+ * KernelSlide.m:47 就是同一个 include（它先用 pthread，所以从没踩过）。
+ */
+#include <pthread.h>
+
 #pragma mark - 页表几何（16K 三级）
 
 /*
@@ -927,6 +937,20 @@ static bool kpm_write_u16_kva(km_pm_text *t, uint64_t kva, uint16_t value, const
 /// acquire 轨迹环形缓冲的条数。只服务于诊断（"这一轮用的是哪个槽、凭什么"）。
 #define KM_PM_SLOT_TRACE_MAX 32
 
+/// acquire 自己的诊断文本 —— **不覆盖** g_physmapText。
+///
+/// 理由：预检/执行的结论文本是有契约的（面板拿第一行当状态行，且它是"那一次跑
+/// 的完整记录"）。一次 acquire 是**下游动作**，它若把结论文本冲掉，面板上那张
+/// 报告就再也不是"上次点按钮的结果"了。所以单开一块、单开一个访问器。
+///
+/// **位置必须在 kpm_append_window_diag 之前，这不是排版偏好**：那两个静态量是
+/// C 的 file-scope 对象，没有"先引用、后定义"这回事 —— 原先它们写在 994/995，
+/// 而使用点在 948~963，clang 直接报 "use of undeclared identifier
+/// 'g_physmapWindowDiag'; did you mean 'g_physmapWindow'?"，16 条错误里 13 条是
+/// 这一条连锁出来的。同型错误这个工程已经犯过一次：`done:` 标签后面挂声明。
+static char g_physmapWindowDiag[4096];
+static bool g_physmapWindowDiagRan = false;
+
 /*
  * 往 g_physmapWindowDiag 里追加一行。**与 kpm_append 分开写**，理由两条：
  *   · kpm_append 要一个 km_pm_text*（used/size/truncated 那套记账），
@@ -985,14 +1009,6 @@ static pthread_mutex_t g_physmapSlotLock = PTHREAD_MUTEX_INITIALIZER;
 static km_pm_slot_trace g_physmapSlotTrace[KM_PM_SLOT_TRACE_MAX];
 static int g_physmapSlotTraceCount = 0;
 static int g_physmapSlotTraceNext = 0;
-
-/// acquire 自己的诊断文本 —— **不覆盖** g_physmapText。
-///
-/// 理由：预检/执行的结论文本是有契约的（面板拿第一行当状态行、且它是"那一次跑
-/// 的完整记录"）。一次 acquire 是**下游动作**，它若把结论文本冲掉，面板上那张
-/// 报告就再也不是"上次点按钮的结果"了。所以单开一块、单开一个访问器。
-static char g_physmapWindowDiag[4096];
-static bool g_physmapWindowDiagRan = false;
 
 /// 选槽用的小工具：读一条槽。
 ///
@@ -1308,7 +1324,7 @@ static km_physmap_status kpm_load(km_pm_ctx *ctx, km_pm_text *t)
     }
     if (!km_phystokv_ensure()) {
         if (!km_xpf_ready()) {
-            kpm_append(t, "✗ XPF 未就绪且这次初始化没成功：建表要的六个符号/常量全部来自它。\n");
+            kpm_append(t, "✗ XPF 未就绪且这次初始化没成功：建表要的符号/常量全部来自它。\n");
             NSString *const xpfError = km_xpf_last_error();
             kpm_append(t, "  原因：%s\n", xpfError != nil ? xpfError.UTF8String : "(没有错误文本)");
             return KM_PM_NOT_READY;
