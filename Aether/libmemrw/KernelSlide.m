@@ -418,11 +418,41 @@ static uint64_t slide_read64(uint64_t addr, bool *ok)
 /// 不拦"跨页"的读：ptov_table 是内核数据段里的定长数组，跨页时那两页都属于同一个
 /// 连续映射的段；真正会出事的是符号地址算错，而那种情况已经被 slide 自检挡住
 /// （自检不过就根本走不到这里）。
-static bool slide_read_bulk(uint64_t addr, void *out, size_t len)
+/*
+ * 读一段字节（不是指针，所以读完不做形态检查）。
+ *
+ * **失败必须能分辨是两种里的哪一种**（2026-09-26）。
+ *
+ * 原先是 `if (!km_slide_kernel_ptr(addr)) return false; return km_read(...)`，
+ * 失败时外面只能写「形态检查未过 或 kread 失败」—— 这一句在真机上出现过
+ * （`kernel_base=0xfffffe0011598000 读不到（形态检查未过 或 kread 失败）`），
+ * 而它恰好把两条**完全不同**的修法混成一条：
+ *   · 形态不过   → 地址根本不是内核 VA / 没对齐 → 错在**候选值或基址的来源**；
+ *   · kread 失败 → 地址形态合法但内核读不出来 → 错在**地址未映射**（候选值算错了），
+ *                  或者被 `km_read` 的页闸门拒了（页内偏移 < 0x0C）。
+ * 前者一次内核访问都不发，后者发了。凭一句含糊的话无法分工，所以在这里分开打。
+ *
+ * 注意 `km_read` 的返回值**不表示"内核读成功"**：kread 本身返回 void，读失败
+ * （踩到未映射地址）它不会报错。所以这里能做到的是"没发出/发出了"，以及
+ * "页闸门拒了"，而不是"内核究竟读到没有"—— 这个区别要如实说。
+ */
+static bool slide_read_bulk(km_slide_text *t, uint64_t addr, void *out, size_t len)
 {
     if (!out || len == 0) return false;
-    if (!km_slide_kernel_ptr(addr)) return false;
-    return km_read(addr, out, (uint64_t)len);
+
+    if (!km_slide_kernel_ptr(addr)) {
+        text_append(t, "  [bulk] 形态不过：%#llx 不是合法内核指针（未发出 kread）\n",
+                    (unsigned long long)addr);
+        return false;
+    }
+    if (!km_read(addr, out, (uint64_t)len)) {
+        const uint64_t pageOff = addr & 0x3fffULL;
+        text_append(t, "  [bulk] 形态过、但 km_read 拒了：%#llx（页内偏移 %#llx）——\n"
+                       "    页内偏移 < 0x0C 就是被页闸门按「下溢」拒的；否则是地址形态没过。\n",
+                    (unsigned long long)addr, (unsigned long long)pageOff);
+        return false;
+    }
+    return true;
 }
 
 /*
@@ -1003,8 +1033,9 @@ static bool slide_verify_kernel_base(km_slide_run *run, uint64_t candidate, km_s
     }
 
     uint32_t head[2] = { 0, 0 };
-    if (!slide_read_bulk(run->kernelBase, head, sizeof(head))) {
-        text_append(t, "  kernel_base=%#llx 读不到（形态检查未过或 kread 失败）\n",
+    if (!slide_read_bulk(t, run->kernelBase, head, sizeof(head))) {
+        /* 具体是形态不过还是 kread 被拒，由 slide_read_bulk 自己那两行说明（见它）。 */
+        text_append(t, "  kernel_base=%#llx 读不到 —— 原因见上面那一行 [bulk]\n",
                     (unsigned long long)run->kernelBase);
         return slide_refuse(run, t, "⑤ 自检", "读不到 kernel_base 处的头部");
     }
@@ -1270,7 +1301,7 @@ static void slide_read_ptov_table(uint64_t slide, km_slide_ptov_entry *out,
     km_slide_ptov_entry table[KM_SLIDE_PTOV_COUNT] = {};
     const size_t tableSize = sizeof(table);
 
-    if (!slide_read_bulk(tableAddr, table, tableSize)) {
+    if (!slide_read_bulk(t, tableAddr, table, tableSize)) {
         text_append(t, "  ptov_table=%#llx（符号 %#llx + slide）读失败\n",
                     (unsigned long long)tableAddr, (unsigned long long)symbol);
         text_append(t, "  ⇒ ptov_table 不可信：表读不出来；查表路径停用，PA→KVA 走兜底公式\n");
