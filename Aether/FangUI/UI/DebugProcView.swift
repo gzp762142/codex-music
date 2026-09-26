@@ -48,29 +48,9 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     private let windowLabel = UILabel()
     private let table = UITableView(frame: .zero, style: .plain)
 
-    /// 跑一次：刷新 → 找村口 → 世界 → 名字池，一条链自动走完
-    private let btnAuto = UIButton(type: .system)
+    /// 刷新：重新找游戏进程、拿 pid。**保留** —— `reload()` 就是调它，而
+    /// `reload()` 是 RootViewController 在面板重新出现时调的外部入口（:115）。
     private let btnRefresh = UIButton(type: .system)
-    private let btnProof = UIButton(type: .system)
-    private let btnCrashFile = UIButton(type: .system)
-    /// 对象：从对象表取前 16 个，解出「类名 + 对象名」
-    private let btnObjects = UIButton(type: .system)
-    /// 世界：GWorld → PersistentLevel → Actors（三次小读，走热页）
-    private let btnWorld = UIButton(type: .system)
-    /// 自己：LocalPlayer → PlayerController → Pawn → 坐标
-    private let btnSelf = UIButton(type: .system)
-    /// 玩家：GameState → PlayerArray → 每个玩家的 Pawn → 坐标（全场，绕开加密）
-    private let btnPlayers = UIButton(type: .system)
-    /// 内存：读游戏的内存账本（footprint / compressed），不碰游戏内存
-    private let btnMemory = UIButton(type: .system)
-    /// 自动总开关：启动/停止后台状态机。手动按钮**全部保留**，用来和自动模式对照排查。
-    private let btnTracker = UIButton(type: .system)
-    /// 映射：把游戏内存 remap 进我们自己进程，之后本地读（样本的读取方式）
-    private let btnMap = UIButton(type: .system)
-    /// 窗口：样本的建窗体（本地虚拟地址窗口）—— 第一步就是把它建起来并当场自验证
-    private let btnWindow = UIButton(type: .system)
-    /// 枚举：只枚举几个 region 打原始字段，验证 vm_region_64 这个调用本身
-    private let btnEnum = UIButton(type: .system)
     /// XPF：读设备的 kernelcache 并解析 physrw 要用的那批内核符号。
     /// 与「窗口」同类 —— 不要求 pid、不依赖内核读写层，可单独跑。
     private let btnXpf = UIButton(type: .system)
@@ -111,19 +91,18 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
     /// 初始化器跑在 `self` 构造出来之前 —— 引用实例成员会被编译器直接拒掉
     /// （instance member cannot be used on type）。`lazy` 首次被访问时才初始化，
     /// 那时 self 已完全构造，所以能引用任何实例属性，也与声明先后顺序无关。
+    ///
+    /// 只留六个 + 刷新（2026-09-26 精简）。删掉的十一个按钮分两类，都不是"暂时不用"：
+    ///   · 九个走 `MemoryProbe` → `km_read_process`（世界/自己/玩家/对象/枚举/跑一次/
+    ///     映射/窗口/自动）—— 那条读路已经作废：`g_linear_map_valid` 在设备上稳定
+    ///     resolved 成 linear=unresolved，`km_read_process` 入口一律直接失败
+    ///     （KernelMemory.m:1642/2066/2161）。留着它们等于每次上机都要先分辨
+    ///     "这个按钮点了没反应"是坏了还是本来就不通。
+    ///   · 两个是与读内存链无关的孤立功能（崩溃文件 / 内存账本）。
+    /// 【刷新】必须留：`reload()` 调它，而 `reload()` 是 RootViewController:115
+    /// 在面板重现时调的外部入口 —— 删了它编译直接不过。
     private lazy var actionButtons: [(button: UIButton, title: String, action: Selector)] = [
-        (btnWorld, "世界", #selector(onWorld)),
-        (btnSelf, "自己", #selector(onSelf)),
-        (btnPlayers, "玩家", #selector(onPlayers)),
-        (btnAuto, "跑一次", #selector(onAutoRun)),
-        (btnMap, "映射", #selector(onMapProbe)),
-        (btnWindow, "窗口", #selector(onWindowProbe)),
-        (btnEnum, "枚举", #selector(onEnumProbe)),
         (btnRefresh, "刷新", #selector(onRefresh)),
-        (btnObjects, "对象", #selector(onObjects)),
-        (btnCrashFile, "崩溃文件", #selector(onCrashFile)),
-        (btnMemory, "内存", #selector(onMemory)),
-        (btnTracker, "自动", #selector(onTracker)),
         (btnXpf, "XPF", #selector(onXpfProbe)),
         (btnSlide, "Slide", #selector(onSlideProbe)),
         (btnPhysWindow, "建窗", #selector(onPhysWindowProbe)),
@@ -476,7 +455,6 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
             // 服务本来就该继续跑。这里只把回调重新接到**当前**这个实例上 ——
             // 旧视图已经释放，它那些闭包是弱引用，等于空转，新面板会一片空白。
             claimTrackerCallbacks()
-            btnTracker.setTitleColor(accent, for: .normal)
             probeLabel.text = "自动[\(t.state.rawValue)] \(t.detail)"
             return
         }
@@ -514,13 +492,11 @@ final class DebugProcView: UIView, UITableViewDataSource, UITableViewDelegate {
             t.onStatus = nil
             t.onTargets = nil
             t.stop()
-            btnTracker.setTitleColor(warnText, for: .normal)
             probeLabel.text = "自动: 已停止（\(source)）"
             return
         }
         claimTrackerCallbacks()
         t.start()
-        btnTracker.setTitleColor(accent, for: .normal)
         probeLabel.text = "自动: 启动中…（\(source)）"
     }
 
