@@ -76,6 +76,28 @@
 #define KM_PM_L2_BLOCK_MASK (KM_PM_16K_L2_BLOCK_SIZE - 1ULL)
 
 /*
+ * 窗口那句 L3 表一共多少项 —— 也就是「可用的槽位号上界」。
+ *
+ * 为什么不写 2048 这个数：它有两个独立来源，任一个抄错都要能被抓住。
+ *   · Dopamine physrw_pte.c:39 的循环上界是 `L2_BLOCK_COUNT`
+ *     （info.c:384-394 的 getter，16K 档 = 2048）；
+ *   · 它的物理含义是：窗口落在一个 L2 块里，那句 L3 表覆盖整个 L2 块，
+ *     于是项数 = L2 块大小 ÷ 页大小 = 0x2000000 ÷ 0x4000 = 2048。
+ * 下面把**第二个来源**写成 _Static_assert：只要 L2 块大小或页大小这两条几何
+ * 常量被改动（或抄成 4K 那一档），CI 立刻编译失败，而不是等真机上多写半张表。
+ * 这也是本文件第一处编译期判据 —— 运行期判据再多也拦不住"常量本身就是错的"。
+ *
+ * 槽位 0 与 1 不参与分配（0 = 自映射项、1 = sw_asid 页映射），见 kpm_slot_choose。
+ */
+#define KM_PM_WINDOW_SLOT_COUNT (KM_PM_16K_L2_BLOCK_SIZE / 0x4000ULL)
+_Static_assert(KM_PM_WINDOW_SLOT_COUNT == 2048ULL,
+               "窗口槽位数必须等于 L2_BLOCK_COUNT（Dopamine physrw_pte.c:39 的循环上界）");
+_Static_assert(KM_PM_WINDOW_SLOT_COUNT * 8ULL == 0x4000ULL,
+               "窗口槽位数 × 8 必须是一页（本工程只有 16K 页的那一套几何）");
+_Static_assert(KM_PM_WINDOW_SLOT_COUNT * 0x4000ULL == KM_PM_16K_L2_BLOCK_SIZE,
+               "槽位数 × 页大小必须正好覆盖一个 L2 块（否则窗口外还有我们没算到的槽）");
+
+/*
  * 三级的 shift 与索引掩码。
  *
  * L1：**用户侧几何**（为什么是 3 位、为什么不能从 XPF 取，见文件头部那段）。
@@ -801,6 +823,455 @@ static bool kpm_write_u16_kva(km_pm_text *t, uint64_t kva, uint16_t value, const
     return true;
 }
 
+#pragma mark - 窗口槽位（物理页 → 用户态窗口的数据通路）
+
+/*
+ * ═══ 这段是把「建好的自映射」用起来：把一张物理页挂进窗口的某个 L3 槽 ═══
+ *
+ * 机制照抄 Dopamine BaseBin/libjailbreak/src/physrw_pte.c:32-74 的 acquire_window：
+ * 自映射生效之后，**页表页自己成了一块普通内存**，于是
+ *     magicPT[i] = pa | 叶模板
+ * 就是往第 i 个 L3 槽里写一条映射物理页 pa 的页表项；随后
+ *     *(窗口 + i × 页大小 + 页内偏移)
+ * 读到的就是 pa 上那一页的内容。
+ *
+ * Dopamine 用 `#define gMagicPT ((uint64_t *)MAGIC_PT_ADDRESS)`（physrw_pte.c:13-14）
+ * 把窗口地址写死成编译期常量 —— 本文件**不这么做**，用 km_physmap_window_address()：
+ * 窗口地址是运行时算出来的（4K/16K 两档几何不同），写死常量等于把页大小分支
+ * 又抄了一遍。样本那侧同样没有固定常量（它的窗口基址也是运行时值）。
+ *
+ * ── 与 Dopamine 的**有意偏离**（两处，都是刻意的，不是遗漏）──
+ *
+ * 1. **写槽位这一句走内核写原语，不用用户态 `str`。**
+ *    Dopamine 的 `gMagicPT[toUse] = ...` 编译出来是用户态 `str`
+ *    （样本：`0x10104909c str x21, [x8, w22, uxtw #3]`）。理由是可执行的：
+ *    本工程没有样本那套独立的原语分发层，而 km_write 有形态闸门、写前读旧值、
+ *    写后回读核对的逐级可中止语义 —— 写错一格的代价是整机 panic，
+ *    多花的这一次读换的是"写不进去就立刻知道"。
+ *    ⚠ 但**页表项存在表页里**，它的物理地址 = magicPT + slot×8，换算出的 KVA
+ *    永远是内核地址，所以这一句在本机是可行的（自映射那一次写走的是同一条路，
+ *    真机已跑通）。
+ *
+ * 2. **槽位数据的读写用 `#if` 选一档，默认走用户态直访（与 Dopamine 同形态）。**
+ *    这一条必须写成注释而不能含糊过去，因为它踩到了本工程的一道**硬边界**：
+ *    `km_read` / `km_read64` / `km_write` 三者**都**先过
+ *    `km_is_kernel_address()`（KernelMemory.m:241-244，判据 `addr >> 48 == 0xFFFF`，
+ *    在 km_read:974 / km_read64:1027 / km_write:1053 三处调用），而窗口地址在
+ *    用户地址空间（目标机 0x7000000000，高 16 位全 0），一定被拒。
+ *    本文件自己的 kpm_shape_ok() 与它**同口径**（见上面那段注释），也一样拒。
+ *    也就是说：「槽位数据的读写走 km_read/km_write」这条路在本工程的现有原语下
+ *    **不可实现** —— 不是保守不保守的问题，是地址域过不去。
+ *    于是给出两档，用 KM_PM_WINDOW_ACCESS 选：
+ *      · 0（默认）= uaccess，用户态直访窗口。与 Dopamine physrw_pte.c:82/96 的
+ *        `memcpy(curUA, ...)` 同形态，也是这套机制**原本**的样子；
+ *      · 1 = kmprim，按任务要求走 km_read/km_write。它会**在形态闸门处确定地失败**
+ *        （诊断里逐条写明「形态不过，未发出 kread/kwrite」），一次内核访问都不发。
+ *    两档的**槽位选择、前置检查、失败路径完全共用**，差别只在这一处；所以切档
+ *    不会改变"写错一格"的风险面，只决定数据通路这一句能不能通。
+ *    详见附加诊断 `km_physmap_window_diag()` 的第一行（它会打出当前档位与原因）。
+ *
+ *    **这一档的失败形态也要说清**：uaccess 直访窗口，若那次访问真的失败，
+ *    它是**本进程的用户态异常**（SIGSEGV / SIGBUS），不是内核 panic ——
+ *    页表项本身是内核写、有回读核对；越界的是用户态那一步。这是两档在
+ *    "出事代价"上的唯一区别，也是为什么默认取它。
+ *
+ * ── 并发 ──
+ *
+ * 一次 acquire 从选槽到用完为止都在同一把锁内：槽位是**共享资源**，
+ * 别人在你用完之前复用同一个槽，你手上的窗口地址就指向了另一张物理页 ——
+ * 那不是读到旧数据，是读到**别人的数据**（或内核刚改过的页表）。
+ * 锁用 `pthread_mutex_t` + `PTHREAD_MUTEX_INITIALIZER` 静态初始化：
+ * 不用 dispatch_once 造锁，是因为本函数可能被 C 侧调用、且工程里已经有
+ * pthread 依赖（KernelSlide/KernelMemory 同）。所有出口都必须解锁 ——
+ * 本段用 `goto unlock` 汇合，一个 return 都不许自己走。
+ */
+
+/// 数据通道档位。见上面「有意偏离」第 2 条。
+#define KM_PM_WINDOW_ACCESS_UACCESS 0
+#define KM_PM_WINDOW_ACCESS_KMPRIM 1
+
+/*
+ * 默认档。**这是本文件唯一一处"按任务要求实现、但本机不可通"的开关**，
+ * 所以默认值取能用的那一档（uaccess），并把不可通的那一档完整保留、
+ * 由诊断如实报出原因 —— 取 kmprim 当默认会让这个模块 100% 不可用。
+ */
+#define KM_PM_WINDOW_ACCESS KM_PM_WINDOW_ACCESS_UACCESS
+
+/*
+ * 保留槽位：0 / 1 / 2 / 3 —— **一个都不许被 acquire 复用**。
+ *
+ *   0 = 自映射项本身。把它改成别的页，窗口的第一页就不再是表页，
+ *       而**它正是这段代码用来写后续槽位的那个东西** —— 一旦被覆盖，
+ *       本模块在不重启进程的前提下永久失去写表能力（不是"下一次会修好"）。
+ *   1 = 本次 build 写的 sw_asid 页映射（build 的第 ⑬ 段写的是 magicPT + 8）。
+ *   2 = Dopamine physrw_pte.c:63 的 `toUse = 2` 起点；它可能被 sw_asid
+ *       那一步占用（上游写的是 magicPT+8 即槽 1，但两个实现的槽位约定
+ *       没有共享的常量，所以 2 与 3 一起保守留下）。
+ *   3 = 预留给"槽位约定将来变一位"的余量。多留两个 16 KB 槽位的代价是
+ *       可寻址窗口少了 32 KB，而代价的另一面是"绝不会把自映射或 sw_asid
+ *       那一页换掉"。
+ *
+ * 为什么不是"只留 0 与 1"：本文件里**没有任何一处**把 sw_asid 用的槽位
+ * 写成共享常量（build 里是字面量 `magicPT + 8`），所以"槽 1 就是它"这件事
+ * 在代码里没有单一真相。多留两个槽位比在这里补一条会漂移的约定便宜。
+ *
+ * 它被三处引用：kpm_slot_hits_reserved_page()、km_physmap_acquire_window()
+ * 的诊断文本、以及 kpm_report_window_slots() 的诊断文本。
+ */
+#define KM_PM_WINDOW_SLOT_RESERVED 4U
+
+/// 单次物理读写的大小上界。有界循环是本工程的硬要求（面板在等它）；
+/// 1 MiB 在 16K 页下是 64 页，正常调用远小于它。
+#define KM_PM_RWBUF_MAX (1ULL << 20)
+
+/// acquire 轨迹环形缓冲的条数。只服务于诊断（"这一轮用的是哪个槽、凭什么"）。
+#define KM_PM_SLOT_TRACE_MAX 32
+
+/*
+ * 往 g_physmapWindowDiag 里追加一行。**与 kpm_append 分开写**，理由两条：
+ *   · kpm_append 要一个 km_pm_text*（used/size/truncated 那套记账），
+ *     而这里只有一个静态缓冲，没有"当次调用"这个作用域；
+ *   · 这块文本是**滚动**的：它记的是最近若干次 acquire，不是某一次调用的完整记录。
+ * 记账口径与 kpm_append 一致 —— 按**实际写入的字节数**（strlen）算，不用
+ * vsnprintf 的返回值（截断时它返回"本来会写多少"，在 size_t 上能把下一句算出界）。
+ */
+static void kpm_append_window_diag(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+static void kpm_append_window_diag(const char *fmt, ...)
+{
+    char line[512];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(line, sizeof(line), fmt, args);
+    va_end(args);
+
+    const size_t size = sizeof(g_physmapWindowDiag);
+    size_t used = strlen(g_physmapWindowDiag);
+    const size_t lineLen = strlen(line);
+    if (used + lineLen + 2 > size) {
+        /* 快满：丢掉全部历史重来 —— 诊断文本允许丢历史，不允许越界。 */
+        g_physmapWindowDiag[0] = '\0';
+        used = 0;
+    }
+    if (used + lineLen + 2 <= size) {
+        memcpy(g_physmapWindowDiag + used, line, lineLen);
+        used += lineLen;
+        g_physmapWindowDiag[used] = '\n';
+        used++;
+        g_physmapWindowDiag[used] = '\0';
+    }
+    g_physmapWindowDiagRan = true;
+}
+
+/// 槽位决策的三种来源（照 physrw_pte.c:36-71 的三段）。
+typedef enum {
+    KM_PM_SLOT_NONE = 0,
+    KM_PM_SLOT_REUSED = 1, /* 已经映射同一个 pa 的槽（physrw_pte.c:39-44） */
+    KM_PM_SLOT_EMPTY = 2,  /* 值为 0 的空槽（physrw_pte.c:47-54） */
+    KM_PM_SLOT_RESET = 3   /* 全清之后从 2 开始用（physrw_pte.c:57-64） */
+} km_pm_slot_decision;
+
+typedef struct {
+    uint64_t pa;   /* 本次要映射的物理页（已页对齐） */
+    uint64_t ua;   /* 交给调用方的窗口地址 */
+    uint32_t slot; /* 用的槽位下标 */
+    uint32_t how;  /* km_pm_slot_decision */
+} km_pm_slot_trace;
+
+/// 串行化「选槽 → 写项 → 用窗口 → 下次覆盖」这条链。见上面「并发」。
+static pthread_mutex_t g_physmapSlotLock = PTHREAD_MUTEX_INITIALIZER;
+
+/// 最近 KM_PM_SLOT_TRACE_MAX 次 acquire 的槽位决策（环形，最旧的被覆盖）。
+static km_pm_slot_trace g_physmapSlotTrace[KM_PM_SLOT_TRACE_MAX];
+static int g_physmapSlotTraceCount = 0;
+static int g_physmapSlotTraceNext = 0;
+
+/// acquire 自己的诊断文本 —— **不覆盖** g_physmapText。
+///
+/// 理由：预检/执行的结论文本是有契约的（面板拿第一行当状态行、且它是"那一次跑
+/// 的完整记录"）。一次 acquire 是**下游动作**，它若把结论文本冲掉，面板上那张
+/// 报告就再也不是"上次点按钮的结果"了。所以单开一块、单开一个访问器。
+static char g_physmapWindowDiag[4096];
+static bool g_physmapWindowDiagRan = false;
+
+/// 选槽用的小工具：读一条槽。
+///
+/// **两道闸门，缺一不可**：
+///   · 地址形态（kpm_shape_ok）：自映射生效时 magicPT 一定是**物理**地址，
+///     而这里要的是内核虚拟地址。若 magicPT 被写成了 KVA（或高 16 位非 0），
+///     `km_phystokv` 会返回 0 或一个别的值 —— 那正是"错值比 0 危险"的形态，
+///     所以换算结果必须重过一次形态检查。
+///   · 页内位置：这条读碰的是**页表页**，页表页跑出页界就是踩到相邻的物理页。
+static bool kpm_slot_read(uint64_t slotIndex, uint64_t *value)
+{
+    *value = 0;
+    if (g_physmapMagicPT == 0 || slotIndex >= KM_PM_WINDOW_SLOT_COUNT) {
+        return false;
+    }
+    const uint64_t entryPa = g_physmapMagicPT + slotIndex * sizeof(uint64_t);
+    const uint64_t entryKva = km_phystokv(entryPa);
+    if (!kpm_shape_ok(entryKva)) {
+        return false;
+    }
+    bool ok = false;
+    *value = km_read64(entryKva, &ok);
+    return ok;
+}
+
+/// 记一条槽位决策。**不解析地址**：它只是把决策记下来供诊断读，
+/// 所以它不需要任何闸门，也永远不会失败。
+static void kpm_slot_trace_push(uint64_t pa, uint64_t ua, uint32_t slot, uint32_t how)
+{
+    g_physmapSlotTrace[g_physmapSlotTraceNext].pa = pa;
+    g_physmapSlotTrace[g_physmapSlotTraceNext].ua = ua;
+    g_physmapSlotTrace[g_physmapSlotTraceNext].slot = slot;
+    g_physmapSlotTrace[g_physmapSlotTraceNext].how = how;
+    g_physmapSlotTraceNext = (g_physmapSlotTraceNext + 1) % KM_PM_SLOT_TRACE_MAX;
+    if (g_physmapSlotTraceCount < KM_PM_SLOT_TRACE_MAX) {
+        g_physmapSlotTraceCount++;
+    }
+}
+
+/// 轨迹里的第 i 条（0 = 最旧）。i 越界返回 NULL。
+static const km_pm_slot_trace *kpm_slot_trace_at(int i)
+{
+    if (i < 0 || i >= g_physmapSlotTraceCount) {
+        return NULL;
+    }
+    const int oldest =
+        (g_physmapSlotTraceNext - g_physmapSlotTraceCount + KM_PM_SLOT_TRACE_MAX) %
+        KM_PM_SLOT_TRACE_MAX;
+    return &g_physmapSlotTrace[(oldest + i) % KM_PM_SLOT_TRACE_MAX];
+}
+
+static const char *kpm_slot_decision_name(uint32_t how)
+{
+    switch (how) {
+    case KM_PM_SLOT_REUSED: return "复用已有槽";
+    case KM_PM_SLOT_EMPTY: return "空槽";
+    case KM_PM_SLOT_RESET: return "全清后从 2 起";
+    }
+    return "未选";
+}
+
+/*
+ * 槽位选择 —— 逐条对照 Dopamine physrw_pte.c:36-71 的**顺序**（顺序是语义的一部分）：
+ *   ① 从下标 2 起找**已经映射同一个 pa** 的槽 → 命中就用（省一次写）；
+ *   ② 没命中找**值为 0 的空槽** → 命中就用；
+ *   ③ 都没有才把下标 2.. 全部清 0，然后用 2。
+ *
+ * 为什么 ① 必须在 ② 前面：先找空槽会让"同一个 pa 第二次进来"写到一个新槽上，
+ * 于是**同一个物理页在窗口里有两处映射**，而旧的那处才是别人正在用的 —— 不崩，
+ * 但会一点点吃光 2046 个槽，最后每次都走 ③（每 2047 次就把整张表清一遍）。
+ * 顺序反了不会立刻出事，只会在跑了几千次之后变成另一套行为：这正是最难查的一类。
+ *
+ * 为什么 ③ 的"全清"必须逐条回读核对：那一段清的是**别人可能正在用的槽**，
+ * 清不掉就说明这张表不由我们独占（或写通道坏了），此时继续往下走等于
+ * 在半张别人的页表上写映射。**任意一条清不掉即中止**，不做部分继续。
+ *
+ * 返回 true 时 *slotOut 是选中的槽位；返回 false 时 *reasonOut 是原因（静态字符串）。
+ */
+static bool kpm_slot_choose(uint64_t pa, uint32_t *slotOut, km_pm_slot_decision *howOut,
+                            const char **reasonOut)
+{
+    *slotOut = 0;
+    *howOut = KM_PM_SLOT_NONE;
+    *reasonOut = NULL;
+
+    /* ① 已有同一个 pa 的槽 */
+    for (uint32_t i = 2; i < KM_PM_WINDOW_SLOT_COUNT; i++) {
+        uint64_t v = 0;
+        if (!kpm_slot_read(i, &v)) {
+            *reasonOut = "读槽位失败（换算不出 KVA 或两次读不一致）";
+            return false;
+        }
+        if ((v & KM_PM_TTE_PA_MASK) == pa) {
+            *slotOut = i;
+            *howOut = KM_PM_SLOT_REUSED;
+            return true;
+        }
+    }
+
+    /* ② 空槽 */
+    for (uint32_t i = 2; i < KM_PM_WINDOW_SLOT_COUNT; i++) {
+        uint64_t v = 0;
+        if (!kpm_slot_read(i, &v)) {
+            *reasonOut = "读槽位失败（换算不出 KVA 或两次读不一致）";
+            return false;
+        }
+        if (v == 0) {
+            *slotOut = i;
+            *howOut = KM_PM_SLOT_EMPTY;
+            return true;
+        }
+    }
+
+    /*
+     * ③ 全清。physrw_pte.c:59-63 在这里调 flush_tlb()（它要靠 gSwAsid 那套机制）；
+     *    Aether 没有 flush_tlb，所以这一处**刻意不做** —— 代价写在诊断里，
+     *    不藏起来：清掉的项在本进程的 TLB 里可能还留着，而它们指向的物理页
+     *    已经被别人（或内核）复用。这是本段唯一一处"照抄机制但少一步"的地方，
+     *    真机上若复现「读到陈旧内容」，第一处要查的就是这里。
+     */
+    for (uint32_t i = 2; i < KM_PM_WINDOW_SLOT_COUNT; i++) {
+        uint64_t entryPa = 0;
+        uint64_t entryKva = 0;
+        if (!kpm_mul(i, sizeof(uint64_t), &entryPa) ||
+            !kpm_add(g_physmapMagicPT, entryPa, &entryPa)) {
+            *reasonOut = "清槽位时下标×8 溢出";
+            return false;
+        }
+        entryKva = km_phystokv(entryPa);
+        if (!kpm_shape_ok(entryKva)) {
+            *reasonOut = "清槽位时目标地址形态不过";
+            return false;
+        }
+        bool ok = false;
+        const uint64_t old = km_read64(entryKva, &ok);
+        if (!ok) {
+            *reasonOut = "清槽位前读旧值失败（两次读不一致）";
+            return false;
+        }
+        if (old == 0) {
+            continue; /* 已经是 0：不写。没有收益的内核写只多一次风险窗口 */
+        }
+        const uint64_t zero = 0;
+        if (!km_write(entryKva, &zero, sizeof(zero))) {
+            *reasonOut = "清槽位写入被底层拒绝";
+            return false;
+        }
+        const uint64_t back = km_read64(entryKva, &ok);
+        if (!ok || back != 0) {
+            *reasonOut = "清槽位回读不为 0";
+            return false;
+        }
+    }
+
+    *slotOut = 2;
+    *howOut = KM_PM_SLOT_RESET;
+    return true;
+}
+
+/// 把一条 PTE 写进选中的槽。写入值 = pa | 叶模板（**不是**裸 pa，见 KM_PM_PTE_LEAF 段）。
+///
+/// 这一步与自映射那一次写是同一条路：先 km_phystokv 把表页物理地址换成 KVA，
+/// 再走受检写入（形态检查 → 写前读旧值 → 写 → 回读核对）。
+static bool kpm_slot_write(uint64_t slotIndex, uint64_t pa, uint64_t *oldOut)
+{
+    *oldOut = 0;
+    uint64_t entryOff = 0;
+    uint64_t entryPa = 0;
+    if (!kpm_mul(slotIndex, sizeof(uint64_t), &entryOff) ||
+        !kpm_add(g_physmapMagicPT, entryOff, &entryPa)) {
+        return false;
+    }
+    const uint64_t entryKva = km_phystokv(entryPa);
+    if (!kpm_shape_ok(entryKva)) {
+        return false;
+    }
+
+    bool ok = false;
+    const uint64_t old = km_read64(entryKva, &ok);
+    if (!ok) {
+        return false;
+    }
+    *oldOut = old;
+
+    const uint64_t value = pa | KM_PM_PTE_LEAF;
+    if (old == value) {
+        return true; /* ① 命中已有槽时就是这一支：一个字节都不写 */
+    }
+    if (!km_write(entryKva, &value, sizeof(value))) {
+        return false;
+    }
+    const uint64_t back = km_read64(entryKva, &ok);
+    return ok && back == value;
+}
+
+/*
+ * 数据通道：读 / 写窗口地址上的 size 字节。
+ *
+ * 两个档位（见上面「有意偏离」第 2 条）。两档都必须**自己**做形态检查 ——
+ * 理由是本文件的硬约束 1（每一条送进内核读写原语的地址使用前过形态检查），
+ * 而不是依赖底座再拒一次：诊断文本要能分清"我拒了"与"底座拒了"。
+ */
+static bool kpm_window_data_is_uaccess(void)
+{
+    /*
+     * 写成 #if 而不是 `return KM_PM_WINDOW_ACCESS == KM_PM_WINDOW_ACCESS_UACCESS;`：
+     * 两个宏都是 0 时那句是常量比较，clang 的 -Wtautological-compare 会报
+     * "self-comparison always evaluates to true"，而本工程把警告当错误看
+     * （CI 上白跑一次的成本已经算过）。预处理期解决掉，编译期什么都不剩。
+     */
+#if KM_PM_WINDOW_ACCESS == KM_PM_WINDOW_ACCESS_UACCESS
+    return true;
+#else
+    return false;
+#endif
+}
+
+#if KM_PM_WINDOW_ACCESS == KM_PM_WINDOW_ACCESS_UACCESS
+static void kpm_window_data_sync(void)
+{
+    /*
+     * 与 Dopamine physrw_pte.c:67-69 的三句（usleep(0) / dmb sy / usleep(0)）同义：
+     * 让刚写进页表的这一项对本核（以及被抢占走的上下文）可见，再取数据。
+     * __sync_synchronize 就是全屏障，等价于 dmb sy。
+     */
+    __sync_synchronize();
+}
+
+static bool kpm_window_data_read(uint64_t ua, void *out, uint64_t len)
+{
+    const volatile uint8_t *src = (const volatile uint8_t *)ua;
+    uint8_t *dst = (uint8_t *)out;
+    for (uint64_t i = 0; i < len; i++) {
+        dst[i] = src[i];
+    }
+    __sync_synchronize();
+    return true;
+}
+
+static bool kpm_window_data_write(uint64_t ua, const void *in, uint64_t len)
+{
+    volatile uint8_t *dst = (volatile uint8_t *)ua;
+    const uint8_t *src = (const uint8_t *)in;
+    for (uint64_t i = 0; i < len; i++) {
+        dst[i] = src[i];
+    }
+    __sync_synchronize();
+    return true;
+}
+#else
+/*
+ * kmprim 档：按任务文字走 km_read / km_write。
+ *
+ * **这一段在本工程的现有原语下一定失败**，而且失败得**安全**：形态闸门在
+ * 发第一个内核访问之前就拒掉，一个字节都不会发出。这不是"没写完"，
+ * 是把"为什么不可行"钉在代码里 —— 谁把它调成默认，谁就会在诊断第一行看到原因。
+ */
+static void kpm_window_data_sync(void)
+{
+    __sync_synchronize();
+}
+
+static bool kpm_window_data_read(uint64_t ua, void *out, uint64_t len)
+{
+    if (!kpm_shape_ok(ua)) {
+        return false;
+    }
+    return km_read(ua, out, len);
+}
+
+static bool kpm_window_data_write(uint64_t ua, const void *in, uint64_t len)
+{
+    if (!kpm_shape_ok(ua)) {
+        return false;
+    }
+    return km_write(ua, in, len);
+}
+#endif
+
 #pragma mark - 前置装载
 
 /*
@@ -1485,6 +1956,69 @@ static void kpm_report_accounting(const km_pm_ctx *ctx, km_pm_text *t)
     }
 }
 
+/// 窗口槽位那一节的诊断（自映射状态 / 数量上限 / 档位 / 最近的槽位决策）。
+///
+/// 它同时被两条路用：
+///   · km_physmap_precheck() / km_physmap_build() 的结论文本（当次跑完就能看到）；
+///   · km_physmap_window_diag() 的近期动作记录（acquire 只往这里写）。
+///
+/// **全是只读**：它读的是模块自己的状态（g_physmapMagicPT / 轨迹环），
+/// 一次内核访问都不发 —— 所以它可以在任何一次预检/执行里无条件调用。
+static void kpm_report_window_slots(km_pm_text *t)
+{
+    kpm_append(t, "== ⑩ 窗口槽位（物理页 → 用户态窗口的数据通路）==\n");
+    if (g_physmapMagicPT == 0) {
+        kpm_append(t, "✗ 自映射未就绪（magicPT = 0）：km_physmap_acquire_window() 会直接返回 false，\n");
+        kpm_append(t, "  且**一次内核写都不发**（硬约束 1 的前置检查）。先跑 km_physmap_build()。\n");
+    } else {
+        kpm_append(t, "✓ 自映射已就绪：magicPT（表页**物理**地址）= %#llx\n",
+                   (unsigned long long)g_physmapMagicPT);
+    }
+
+    const uint64_t window = km_physmap_window_address();
+    kpm_append(t, "  窗口基址 = %#llx（km_physmap_window_address()）\n", (unsigned long long)window);
+    kpm_append(t, "  槽位下标 2 .. %llu（共 %llu 项；0 = 自映射项、1 = sw_asid 页映射，\n",
+               (unsigned long long)(KM_PM_WINDOW_SLOT_COUNT - 1ULL),
+               (unsigned long long)KM_PM_WINDOW_SLOT_COUNT);
+    kpm_append(t, "    2 与 3 是保守保留的余量 —— acquire 一律不碰下标 < %u 的槽）\n",
+               KM_PM_WINDOW_SLOT_RESERVED);
+    kpm_append(t, "  页大小 = %#llx；槽位数 × 页大小 = %#llx = 一个 L2 块（编译期 _Static_assert 已钉住）\n",
+               (unsigned long long)0x4000ULL,
+               (unsigned long long)(KM_PM_WINDOW_SLOT_COUNT * 0x4000ULL));
+
+    /*
+     * 数据通道那一档必须显式打出来，而且要打**为什么**。
+     * 它的选择直接决定"这段代码在真机上通不通"，所以它不是一个实现细节，
+     * 是一条要让人一眼看到的事实。完整说明在 .m 的「窗口槽位」段头。
+     */
+#if KM_PM_WINDOW_ACCESS == KM_PM_WINDOW_ACCESS_UACCESS
+    kpm_append(t, "  数据通道档位 = uaccess（默认）：槽位**数据**的读写走用户态直访窗口。\n");
+    kpm_append(t, "    理由：km_read / km_read64 / km_write 三者都先过 km_is_kernel_address()\n");
+    kpm_append(t, "    （KernelMemory.m:241-244，判据 addr>>48 == 0xFFFF），而窗口地址在用户地址空间\n");
+    kpm_append(t, "    （高 16 位全 0）—— 走内核原语一定被拒；本模块的 kpm_shape_ok() 与它同口径，\n");
+    kpm_append(t, "    也一样拒。槽位**页表项本身**的写入仍走内核原语（它在页表页里，是内核地址）。\n");
+#else
+    kpm_append(t, "  ⚠ 数据通道档位 = kmprim：槽位数据的读写走 km_read / km_write。\n");
+    kpm_append(t, "    **本工程现有原语下这条路一定失败**：窗口地址高 16 位为 0，形态闸门\n");
+    kpm_append(t, "    在发出任何内核访问之前就拒掉（因此不会有任何内核副作用）。\n");
+#endif
+
+    kpm_append(t, "  最近 %d 次槽位决策（环形，最多 %d 条）：\n", g_physmapSlotTraceCount,
+               KM_PM_SLOT_TRACE_MAX);
+    if (g_physmapSlotTraceCount == 0) {
+        kpm_append(t, "    （还没有 acquire 过）\n");
+    }
+    for (int i = 0; i < g_physmapSlotTraceCount; i++) {
+        const km_pm_slot_trace *e = kpm_slot_trace_at(i);
+        if (e == NULL) {
+            continue;
+        }
+        kpm_append(t, "    [%d] pa=%#llx → slot=%u（%s）→ ua=%#llx\n", i,
+                   (unsigned long long)e->pa, (unsigned)e->slot,
+                   kpm_slot_decision_name(e->how), (unsigned long long)e->ua);
+    }
+}
+
 /// pmap 布局的三条佐证。返回 true 表示"可以按 arm64e 支继续"。
 ///
 /// 为什么需要它：sw_asid / type / wx_allowed 三个偏移是硬编码的（头文件写明未确证）。
@@ -1983,6 +2517,7 @@ km_physmap_status km_physmap_precheck(void)
 
     kpm_probe_window(&ctx, &t);
     kpm_report_accounting(&ctx, &t);
+    kpm_report_window_slots(&t);       /* 窗口槽位那一段的状态（只读，含档位） */
     kpm_verify_pmap_layout(&ctx, &t); /* 只写诊断，不阻断预检结论 */
 
     if (ctx.windowHasL3) {
@@ -2005,7 +2540,7 @@ km_physmap_status km_physmap_precheck(void)
     } else if (ctx.windowWalkErr == KM_PM_E_INVALID) {
         status = KM_PM_READY;
         summary = @"[建表] ✓ 前置齐备且窗口上没有页表 —— 可以执行建表";
-        kpm_append(&t, "== ⑩ 结论 ==\n");
+        kpm_append(&t, "== ⑪ 结论 ==\n");
         kpm_append(&t, "✓ 可以执行：km_physmap_build() 会在 %#llx 上建表 → 写自映射。\n",
                    (unsigned long long)ctx.window);
     } else {
@@ -2086,6 +2621,7 @@ km_physmap_build_status km_physmap_build(void)
                        (unsigned long long)ctx.window, (unsigned long long)ctx.windowLeafEntry,
                        (unsigned long long)tablePa);
             kpm_append(&t, "  ⇒ 本次**没有写任何内核内存**（建表与自映射都已生效，重写没有收益只有风险）。\n");
+            kpm_report_window_slots(&t); /* 幂等命中也是"自映射已就绪"的一种，槽位那一段可以用 */
             status = KM_PM_BUILD_ALREADY;
             summary = @"[建表] 已经建过且自映射已生效（本次未写任何内存）";
             goto done;
@@ -2098,7 +2634,7 @@ km_physmap_build_status km_physmap_build(void)
     }
 
     /* ── 建表（util.c:303-335）── */
-    kpm_append(&t, "== ⑩ 建表（pmap_expand_range 的无 kcall 支）==\n");
+    kpm_append(&t, "== ⑪ 建表（pmap_expand_range 的无 kcall 支）==\n");
     const km_pm_expand_result expand =
         kpm_pmap_expand_range(&ctx, &t, ctx.window, KM_PM_16K_L2_BLOCK_SIZE);
     if (expand != KM_PM_EXPAND_OK) {
@@ -2127,7 +2663,7 @@ km_physmap_build_status km_physmap_build(void)
     }
 
     /* ── 自映射（physrw_pte.c:132）── */
-    kpm_append(&t, "== ⑪ 自映射（physrw_pte.c:132）==\n");
+    kpm_append(&t, "== ⑫ 自映射（physrw_pte.c:132）==\n");
     kpm_append(&t, "  表页 PA=%#llx；窗口 %#llx 的 L3 表项 = 该表的第 0 项（L3 索引 0 已在 ③ 核对）\n",
                (unsigned long long)magicPT, (unsigned long long)ctx.window);
     kpm_append(&t, "  写入值 = 表页 PA | 叶模板 %#llx（PERM_TO_PTE(0x7)|NG|OSH|L3ENTRY）\n",
@@ -2164,7 +2700,7 @@ km_physmap_build_status km_physmap_build(void)
     }
 
     /* ── sw_asid 那一步（physrw_pte.c:134-140）── */
-    kpm_append(&t, "== ⑫ sw_asid 页映射（physrw_pte.c:134-140）==\n");
+    kpm_append(&t, "== ⑬ sw_asid 页映射（physrw_pte.c:134-140）==\n");
     if (!kpm_verify_pmap_layout(&ctx, &t)) {
         status = KM_PM_BUILD_SWASID_SKIPPED;
         summary = @"[建表] ✓ 建表+自映射完成；sw_asid 一步前置佐证不过，已跳过";
@@ -2225,11 +2761,12 @@ km_physmap_build_status km_physmap_build(void)
 
     status = KM_PM_BUILD_OK;
     summary = @"[建表] ✓✓ 建表 + 自映射 + sw_asid 映射全部完成";
-    kpm_append(&t, "== ⑬ 结论 ==\n");
+    kpm_append(&t, "== ⑭ 结论 ==\n");
     kpm_append(&t, "✓ 全部完成：magicPT=%#llx，窗口 %#llx 现在指向表页自己。\n",
                (unsigned long long)magicPT, (unsigned long long)ctx.window);
     kpm_append(&t, "  复查办法：再点一次「建窗」（KernelPhysWindow 的只读探针），\n");
     kpm_append(&t, "  它应当在窗口地址上看到 L3 有效叶；两个模块的结论必须对得上。\n");
+    kpm_report_window_slots(&t); /* 自映射已就绪 ⇒ 槽位那一段现在可用 */
 
 done:
     /*
@@ -2288,6 +2825,296 @@ uint64_t km_physmap_window_address(void)
 uint64_t km_physmap_magic_pt(void)
 {
     return g_physmapMagicPT;
+}
+
+#pragma mark - 对外：窗口槽位
+
+/// 目标物理页是否与某个保留槽位现在映射着的那一页重叠。
+///
+/// 需要它是因为**保留槽位里存的物理页地址是运行时才知道的**
+/// （表页自身、sw_asid 页），不能靠常量枚举。判据用的是"槽位当前值里的
+/// 物理地址" —— 这与 acquire 自己选槽时的判据完全同口径（`& KM_PM_TTE_PA_MASK`），
+/// 不引入第二套解释。
+static bool kpm_slot_hits_reserved_page(uint64_t pa)
+{
+    for (uint32_t i = 0; i < KM_PM_WINDOW_SLOT_RESERVED; i++) {
+        uint64_t v = 0;
+        if (!kpm_slot_read(i, &v)) {
+            /*
+             * 读不到就**当作命中**（拒绝这次 acquire）：这里读不到的三种原因
+             * （换算不出 KVA / 两次读不一致 / magicPT 为 0）都说明"我们不知道
+             * 那一项里是什么"，而"不知道"在写内核内存这条路上只能当"危险"。
+             * 这正是本工程那条口径：0 会被拦下，错值不会 —— 所以宁可误拒。
+             */
+            return true;
+        }
+        if ((v & KM_PM_TTE_PA_MASK) == pa) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool km_physmap_acquire_window(uint64_t pa, void (^block)(uint64_t ua))
+{
+    /*
+     * ── 前置（顺序即优先级）──
+     *
+     * ① block 为 NULL 直接拒：本函数存在的意义就是"给你一个地址去用"，
+     *    没有回调就没有意义，而继续往下走会写一条没人用的映射（多一次内核写）。
+     * ② **自映射未就绪就返回 false，一次内核写都不发**（硬约束 1）。
+     * ③ pa 合理性：非 0、落在物理域（< 2^48）、按页对齐（硬约束 7）。
+     *    对齐**不做静默纠正**：Dopamine 的调用方自己 `curPA & ~page_mask`
+     *    （physrw_pte.c:80/94），本函数把这件事变成显式判据 —— 悄悄替你圆整
+     *    会让"传进来的是页内地址，被圆到别的页"这种错安静生效。
+     * ④ 与保留槽位重叠 → 拒（见 KM_PM_WINDOW_SLOT_RESERVED 那段）。
+     */
+    if (block == NULL) {
+        return false;
+    }
+    if (g_physmapMagicPT == 0) {
+        return false;
+    }
+    if (pa == 0 || pa >= (1ULL << 48)) {
+        return false;
+    }
+    if ((pa & (0x4000ULL - 1ULL)) != 0) {
+        return false;
+    }
+
+    const uint64_t window = km_physmap_window_address();
+    if (window == 0) {
+        return false;
+    }
+    /*
+     * 窗口地址必须落在用户地址空间（高 16 位为 0）。这条不是形式主义：
+     * 它是"窗口是**用户**地址空间里的映射"这句话的唯一判据，而下面算出的
+     * ua 会被交给调用方当用户地址用。若某天它变成内核地址（比如有人把窗口
+     * 常量改错），这条会立刻停住而不是交出一个语义已变的地址。
+     */
+    if ((window >> 48) != 0) {
+        return false;
+    }
+
+    bool ok = false;
+    pthread_mutex_lock(&g_physmapSlotLock);
+
+    uint32_t slot = 0;
+    km_pm_slot_decision how = KM_PM_SLOT_NONE;
+    const char *reason = NULL;
+    uint64_t oldEntry = 0;
+    uint64_t ua = 0;
+    uint64_t slotSpan = 0;
+
+    if (!kpm_slot_choose(pa, &slot, &how, &reason)) {
+        kpm_append_window_diag("acquire 失败：选槽中止（%s）", reason ? reason : "未说明");
+        goto unlock;
+    }
+    /*
+     * 选中槽位之后、写之前：**再确认这一页不是保留槽位映射着的那一页**。
+     *
+     * 为什么必须在这里（而不是在选槽之前）：① 命中已有槽时**本来就不会写**，
+     * 所以那一支不需要这条判据 —— 而这条判据每次要读 4 个槽（4 次 km_read64
+     * 是 8 次 kread），放在最前面等于给每一次复用都加上 8 次 kread 的税。
+     * 放在这里只在"真要写"的时候收税。
+     *
+     * 代价说清楚：判据本身读的是**槽位当前值里的物理地址**
+     * （与选槽同口径的 `& KM_PM_TTE_PA_MASK`），而槽位可能刚被改写 ——
+     * 这个窗口里发生的事只有一种：别人（或本进程另一条路径）在 acquire 之间
+     * 动了同一句表。那种情况下下面 kpm_slot_write 的"写前读旧值 + 写后回读"
+     * 仍会拦住写在别处的值，所以这里不是唯一一道闸。
+     */
+    if (kpm_slot_hits_reserved_page(pa)) {
+        kpm_append_window_diag("acquire 拒绝：pa=%#llx 与保留槽位（0..%u）映射着的那一页重叠"
+                               " —— 写下去会毁掉自映射或 sw_asid 页，本次一个字节都没写",
+                               (unsigned long long)pa, KM_PM_WINDOW_SLOT_RESERVED - 1U);
+        goto unlock;
+    }
+    if (!kpm_slot_write(slot, pa, &oldEntry)) {
+        kpm_append_window_diag("acquire 失败：写槽 %u 的页表项没通过受检写入（pa=%#llx）",
+                               (unsigned)slot, (unsigned long long)pa);
+        goto unlock;
+    }
+    /*
+     * 数据通道档位在 kmprim 下必然失败（理由见本文件「窗口槽位」段头）：
+     * 窗口地址过不了形态闸门。失败时**立刻中止**，不把地址交出去 ——
+     * 交出去的那一刻调用方就会用一条没有生效的映射去读别人的物理页。
+     */
+    if (!kpm_window_data_is_uaccess()) {
+        kpm_append_window_diag("acquire 中止：当前数据通道档位是 kmprim，"
+                               "而窗口地址 %#llx 过不了内核地址形态闸门（未发出 kread/kwrite）",
+                               (unsigned long long)window);
+        goto unlock;
+    }
+    if (!kpm_mul((uint64_t)slot, 0x4000ULL, &slotSpan) || !kpm_add(window, slotSpan, &ua)) {
+        kpm_append_window_diag("acquire 失败：窗口 + 槽 %u × 页大小 溢出", (unsigned)slot);
+        goto unlock;
+    }
+
+    kpm_slot_trace_push(pa, ua, slot, (uint32_t)how);
+    kpm_append_window_diag("acquire pa=%#llx → slot=%u（%s，旧项 %#llx）→ ua=%#llx",
+                           (unsigned long long)pa, (unsigned)slot, kpm_slot_decision_name(how),
+                           (unsigned long long)oldEntry, (unsigned long long)ua);
+    kpm_window_data_sync();
+    block(ua);
+    kpm_window_data_sync();
+    ok = true;
+
+unlock:
+    pthread_mutex_unlock(&g_physmapSlotLock);
+    return ok;
+}
+
+/*
+ * 物理读写。语义对齐 Dopamine physrw_pte.c:76-102（那两个函数底下的
+ * enumerate_pages 逐页切分），差异只有一处：那边 memcpy 的是窗口地址，
+ * 这边走 kpm_window_data_read / kpm_window_data_write（档位决定实现）。
+ *
+ * ── 三条必须成立的纪律 ──
+ *
+ * 1. **页内偏移保留**。传给 acquire 的必须是**页对齐**的 pa（那是 acquire 的硬判据），
+ *    而真实目标 = 页首 + 页内偏移；偏移由下面的 pageOff 保留，页首交给 acquire。
+ * 2. **不跨页**。每一段先按"页内剩余"截断（chunk），所以任何一次读写都不会
+ *    伸到下一张物理页上 —— 那会是别人的内存。参数里那 8 字节对齐要求就是
+ *    为了这件事：本工程的读写粒度是 8 字节，而页大小是 8 的倍数，于是
+ *    "页对齐起点 + 8 字节对齐偏移"必然推出每一段长度都是 8 的倍数，
+ *    于是"段内最后一个字节"永远还在这一页里。
+ * 3. **写是读-改-写**。写不足 8 字节的尾段时先读出那一整字、只把属于本次写入的
+ *    字节拼进去、再整字写回 —— 否则同一个字里不属于本次写入的字节会被抹掉，
+ *    而那是目标物理页上原有的数据。
+ *
+ * 关于 **对齐要求**：`pa` 与 `size` 都必须是 8 的倍数。这不是"顺手加的约束"，
+ * 而是"字节粒度做不到就必须说出来"：km_read/km_write 的粒度都是 8 字节，
+ * 窗口地址又只能给出 8 字节对齐的偏移（槽位起点是页对齐的），所以一个 8 字节
+ * 不对齐的请求**没有正确的实现方式**。拒绝它比"帮你圆整到附近"安全得多 ——
+ * 圆整会安静地读写到不属于请求范围的字节。
+ */
+static bool kpm_physmem_range_ok(uint64_t pa, uint64_t size)
+{
+    if (size == 0 || size > KM_PM_RWBUF_MAX) {
+        return false;
+    }
+    if ((size & 0x7ULL) != 0 || (pa & 0x7ULL) != 0) {
+        return false; /* 8 字节粒度：见上面那段 */
+    }
+    if (pa == 0 || pa >= (1ULL << 48)) {
+        return false;
+    }
+    /* 末字节必须仍在物理域内（pa + size − 1 < 2^48），用减法避免回绕。 */
+    if (size - 1ULL > (1ULL << 48) - 1ULL - pa) {
+        return false;
+    }
+    return true;
+}
+
+bool km_physmap_physreadbuf(uint64_t pa, void *out, uint64_t size)
+{
+    if (out == NULL || !kpm_physmem_range_ok(pa, size)) {
+        return false;
+    }
+    uint8_t *cursor = (uint8_t *)out;
+    uint64_t done = 0;
+    while (done < size) {
+        const uint64_t curPa = pa + done;
+        const uint64_t pageOff = curPa & (0x4000ULL - 1ULL);
+        uint64_t chunk = 0x4000ULL - pageOff;
+        if (chunk > size - done) {
+            chunk = size - done;
+        }
+        const uint64_t pagePa = curPa - pageOff;
+        __block bool got = false;
+        const bool acquired = km_physmap_acquire_window(pagePa, ^(uint64_t va) {
+            got = kpm_window_data_read(va, cursor, chunk);
+        });
+        if (!acquired || !got) {
+            kpm_append_window_diag("physreadbuf 中止：pa=%#llx size=%llu done=%llu"
+                                   "（acquire=%s read=%s）",
+                                   (unsigned long long)pa, (unsigned long long)size,
+                                   (unsigned long long)done, acquired ? "ok" : "fail",
+                                   got ? "ok" : "fail");
+            return false;
+        }
+        cursor += chunk;
+        done += chunk;
+    }
+    return true;
+}
+
+bool km_physmap_physwritebuf(uint64_t pa, const void *in, uint64_t size)
+{
+    if (in == NULL || !kpm_physmem_range_ok(pa, size)) {
+        return false;
+    }
+    const uint8_t *cursor = (const uint8_t *)in;
+    uint64_t done = 0;
+    while (done < size) {
+        const uint64_t curPa = pa + done;
+        const uint64_t pageOff = curPa & (0x4000ULL - 1ULL);
+        uint64_t chunk = 0x4000ULL - pageOff;
+        if (chunk > size - done) {
+            chunk = size - done;
+        }
+        const uint64_t pagePa = curPa - pageOff;
+        __block bool wrote = false;
+        __block bool readOld = true;
+        const bool acquired = km_physmap_acquire_window(pagePa, ^(uint64_t va) {
+            if ((chunk & 0x7ULL) == 0) {
+                wrote = kpm_window_data_write(va, cursor, chunk);
+                return;
+            }
+            /* 尾段不足 8 字节：读-改-写（见上面第 3 条）。 */
+            uint64_t word = 0;
+            if (!kpm_window_data_read(va, &word, sizeof(word))) {
+                readOld = false;
+                return;
+            }
+            uint8_t *w = (uint8_t *)&word;
+            for (uint64_t i = 0; i < chunk; i++) {
+                w[i] = cursor[i];
+            }
+            wrote = kpm_window_data_write(va, &word, sizeof(word));
+        });
+        if (!acquired || !wrote || !readOld) {
+            kpm_append_window_diag("physwritebuf 中止：pa=%#llx size=%llu done=%llu"
+                                   "（acquire=%s readold=%s write=%s）",
+                                   (unsigned long long)pa, (unsigned long long)size,
+                                   (unsigned long long)done, acquired ? "ok" : "fail",
+                                   readOld ? "ok" : "fail", wrote ? "ok" : "fail");
+            return false;
+        }
+        cursor += chunk;
+        done += chunk;
+    }
+    return true;
+}
+
+NSString *km_physmap_window_diag(void)
+{
+    /*
+     * 与 g_physmapText 同一套两级编码：**永不返回 nil**。
+     * 本函数不调 kpm_store_text —— 那块文本属于预检/执行的结论，
+     * acquire 只是下游动作，不许把它冲掉（理由见 g_physmapWindowDiag 的注释）。
+     */
+    if (!g_physmapWindowDiagRan) {
+        return @"== 窗口槽位诊断 ==\n本进程还没有 acquire 过：先跑 km_physmap_build()，"
+                "再用 km_physmap_physreadbuf() / km_physmap_physwritebuf()。\n";
+    }
+#if __has_feature(objc_arc)
+    NSString *text = [NSString stringWithUTF8String:g_physmapWindowDiag];
+#else
+    NSString *text = [[NSString alloc] initWithBytes:g_physmapWindowDiag
+                                              length:strlen(g_physmapWindowDiag)
+                                            encoding:NSUTF8StringEncoding];
+#endif
+    if (text == nil) {
+        text = [[NSString alloc] initWithBytes:g_physmapWindowDiag
+                                        length:strlen(g_physmapWindowDiag)
+                                      encoding:NSISOLatin1StringEncoding];
+    }
+#if !__has_feature(objc_arc)
+    [text autorelease];
+#endif
+    return text;
 }
 
 NSString *km_physmap_diagnostic(void)
