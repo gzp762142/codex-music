@@ -51,6 +51,7 @@
 #include <stdlib.h>              /* malloc/free：异步落盘的内容要在堆上带过去 */
 #include <string.h>
 #include <sys/qos.h>             /* QOS_CLASS_USER_INITIATED：不指望 dispatch 头转引它 */
+#include <sys/sysctl.h>          /* sysctlbyname("hw.memsize")：⑦ 对账用的那个权威值 */
 #include <time.h>                /* clock_gettime：等落盘写完的那个上限 */
 #include <unistd.h>
 
@@ -1916,6 +1917,115 @@ static bool slide_read_bases(uint64_t slide, km_slide_run *run, km_slide_text *t
     return true;
 }
 
+/*
+ * ── ⑦ 之后、下一次下读之前的那道对账门：用 hw.memsize 判「slide 是错的」──────────
+ *
+ * 判据只有一条，但它用的两个量来自**两个互相独立的世界**：
+ *   · physSize  —— 内核里的 gPhysSize，读它的地址是「符号链接期地址 + slide」
+ *                  （slide_read_bases 里那句 `const uint64_t addr = symbol + slide;`）；
+ *   · hw.memsize —— 用户态 sysctl，设备真实物理内存大小，与 slide、与内核怎么摆无关。
+ * slide 一错，前者的地址就不是 gPhysSize 这个变量，读回来的值**不可能**等于真实
+ * 内存大小；于是"两者不等"直接等价于一句话结论：**这个 slide 是错的**。
+ *
+ * ── 为什么这条对账是零风险的（这是它敢当门闸的唯一理由）──
+ * 它只做两件事：一次 sysctlbyname("hw.memsize")（纯用户态，不碰内核内存），
+ * 加一次**已经读到**的值（run->physSize 由上一行的 slide_read_bases 读回来）。
+ * 本函数自己**一次 kread 都不发**，也不去读任何候选地址 —— 所以无论判成通过还是
+ * 拒绝，它都不给这条链增加一次内核读。反过来，拒绝即终止，从这里往下的
+ * ptov_table 8 项读、锚点校验的符号读、PA→KVA 抽样换算**本次一个都不发**。
+ *
+ * ── 这道门的边界（别把它读强，三条都要记住）──
+ *   · 它拦的是"slide 错得足够离谱、以致 physSize 读到了别处"这一类。若错的 slide
+ *     恰好让「符号 + slide」落在一段仍然映射的内存上、且那里的值在数值上等于内存
+ *     大小（概率极低但非零），本门放行 —— 它是筛查，不是证明。
+ *   · 它**不能**替代自检：即使 physSize 对上了，kernel_base 处是不是 Mach-O 头
+ *     仍然要靠 slide_verify_kernel_base 的页首两字强判据确认。对账通过只说
+ *     "这个 slide 让 gPhysSize 读到了内存大小"，与自检回答的**不是**同一个问题。
+ *   · 它**拦不住自检那一次 kread**，而且这一点由数据依赖决定、不是摆放问题：
+ *     读 physSize 必须先有已采信的 slide，而 slide 要到自检通过才被采信
+ *     （slide_run_find_slide 末尾才赋值 run->slide），两者互为前提。所以在"三基准
+ *     已读"与"尚未自检"之间**不存在**可以放门的窗口 —— 本门只能落在自检之后。
+ *     想让对账发生在自检之前，唯一办法是把三基准的读提到候选阶段（用尚未验证的
+ *     candidate 拼地址、读 3 个 64 位标量）：那等于把 3 次内核读打在未验证地址上，
+ *     本门"不新增任何内核读"的性质当场丢掉，所以没有那样做。
+ *
+ * ── 失败语义（三档，逐档都能从诊断里一眼认出）──
+ *   · hw.memsize 取不到（sysctl 调用失败，或它写回的长度不是 8 字节）⇒ **不拒绝**：
+ *     内存大小拿不到说明不了 physSize 错，为了这一条停掉整条链是拿错误的理由中止；
+ *   · physSize == 0 ⇒ 拒绝：gPhysSize 没读到（或符号取不到），兜底公式的除数没了；
+ *   · physSize != hw.memsize ⇒ 拒绝，并把差值（及方向）打出来。
+ */
+static bool slide_physsize_matches_memsize(uint64_t physSize, km_slide_text *t)
+{
+    /*
+     * hw.memsize 是 **64 位**，所以这里就该用 uint64_t 接 —— 与 km_kernel_page_size()
+     * 那条教训正好相反（hw.pagesize 是 int，拿 uint64_t 接只会写低 4 字节、把高 4
+     * 字节留成缓冲区原值）。规模大的值用窄类型接会得到"看似合理"的错值，这一条在
+     * 本工程里已经写过一次；这里的方向则是"宽类型接窄值"：只要**核对写回的长度**，
+     * 长度不等于 8 就说明拿到的不是 64 位内存大小。
+     */
+    uint64_t memsize = 0;
+    size_t memsizeLen = sizeof(memsize);
+    const int rc = sysctlbyname("hw.memsize", &memsize, &memsizeLen, NULL, 0);
+
+    if (rc != 0) {
+        text_append(t, "  [对账] sysctl hw.memsize 取不到：rc=%d errno=%d (%s)，写回长度=%llu 字节；"
+                       "physSize=%#llx（= %llu 字节）\n",
+                    rc, errno, strerror(errno),
+                    (unsigned long long)memsizeLen,
+                    (unsigned long long)physSize, (unsigned long long)physSize);
+        text_append(t, "  [对账] 内存大小取不到 ⇒ 这条对账不成立，**不拒绝**"
+                       "（它说明不了 physSize 错），流程照常往下\n");
+        return true;
+    }
+
+    if (memsizeLen != sizeof(uint64_t)) {
+        text_append(t, "  [对账] sysctl hw.memsize 成功，但写回长度=%llu 字节（期望 %llu）——"
+                       "拿到的不是一个 64 位值，对账不成立\n",
+                    (unsigned long long)memsizeLen, (unsigned long long)sizeof(uint64_t));
+        text_append(t, "  [对账] ⇒ **拒绝**：宁可停在这里，也不拿一个位数不对的数当内存大小去对账\n");
+        return false;
+    }
+
+    const bool equal = (physSize == memsize);
+    text_append(t, "  [对账] physSize=%#llx（= %llu 字节）  hw.memsize=%#llx（= %llu 字节）  相等=%s\n",
+                (unsigned long long)physSize, (unsigned long long)physSize,
+                (unsigned long long)memsize, (unsigned long long)memsize,
+                equal ? "是" : "否");
+
+    if (physSize == 0) {
+        text_append(t, "  [对账] ⇒ **拒绝**：physSize=0 —— 它与 hw.memsize=%#llx 不可能相等。"
+                       "这个 0 有两种成因：读 gPhysSize 失败，或 XPF 取不到该符号；"
+                       "是哪一种看上面 ⑦ 那几行（缺席的那一行就是原因）\n",
+                    (unsigned long long)memsize);
+        text_append(t, "  [对账] 本次从这里往后的全部内核读（ptov_table 的 8 项、锚点校验的"
+                       "符号读、抽样换算）一个都没发\n");
+        return false;
+    }
+
+    if (!equal) {
+        const uint64_t diff = (physSize > memsize) ? (physSize - memsize) : (memsize - physSize);
+        text_append(t, "  [对账] ⇒ **拒绝**：physSize 比 hw.memsize %s %#llx（= %llu 字节，"
+                       "约 %llu MiB）\n",
+                    (physSize > memsize) ? "多" : "少",
+                    (unsigned long long)diff, (unsigned long long)diff,
+                    (unsigned long long)(diff >> 20));
+        text_append(t, "  [对账] 为什么「不等」就等于「slide 是错的」：physSize 的读地址是"
+                       "「符号链接期地址 + slide」——slide 一错，读它的地址就错，"
+                       "读回来的值不可能是真实物理内存大小；而 hw.memsize 是用户态"
+                       "独立取得的权威值。两者不等 ⇒ **本次推出的这个 slide 是错的**\n");
+        text_append(t, "  [对账] 自检那次 kread 已经发出（它在本门之前：读 physSize 必须先有"
+                       "通过自检的 slide），但那之后的全部内核读本次一个都没发 ——"
+                       "上面那些地址都是「符号 + 这个错 slide」拼出来的\n");
+        return false;
+    }
+
+    text_append(t, "  [对账] 通过：physSize 与 hw.memsize 相等。这只说明「这个 slide 让 "
+                   "gPhysSize 读到了内存大小」，**不等于** kernel_base 对 —— 后者由 ⑤ 自检的"
+                   "页首两字判据负责\n");
+    return true;
+}
+
 /// 把 8 项表与三个全局摊开写进诊断（成功路径专用）。
 static void slide_report_tables(const km_slide_run *run, km_slide_text *t)
 {
@@ -2038,6 +2148,26 @@ static bool slide_run_load_tables(km_slide_run *run, km_slide_text *t)
      * `gVirtBase + gPhysSize` 做上界 —— 三个基准先到位，判据才有得比。
      */
     slide_read_bases(run->slide, run, t);
+
+    /*
+     * ── 门：对账 gPhysSize 与 hw.memsize，把「slide 算错了」挡在下一次读之前 ──
+     *
+     * 位置由数据依赖唯一确定，不是随手放的：
+     *   · 必须在**这一行之后** —— physSize 是上一行（slide_read_bases）才读回来的，
+     *     它的一次读也是全流程里唯一一次"用要判的 slide 去读一个已知物理量"；
+     *   · 必须在**slide_read_ptov_table 之前** —— 那一步会按「符号 + slide」发出 8 项
+     *     读，本门拒绝时它们一次都不该发（本门自己一次 kread 都不发，见它的注释）；
+     *   · 它**不可能**再往前挪到自检之前：读 physSize 需要已采信的 slide，而 slide
+     *     要到自检通过才采信 —— 那个窗口不存在（详细理由写在门的注释里）。
+     *
+     * 失败时**不覆盖**更具体的原因：slide_read_bases 若已因 gVirtBase/gPhysBase 形态
+     * 不合法而拒绝，它的 failure 比本门更靠前、更具体，照原样留着。
+     */
+    if (!slide_physsize_matches_memsize(run->physSize, t)) {
+        if (run->failure[0] != '\0') return false;
+        return slide_refuse(run, t, "⑦ 全局基准对账",
+                            "physSize 与 hw.memsize 不等 ⇒ 这个 slide 是错的（未再发任何 kread）");
+    }
 
     /*
      * 这一步**没有失败出口**（返回 void）：表读不到、或不可信，都只记进
