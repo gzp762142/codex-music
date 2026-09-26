@@ -628,6 +628,14 @@ uint64_t km_scan_task_map_offset(void)
 
 done:
     /*
+     * 这一条空语句不是装饰，**不能删**：C 的 labeled-statement 是
+     * `identifier : statement`，而**声明不是语句**。标签后面先跟一个块注释、
+     * 再跟 `char finalSummary[...]`，clang 在 C11（本项目用的 `-std=gnu11`）下会
+     * 直接报 "expected expression" —— 本文件在 CI 上就挂在 645 行这一处。
+     * 旧版标签后面挂的是 `(void)state;`，它本身就是一条语句，所以从没暴露过。
+     */
+    ;
+    /*
      * 状态机的落地就是上面那几个 summary 赋值：每一个分支写一次，没有第二个写入点，
      * 所以不会出现"两个地方各写一遍、然后互相不一致"的那种旧毛病。这里没有额外的
      * state 变量：多个副本就是多个会漂移的真相。
