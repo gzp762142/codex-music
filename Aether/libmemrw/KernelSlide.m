@@ -758,13 +758,27 @@ static bool slide_candidate_fits_image(const km_slide_run *run, uint64_t candida
 static pthread_mutex_t g_dumpLock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_dumpCond = PTHREAD_COND_INITIALIZER;
 static bool            g_dumpDone = false;
+/*
+ * 那次落盘**是否真的成功**。与 g_dumpDone 是两件事：done 只说异步块跑完了，
+ * 而块里 open 失败同样是"跑完了"。面板上那句"已写完"必须看的是这一个。
+ * 由 g_dumpLock 保护（与 g_dumpDone 同临界区）。
+ */
+static bool            g_dumpWroteOk = false;
 
 /*
  * 真正落盘。**只在后台队列上执行** —— 这函数里每一步都可能阻塞。
- * 失败一律静默返回：调用链那头只关心"写完没写完"，不关心为什么没写完
- * （沙盒、磁盘、权限都不影响本次自检的正确性）。
+ *
+ * 返回**真实**结果：路径取不到、open 失败、短写都算失败。
+ *
+ * 2026-09-26 改：原先返回 void 且失败一律静默 `return`，而调用方那句
+ * 「自检前落盘：已写完」依据的是 g_dumpDone（异步块**跑完了**）—— 两者是
+ * 两件事。于是真机上出现过"面板说已写完、Filza 里根本没有这个文件"，
+ * 把人指去翻一个不存在的文件。返回值是唯一能让那句话诚实的东西。
+ *
+ * 为什么"短写也当失败"：写了一半的诊断比没有更坏 —— 它会让人以为
+ * 后半段本来就该没有，从而在残缺数据上继续推结论。
  */
-static void slide_write_diag_file(const char *text)
+static bool slide_write_diag_file(const char *text)
 {
     /*
      * 本文件没有单独钉 -fobjc-arc（project.yml 只给 libmemrw/xpf 钉了），所以这里
@@ -775,14 +789,14 @@ static void slide_write_diag_file(const char *text)
         NSArray<NSString *> *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
                                                                        NSUserDomainMask, YES);
         NSString *documents = dirs.count > 0 ? dirs.firstObject : nil;
-        if (documents.length == 0) return;
+        if (documents.length == 0) return false;
 
         char path[PATH_MAX];
         snprintf(path, sizeof(path), "%s/%s",
                  documents.fileSystemRepresentation, KM_SLIDE_DIAG_FILE_NAME);
 
         const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (fd < 0) return;
+        if (fd < 0) return false;
 
         /*
          * 单次 write，不追加、不重试、短写就短写：这条路径上的任何重试都是拿
@@ -790,8 +804,9 @@ static void slide_write_diag_file(const char *text)
          */
         const size_t len = strlen(text);
         const ssize_t written = write(fd, text, len);
-        (void)written;
         close(fd);
+        /* 短写也算失败：写一半的诊断比没有更坏（会让人以为后面本来就没有）。 */
+        return written == (ssize_t)len;
     }
 }
 
@@ -808,6 +823,7 @@ static bool slide_dump_diag_and_wait(const char *text)
 
     pthread_mutex_lock(&g_dumpLock);
     g_dumpDone = false;
+    g_dumpWroteOk = false;
     pthread_mutex_unlock(&g_dumpLock);
 
     /*
@@ -816,10 +832,11 @@ static bool slide_dump_diag_and_wait(const char *text)
      * 这里也**不需要**串行 —— 全局状态只有 g_slideLock 下的这一次调用，天然串行。
      */
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        slide_write_diag_file(owned);
+        const bool wroteOk = slide_write_diag_file(owned);
         free(owned);
 
         pthread_mutex_lock(&g_dumpLock);
+        g_dumpWroteOk = wroteOk;
         g_dumpDone = true;
         pthread_cond_signal(&g_dumpCond);
         pthread_mutex_unlock(&g_dumpLock);
@@ -838,9 +855,15 @@ static bool slide_dump_diag_and_wait(const char *text)
     while (!g_dumpDone) {
         if (pthread_cond_timedwait(&g_dumpCond, &g_dumpLock, &deadline) == ETIMEDOUT) break;
     }
-    const bool settled = g_dumpDone;
+    /*
+     * 返回的是**文件真的写成功了没**，不是"异步块跑完了没"。
+     * 超时（没等到 done）时 g_dumpWroteOk 保持着 false —— 对调用方来说
+     * "不知道有没有写成"与"没写成"在用途上是同一件事：不能让人去翻一个
+     * 可能不存在的文件。失败原因的区分留给上面那句诊断（它会打出路径）。
+     */
+    const bool wroteOk = g_dumpDone && g_dumpWroteOk;
     pthread_mutex_unlock(&g_dumpLock);
-    return settled;
+    return wroteOk;
 }
 
 /*
@@ -851,8 +874,10 @@ static bool slide_dump_diag_and_wait(const char *text)
  * 哪些数在这次事件里是对的、哪些是错的。
  */
 static bool slide_dump_before_kread(const km_slide_run *run, uint64_t candidate,
-                                    const km_slide_text *t)
+                                    const km_slide_text *t,
+                                    char *outPath, size_t outPathSize)
 {
+    if (outPath && outPathSize > 0) outPath[0] = '\0';
     @autoreleasepool {
         NSString *kernelcache = km_xpf_kernelcache_path();
 
@@ -902,6 +927,28 @@ static bool slide_dump_before_kread(const km_slide_run *run, uint64_t candidate,
 
         const bool settled = slide_dump_diag_and_wait(text);
         free(text);
+
+        /*
+         * 把**绝对路径**和**真实结果**回传，让面板直接打出来。
+         *
+         * 为什么要回传路径：原来面板只写「Documents/kernelslide-diag.txt」——
+         * 那是路径的尾巴，而 App 沙盒目录名是一个随机 UUID，人不该靠猜或靠
+         * 文件管理器去逐个目录找。真机上就是这么卡住的：面板说"已写完"，
+         * 而按那个尾巴去找根本找不到（既可能是路径没显示全，也可能是当时的
+         * open 真的失败了 —— 这个区别现在由写了没写分清）。
+         */
+        if (outPath) {
+            NSArray<NSString *> *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                                           NSUserDomainMask, YES);
+            NSString *documents = dirs.count > 0 ? dirs.firstObject : nil;
+            if (documents.length > 0) {
+                NSString *full = [documents stringByAppendingPathComponent:
+                                      [NSString stringWithUTF8String:KM_SLIDE_DIAG_FILE_NAME]];
+                if (full.length > 0) {
+                    snprintf(outPath, outPathSize, "%s", full.fileSystemRepresentation);
+                }
+            }
+        }
         return settled;
     }
 }
@@ -1003,6 +1050,12 @@ static bool slide_verify_kernel_base(km_slide_run *run, uint64_t candidate, km_s
 {
     run->kernelBase = run->linkBase.addr + candidate;
 
+    /*
+     * 落盘路径要在下面那次调用**之前**声明 —— C 没有"先引用后定义"，
+     * 而 decl_order_check.py 会把这种错直接标出来（本文件刚因此栽过一次）。
+     */
+    char dumpPath[PATH_MAX] = { 0 };
+
     text_append(t, "⑤ 待读地址=%#llx（链接基址 %#llx + slide %#llx）\n",
                 (unsigned long long)run->kernelBase,
                 (unsigned long long)run->linkBase.addr,
@@ -1019,10 +1072,19 @@ static bool slide_verify_kernel_base(km_slide_run *run, uint64_t candidate, km_s
      *
      * 落盘是有界等待，不是同步挂在读链上的 I/O，理由见 slide_dump_diag_and_wait()。
      */
-    run->dumpSettled = slide_dump_before_kread(run, candidate, t);
-    text_append(t, "  自检前落盘：%s（Documents/%s）\n",
-                run->dumpSettled ? "已写完" : "超时或失败（不阻断本次自检）",
-                KM_SLIDE_DIAG_FILE_NAME);
+    run->dumpSettled = slide_dump_before_kread(run, candidate, t, dumpPath, sizeof(dumpPath));
+    if (run->dumpSettled) {
+        text_append(t, "  自检前落盘：**写成功** → %s\n",
+                    dumpPath[0] != '\0' ? dumpPath : "(路径取不到，但写成功了？不可能)");
+    } else {
+        /*
+         * 失败时给出路径（若能拿到）—— 人能据此判断是"目录不对"还是"写不进去"。
+         * 路径为空说明连 Documents 都没取到，那本身就是一条结论。
+         */
+        text_append(t, "  自检前落盘：**失败**（文件不存在，别去翻它）%s%s\n",
+                    dumpPath[0] != '\0' ? "；本该写在这里：" : "",
+                    dumpPath[0] != '\0' ? dumpPath : "（连 Documents 目录都没取到）");
+    }
 
     /*
      * 纯算术约束再看要不要读：不通过时这一轮一次 kread 都不发。
