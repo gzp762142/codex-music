@@ -15,24 +15,33 @@
 ## 一句话核心问题
 
 我用「运行时函数指针 − 链接期符号地址」推内核 slide，再拼 `kernel_base`。设备 panic
-全文给出了权威值，两相对账后 `kernel_base` **恰好偏 `0x8570000`（133 MB）**，而这个偏差
-可以**精确拆成两笔**：
+全文给出了权威值，两相对账后 `kernel_base` **偏 `0x8570000`（133 MB）**：
 
 ```
-真实 kernel_base − 真实 slide = 0xfffffe0006ffc000      [推算]
-我用的链接基址              = 0xfffffe0007004000      [诊断 + 代码]
-差                           =            0x8000      ← 误差 A
-
-真实 slide − 我推出的 slide   = 0x8578000               [推算]
-两者相抵：0x8578000 − 0x8000 = 0x8570000 = 133 MB      ← 误差 B 是主因
+真实 kernel_base（= KernelCache base）  = 0xfffffe0019b08000   [日志]
+我算出的 kernel_base                    = 0xfffffe0011598000   [诊断]
+差                                      = 0x8570000 = 133 MB
 ```
 
-（注：`0x8578000 − 0x8000 = 0x8570000`，即"真实 slide 比推出值大 `0x8578000`"与
-"链接基址比真实值高 `0x8000`"两笔互相抵消掉 `0x8000` 之后的净差。）
+**这笔偏差整体落在 `candidate` 这一项上**，因为链接基址本身是对的 —— panic 日志里
+**每一组 base 减它自己的 slide 都等于同一个值**：
 
-**请复核这个拆法，并指出 `slide` 系统性偏掉 133 MB 这种量级最可能的成因与判别方法。**
-我最想知道的是：这 133 MB 是"链接期符号取错了"还是"运行时 `fo_kqfilter` 读错了"，
-以及**怎么在不冒 panic 风险的前提下确定**。
+```
+KernelCache base − KernelCache slide = 0xfffffe0007004000
+Kernel text base − Kernel slide      = 0xfffffe0007004000
+text exec base  − text exec slide    = 0xfffffe0007004000
+我用的链接基址                       = 0xfffffe0007004000   ← 与上面三条一致
+```
+
+所以 `kernel_base = 链接基址 + candidate` 里，**只有 `candidate` 可能错**。
+而 `candidate = fo_kqfilter(运行时读) − vn_kqfilter(XPF 链接期)`，两个输入里至少一个错。
+
+**请判定是哪一个错，以及怎么在不冒 panic 风险的前提下确定。**
+（我原来写过一个"偏差可拆成 0x8000 + 0x8578000 两笔"的说法，那是错的：
+它把 `KernelCache base` 与 `Kernel slide` 这两个**不同对象**的字段相减了。
+按正确配对，0x8000 那一笔不存在。特此更正。）
+
+**同时请看本文末尾新增的「对称判据」一节** —— 它把"猜哪端错"变成一个可判定的等式。
 
 ---
 
@@ -230,6 +239,48 @@ current_proc、fd_ofiles 偏移
 才能用于下一次拼地址；自检不通过就停，**不换地址重试**。
 
 ---
+
+## 对称判据（把"猜哪端错"变成可判定的等式）
+
+`slide = 运行时符号 − 链接期符号` 这个式子**对任意一个符号都成立**，前提是两端
+真的是同一个符号。所以可以让**两个独立符号**各算一次 slide，二者必须相等：
+
+```
+(甲) slide_A = fo_kqfilter(运行时读)     − XPF(kernelSymbol.vn_kqfilter)
+(乙) slide_B = 运行时地址(符号 X)         − XPF(kernelSymbol.X)
+     slide_A == slide_B 必须成立。不等 ⟺ 至少一端的符号解析错了。
+```
+
+**为什么这条能定位：** 这两个式子共用同一个 `slide`，但用的是**两条独立的解析链**。
+`XPF` 把每个符号的链接期值都打印出来了（面板与诊断文本都有），所以 (乙) 的 XPF 那端
+是现成的，只缺"符号 X 的运行时地址"。
+
+**可用的 X**：`kernelSymbol.ptov_table` / `gVirtBase` / `gPhysBase` / `gPhysSize` /
+`vn_kqfilter`。其中只有**函数符号**（`vn_kqfilter`）可以两端直接相减 —— 因为
+`XPF(gVirtBase)` 给的是**变量自身的地址**，而第 ⑥⑦ 步读到的是**变量里存的值**，
+两者口径不同，不能直接减。**请确认这个区分，并指出还能用哪些符号做 (乙)。**
+
+**我还想知道**：`XPF` 内部有没有一个"自校验"的口子？例如
+`xpf.c:722-730` 的 `xpfsec_decode_pointer()` 在还原 chained fixups 指针时用了
+`macho_get_base_address(section->macho)`，而 `common.c:895-919` 的
+`xpf_find_vn_kqfilter()` 是一条**纯启发式链**（找字符串 → 找交叉引用 → 取函数起始
+→ 再往前 4 字节取另一个函数起始），**没有符号表校验**。同库的
+`xpf_find_ptov_table` 有已知的同类问题。所以：
+
+**Q** `xpf_find_vn_kqfilter()` 这条链在本机（Darwin 22.4.0 / T8112）上抓到的
+是不是真正的 `vn_kqfilter`？有没有**不依赖可信 slide** 的办法验证它？
+
+（我先试着自己答了两种，都失败，请你判断它们是否真的不成立：
+&nbsp;
+· **形态法**：看返回地址的高位是否落在内核域。失败 —— 抓错邻近函数时返回值**仍然
+是个合法内核地址**，形态上完全分不出来。
+&nbsp;
+· **段范围法**：断言它必须落在 `__TEXT_EXEC` 的链接期范围内。失败 —— 求那个范围
+需要 `__TEXT_EXEC` 的链接期起始，而 `Kernel text exec base − Kernel text exec slide`
+也依赖 slide。**用运行时地址减 slide 去判，用的是待求量本身，是循环。**
+&nbsp;
+所以我想知道是否有一条真正独立的判据，还是说这个问题本身只能靠"两个符号交叉验证
+必须一致"来间接发现异常（即上文 (甲)/(乙) 那条），而不能直接证明单端正确。）
 
 ## 输出格式
 
