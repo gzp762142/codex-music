@@ -6,6 +6,16 @@
 
 ---
 
+## 一句话核心问题
+
+我用「运行时函数地址 − 链接期函数地址」推内核 slide，再用它拼 `kernel_base`。
+一次 panic 日志给出了**权威值**，两相对账后发现：**`kernel_base` 偏了 133 MB**，
+而偏差可以拆成两笔 —— 链接基址高 `0x8000`、slide 少 `0x8578000`。
+请复核这个拆法，并指出 `slide` 系统性偏掉 133 MB 这种量级**最可能的成因与判别方法**。
+（关键数据在背景之后的「一次 panic 日志给出权威值」一节。）
+
+---
+
 ## 背景（全部为通用事实）
 
 平台：Darwin 22.4.0 / xnu 8796.102.5 / arm64e / **16 KB 页** / 用户态进程（无越狱、通过公开内核漏洞获得内核读原语）。
@@ -35,6 +45,65 @@ kernel_base 候选 = 0xfffffe0011598000        ⇒  推出的 slide = 0xA594000
 ```
 
 其余环节都读出来了（`fd_ofiles=0xfffffe8211098000`、`fileproc=0xfffffe1300abc240`、`vn_kqfilter` 链接期=0xfffffe0008121… 均取得），所以**读取原语本身可用**，断在自检那一次读。
+
+### 补充：一次 panic 日志给出了权威值（这一节是后加的关键数据）
+
+随后那次自检读触发内核 data abort（`esr = 0x96000006`，DFSC = 0b000110 **level-2** translation fault；
+`far = 0xfffffe005647c034`，`x8 = 0xfffffe005647c02c`，`far == x8 + 8`）。panic 日志本身给出了权威地址：
+
+```
+KernelCache slide: 0x0000000012b04000
+KernelCache base:  0xfffffe0019b08000
+Kernel slide:      0x0000000012b0c000
+Kernel text base:  0xfffffe0019b10000
+Kernel text exec slide: 0x0000000013a5c000
+Kernel text exec base:  0xfffffe001aa60000
+Fileset Kernelcache UUID: DD3296640AAAC379C87A292839B3B6B7
+Kernel UUID: F252D9D1-9D79-35E5-81FC-4B4F64ED3231
+Zone map: 0xfffffe100cae0000 - 0xfffffe160cae0000
+设备：iPad14,3 / socId 8112 / iPhone OS 16.4.1 (20E252) / xnu-8796.102.5~1/RELEASE_ARM64_T8112
+内核参数：Kernel text base = KernelCache base + Kernel slide = 0xfffffe0019b08000 + 0x12b0c000 ✓
+```
+
+与上面那次推算对账：
+
+```
+真实 kernel_base − 真实 slide = 0xfffffe0006ffc000     ← 由这两个权威值算出的"链接期基址"
+手上用的链接基址              = 0xfffffe0007004000
+差                            =            0x8000     ← 误差 A
+真实 slide − 推出的 slide     = 0x8578000 = 133 MB     ← 误差 B（主因）
+
+两者相抵后：真实 kernel_base − 候选 kernel_base = 0x8570000 = 133 MB
+```
+
+请注意 `0x8000` 那个差：panic 里 `KernelCache base` 与 `Kernel text base` 正好差 `0x8000`，
+而 `Kernel text base = KernelCache base + Kernel slide` 是定义。这似乎说明
+`gXPF.kernelBase` 给的不是 Mach-O 头那一处，而是往后 `0x8000` 的 `__TEXT`。
+
+**Q0.1** 上面对账的三条推论（误差 A = `0x8000`、误差 B = `0x8578000` 为主因）成立吗？有没有别的拆法？
+
+**Q0.2** `0x8000` 这个偏移。`macho_get_base_address` 取的是"非 `__PRELINK`/`__PLK`/`__PAGEZERO`
+段中最小的 `vmaddr`"。在内核 64 位 Mach-O 里，这个最小 `vmaddr` 是**文件头所在地址**，还是
+`__TEXT` 段的 `vmaddr`（即头之后 `0x8000`）？两者在标准布局下是否相同？如果 `__PAGEZERO`
+被排除而头本身不属于任何段，那"头地址"该怎么求？
+
+**Q0.3** 误差 B 是最要紧的：`slide = 运行时 fn − 链接期 fn` 这个式子，在什么情况下会**系统性**
+偏掉 133 MB 这种量级？请按可能性排序，并给出**判别方法**（不要只说"可能错"，要说怎么证实）：
+  - 链接期地址来自**另一个 kernelcache 变体**（同一 SoC 可能存在多个 fileset）；
+  - 运行时 `fo_kqfilter` 实际指向 **thunk / 桩**而不是函数本体；
+  - 该字段本身不签名或有别的编码，导致"还原 PAC"步骤引入了偏差；
+  - 取的是 fileops 表里**不同条目**（偏移错位）；
+  - 其他。
+
+**Q0.4** 内核版本串里带 `RELEASE_ARM64_T8112`，而 `iPad14,3` 的 SoC 也是 T8112，
+所以这一处是一致的。那么 kernelcache 的选择是否还存在"同 SoC 多份 fileset"的坑？
+公开的 kernelcache 路径（`/System/Library/Caches/com.apple.kernelcaches/` 与
+`/private/preboot/<uuid>/...` 那几处）在 16.4.1 上应当以哪一个为准，如何用 UUID 校验？
+
+**Q0.5** 既然 panic 日志能给出 `KernelCache base` / `Kernel slide` 这类**权威值**，
+那么在**运行时**（不依赖 panic），有没有受支持的方式拿到等价信息？例如
+`sysctl kern.kernel_slide`、`OSKext` 系列接口、或 `kern.bootargs` 里的线索？
+如果有，它是否对所有进程可见？
 
 ---
 
