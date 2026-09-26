@@ -140,9 +140,25 @@
  * 每项是 pa / va / len 三个 u64 = 24 字节；下面的表按 sizeof 取，不另写字节数）。 */
 #define KM_SLIDE_PTOV_COUNT 8ULL
 
-/* kernelcache 头两个 32 位字：MH_MAGIC_64 与 cputype（CPU_TYPE_ARM64|ABI64）。 */
+/*
+ * kernelcache 头两个 32 位字：MH_MAGIC_64 与 cputype（CPU_TYPE_ARM64|ABI64）。
+ *
+ * **这两个常量目前没有读取点，但不要删**（2026-09-26）：它们在 kernel_base 的
+ * 第 0 个 8 字节处，而 kernel_base 是 16 KB 对齐页首、页内偏移恒为 0 ——
+ * 底层 kread 会把指针改写成 `addr − 0x0C` 再让内核解引用，偏移 0 落到前一页
+ * 就是整机 panic，于是页闸门必然拒掉这个读（详见 slide_verify_kernel_base 里
+ * 那段注释）。所以自检改用页内 0x10 的 ncmds/sizeofcmds，这两个字读不到。
+ *
+ * 留着它们的理由：它们是"这个地址处到底是什么"的**定义**，将来若有一条能安全
+ * 读页首的路径（例如另一个读取后端把下溢量降到 0），自检应当回到这个更强的判据。
+ */
 #define KM_SLIDE_MH_MAGIC   0xfeedfacfU
 #define KM_SLIDE_MH_CPUTYPE 0x0100000cU
+
+/* 自检的页内锚点：ncmds@0x10 / sizeofcmds@0x14。为什么是 0x10 见上面那条注释。 */
+#define KM_SLIDE_HEAD_AUX_OFF 0x10U
+/* ncmds 的合理上界。真实内核是几百条，给足余量后仍能挡住"随机数据凑巧通过"。 */
+#define KM_SLIDE_NCMDS_MAX 4096U
 
 /*
  * 自己 open 出来的 fd 必然是小的整数（进程的 ofiles 数组长度在几百量级）。
@@ -535,6 +551,13 @@ typedef struct {
                                * 内核没开 ASLR 时 slide 合法地为 0，那时"0"是值不是标志 */
     uint64_t slide;
     uint64_t kernelBase;
+    /*
+     * 自检实际读到的头字段（只进诊断）。之所以记这两个而不是 magic/cputype：
+     * kernel_base 是页首、读不了（见 slide_verify_kernel_base 那段长注释），
+     * 自检只能从页内 0x10 的 ncmds/sizeofcmds 下手。
+     */
+    uint32_t headNcmds;
+    uint32_t headSizeofcmds;
     km_slide_ptov_entry ptov[KM_SLIDE_PTOV_COUNT];
     bool     ptovTrusted;     /* ⑥ 的三道判据（整表形态 + ① 偏移恒定 + ② va 值域）
                                * 是否全过 —— 只有它为真，提交出去的表才参与查表。
@@ -1094,29 +1117,64 @@ static bool slide_verify_kernel_base(km_slide_run *run, uint64_t candidate, km_s
                             "候选值与链接基址拼出的地址不在内核映像窗口内（未发出 kread）");
     }
 
-    uint32_t head[2] = { 0, 0 };
-    if (!slide_read_bulk(t, run->kernelBase, head, sizeof(head))) {
+    /*
+     * ── 自检锚点必须落在页内偏移 >= 0x0C 处（2026-09-26 重写，原实现必然失败）──
+     *
+     * 原实现读 `kernel_base + 0` 处的 `mach_header_64`，而 kernel_base 是 **16 KB
+     * 对齐的页首**，页内偏移恒为 0。底层 kread 把指针改写成 `addr − 0x0C` 再让内核
+     * 解引用，偏移 0 会落到前一页 → 整机 panic，所以 `km_read` 的页闸门要求偏移
+     * >= 0x0C 并**必然拒绝**这个读。真机症状就是那句
+     * 「kernel_base=0xfffffe0011598000 读不到（形态检查未过或 kread 失败）」——
+     * 而它什么都没证明：那次读根本没发出去。**自检失败 ≠ slide 错。**
+     *
+     * 所以判据从「页首的 magic/cputype」换成「页内 0x10 起的头字段」：
+     *     mach_header_64:  magic@0x00 cputype@0x04 cpusubtype@0x08
+     *                      filetype@0x0C ncmds@0x10 sizeofcmds@0x14 flags@0x18
+     * kread 的粒度是 4 或 8 字节，所以页内偏移必须是 4 的倍数，而 >= 0x0C 的最小
+     * 4 字节对齐位置就是 **0x10**（= ncmds）。读它 + 0x14 的 sizeofcmds，一次 8 字节。
+     *
+     * 判据强度如实说清：这两个是**增量式 32 位字段**，不像 magic 那样是精确常量，
+     * 所以这条自检比原设计的**弱**。它挡得住"随机 slide 落在一段无关数据上"
+     * （ncmds 与 sizeofcmds 同时落在有效区间的概率极低），挡不住刻意构造的数据。
+     * 换来的是一件事：**这次读真的会发出去**，因此它的成败才是一条关于地址的观察，
+     * 而不是关于我们自己闸门的观察。这个取舍写在 KernelSlide.h 里。
+     */
+    uint64_t aux = 0;
+    if (!slide_read_bulk(t, run->kernelBase + KM_SLIDE_HEAD_AUX_OFF, &aux, sizeof(aux))) {
         /* 具体是形态不过还是 kread 被拒，由 slide_read_bulk 自己那两行说明（见它）。 */
-        text_append(t, "  kernel_base=%#llx 读不到 —— 原因见上面那一行 [bulk]\n",
-                    (unsigned long long)run->kernelBase);
-        return slide_refuse(run, t, "⑤ 自检", "读不到 kernel_base 处的头部");
+        text_append(t, "  kernel_base+%#x=%#llx 读不到 —— 原因见上面那一行 [bulk]\n",
+                    (unsigned)KM_SLIDE_HEAD_AUX_OFF,
+                    (unsigned long long)(run->kernelBase + KM_SLIDE_HEAD_AUX_OFF));
+        return slide_refuse(run, t, "⑤ 自检", "读不到 kernel_base 头部的 ncmds/sizeofcmds");
     }
 
-    if (head[0] != KM_SLIDE_MH_MAGIC || head[1] != KM_SLIDE_MH_CPUTYPE) {
+    const uint32_t ncmds = (uint32_t)(aux & 0xFFFFFFFFu);
+    const uint32_t sizeofcmds = (uint32_t)(aux >> 32);
+    /* sizeofcmds 至少要放得下 ncmds 条最小 load command（每条 8 字节头）。 */
+    const bool plausible = (ncmds > 0) && (ncmds <= (uint32_t)KM_SLIDE_NCMDS_MAX) &&
+                           (sizeofcmds >= ncmds * 8u) && (sizeofcmds <= (16u << 20));
+    if (!plausible) {
         text_append(t, "  自检不通过：slide=%#llx kernel_base=%#llx "
-                       "头部实际读到 %#x / %#x（期望 %#x / %#x）\n",
+                       "头部 +%#x 读到 ncmds=%u sizeofcmds=%u（不像一个 Mach-O 头）\n",
                     (unsigned long long)candidate,
                     (unsigned long long)run->kernelBase,
-                    head[0], head[1], KM_SLIDE_MH_MAGIC, KM_SLIDE_MH_CPUTYPE);
-        return slide_refuse(run, t, "⑤ 自检", "kernel_base 头部不是 MH_MAGIC_64/arm64");
+                    (unsigned)KM_SLIDE_HEAD_AUX_OFF,
+                    (unsigned)ncmds, (unsigned)sizeofcmds);
+        return slide_refuse(run, t, "⑤ 自检", "kernel_base 头部字段不像 mach_header_64");
     }
 
-    /* 这里打印 candidate 而不是 run->slide：run->slide 要到本函数返回之后才赋值，
-     * 用它会把这行诊断打成 slide=0（值本身没错，显示错的诊断比没有更差）。 */
-    text_append(t, "⑤ 自检通过：slide=%#llx kernel_base=%#llx 头部=%#x/%#x\n",
+    /*
+     * 这里打印 candidate 而不是 run->slide：run->slide 要到本函数返回之后才赋值，
+     * 用它会把这行诊断打成 slide=0（值本身没错，显示错的诊断比没有更差）。
+     */
+    run->headNcmds = ncmds;
+    run->headSizeofcmds = sizeofcmds;
+    text_append(t, "⑤ 自检通过：slide=%#llx kernel_base=%#llx "
+                   "头部 +%#x = ncmds %u / sizeofcmds %u\n",
                 (unsigned long long)candidate,
                 (unsigned long long)run->kernelBase,
-                head[0], head[1]);
+                (unsigned)KM_SLIDE_HEAD_AUX_OFF,
+                (unsigned)ncmds, (unsigned)sizeofcmds);
     return true;
 }
 
