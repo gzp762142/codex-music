@@ -246,9 +246,27 @@ static bool g_slideSettled = false;
 static uint64_t g_slide = 0;
 static uint64_t g_kernelBase = 0;
 
-/* 换算表。三项都读到位才置 g_convertReady，避免下游看到"读了一半"的表。 */
+/*
+ * PA → KVA 当前是否可用。置位的唯一地方是 slide_run_load_tables 的提交点，
+ * 且提交前必须过 slide_fallback_usable()（三个基准各自在自己的域里）。
+ *
+ * 与旧语义的区别（本轮改动）：以前"就绪"隐含"ptov_table 也读到了"；现在 ptov_table
+ * 读得不合法**不再**影响它。理由是真机实测（见 slide_read_ptov_table 上方那段注释）：
+ * 那张表读到的是某个邻近标量全局、整张表是假的，而兜底公式
+ * `pa - gPhysBase + gVirtBase` 与它无关 —— 把"可以不用"的东西当硬前置，代价是
+ * 依赖 PA→KVA 的建表路径一步都走不了。
+ */
 static bool g_convertReady = false;
+
+/*
+ * 读回来的表 + 它是否**可信** —— 两个必须分开：
+ *   · g_ptov 是"读到了什么"（不可信时按原样收下，诊断与锚点校验要用这份数据）；
+ *   · g_ptovTrusted 是"能不能拿它算地址"（判据见 slide_read_ptov_table）。
+ * 查表只看后者（slide_phystokv_locked 的第一道分支）。
+ */
 static km_slide_ptov_entry g_ptov[KM_SLIDE_PTOV_COUNT];
+static bool g_ptovTrusted = false;
+
 static uint64_t g_virtBase = 0;
 static uint64_t g_physBase = 0;
 static uint64_t g_physSize = 0;
@@ -462,6 +480,9 @@ typedef struct {
     uint64_t slide;
     uint64_t kernelBase;
     km_slide_ptov_entry ptov[KM_SLIDE_PTOV_COUNT];
+    bool     ptovTrusted;     /* ⑥ 的三道判据（整表形态 + ① 偏移恒定 + ② va 值域）
+                               * 是否全过 —— 只有它为真，提交出去的表才参与查表。
+                               * 它为假**不是**失败：兜底公式不依赖那张表。 */
     uint64_t virtBase;
     uint64_t physBase;
     uint64_t physSize;
@@ -1045,29 +1066,178 @@ static bool slide_run_find_slide(km_slide_run *run, km_slide_text *t)
 #pragma mark - 步骤⑥⑦：换算表与抽样
 
 /*
- * 读回 ptov_table（8 项定长表），逐行对照 perf.h:150-151。
+ * ── ptov_table 的「可不可信」判据（纯算术、零 kread）───────────────────────
  *
- * 每一项都要过形态检查：va 必须是内核地址（它描述的是内核虚拟映射）、pa 与 len
- * 必须落在物理地址空间（< 2^48）且 len 非 0。表按「len == 0 即结束」解释
- * （perf.h:240 的循环条件原样继承），至少要有 1 项有效。
+ * 判据不是"每一项的形状"，而是"这张表与三个基准之间的代数关系"。为什么必须这样：
+ * 这张表的**地址**来自 XPF 的 kernelSymbol.ptov_table，而那个 finder 的链是
+ * `xpf_find_ptov_table` → 先 resolve `kernelSymbol.phystokv` → 再在 phystokv 的
+ * 反汇编里找**第 2 个 LDR**。而 phystokv 内部同时有加载 ptov_table / gPhysBase /
+ * gVirtBase 的 ADRP+LDR —— 抓错其中任何一条，返回的就是**邻近某个标量全局**的地址；
+ * 把它当表头逐项解引用，读到的 pa 是那个全局的**值**（看着像物理地址）、va 是紧邻
+ * 内存里的另一个全局、len 又是别的：**每一项都形态合理，整张表却是假的**。
+ * 形状判据对这类错值天然是盲的（KernelMemory.m 那条"看似合法的错值比 0 更危险"
+ * 说的是同一件事）。
  *
- * 任何一项不合法就整表拒绝 —— 半张表比没有表更危险：下游的 phystokv 会用它算出
- * 一个落点在别处的地址，而那正是"段外换算"的形态（KernelMemory.m 里记着的
- * bug_type 210 就是这一路）。
+ * 两条判据（都通过才算可信）：
+ *   ① 偏移恒定：每个非哨兵项满足 `va - pa == gVirtBase - gPhysBase`。
+ *      为什么是"偏移恒定"而不是逐段比边界：物理内存可以分成多段（多段正是这张表
+ *      存在的理由），而 physmap 对所有段的偏移相同 —— 这一条与 perf.h:241 的
+ *      `return pa - ptov[i].pa + ptov[i].va` 是同一件事的另一种写法。
+ *   ② 值域：`va ∈ [gVirtBase, gVirtBase + gPhysSize)`。
+ *
+ * 真机实测（iPad14,3 / iPadOS 16.4.1，本轮诊断的原始读数）—— 两条都过不了：
+ *     gVirtBase=0xfffffe001e57c000  gPhysBase=0x80257c000
+ *     delta = gVirtBase - gPhysBase = 0xfffffdf81c000000
+ *     ptov[0] pa=0x80af20000 → 按 delta 期望 va = 0xfffffe0026f20000
+ *             实测 va = 0xfffffdf03cf24000，va - pa = 0xfffffde832004000   ✗①
+ *             且 0xfffffdf03cf24000 < gVirtBase（比 0xfffffe 窗口低约 32 GiB）  ✗②
+ * 两条都不过 ⇒ 这张表不是描述本机映射的，查表必须停用：perf.h 那个循环会拿一项假的
+ * (pa, va) 把一个段外地址算成一个"形态合法"的内核地址，下钻即 data abort。
+ *
+ * 与此相对，三个基准本身是可信的：gPhysBase 页对齐、形如"32 GiB 之上偏移 38 MB"
+ * 这一 Apple 芯片 DRAM 起点、gVirtBase 落在合法的 0xfffffe 窗口，且两者互相对得上
+ * （gVirtBase - gPhysBase = 0xfffffdf81c000000）。而兜底公式
+ * `pa - gPhysBase + gVirtBase` 只用这三个值 —— **表是"可以不用"的东西**，所以判据
+ * 不过的后果只能是"停用查表、改用兜底"，不该是"整条 PA→KVA 失败"。
  */
+static bool slide_fallback_usable(uint64_t virtBase, uint64_t physBase, uint64_t physSize)
+{
+    /*
+     * 兜底公式的前置条件，逐条都对应公式里的一个位置：
+     *   · virtBase 必须在内核地址域里（km_slide_kernel_ptr，KernelSlide.m:321-326）——
+     *     它是公式的加数，也是下游 km_read64 的输入；
+     *   · physBase / physSize 必须在物理地址空间（< 2^48）且非 0 —— physBase 是减数，
+     *     physSize 是范围检查的除数（它为 0 时 `(pa - physBase) >= 0` 恒真，
+     *     公式对任何 pa 都返回 0，等于 PA→KVA 全灭）。
+     * 刻意**不含** ptov_table：兜底公式与那张表无关，这正是本轮改动的立足点。
+     */
+    if (!km_slide_kernel_ptr(virtBase)) return false;
+    if (physBase == 0 || physBase >= (1ULL << 48)) return false;
+    if (physSize == 0 || physSize >= (1ULL << 48)) return false;
+    return true;
+}
+
 /*
- * 前向声明（必须在文件作用域，不能放进函数体内）：表判成不合法时也要把独立锚点的
+ * 判据①：偏移恒定。返回 true = 每个非哨兵项都满足 va - pa == gVirtBase - gPhysBase。
+ * 不过时打印**第一个**不过的项（下标 + 实测 + 期望）—— 诊断要能直接说出"为什么不可信"，
+ * 而不是只丢一句"表不合法"。
+ */
+static bool slide_ptov_delta_invariant(const km_slide_run *run, km_slide_text *t)
+{
+    if (!slide_fallback_usable(run->virtBase, run->physBase, run->physSize)) {
+        text_append(t, "  [可信判据① 偏移恒定] 无法评估：三个基准未同时可用（见上面各自的读数行）\n");
+        return false;
+    }
+    if (run->ptov[0].len == 0) {
+        text_append(t, "  [可信判据① 偏移恒定] 无法评估：表首项 len=0，按 perf.h:240 这是一张空表\n");
+        return false;
+    }
+
+    const uint64_t delta = run->virtBase - run->physBase;
+    uint64_t items = 0;
+    for (uint64_t i = 0; i < KM_SLIDE_PTOV_COUNT; i++) {
+        if (run->ptov[i].len == 0) break; /* 表结束（perf.h:240） */
+        items++;
+
+        const uint64_t pa = run->ptov[i].pa;
+        const uint64_t va = run->ptov[i].va;
+        if (va < pa) {
+            text_append(t, "  [可信判据① 偏移恒定] 不过：ptov[%llu] va=%#llx < pa=%#llx（偏移为负，不可能）\n",
+                        (unsigned long long)i,
+                        (unsigned long long)va, (unsigned long long)pa);
+            return false;
+        }
+        if ((va - pa) != delta) {
+            text_append(t, "  [可信判据① 偏移恒定] 不过：ptov[%llu] pa=%#llx va=%#llx → va-pa=%#llx；"
+                           "期望 %#llx（= gVirtBase - gPhysBase）\n",
+                        (unsigned long long)i,
+                        (unsigned long long)pa, (unsigned long long)va,
+                        (unsigned long long)(va - pa), (unsigned long long)delta);
+            return false;
+        }
+    }
+
+    text_append(t, "  [可信判据① 偏移恒定] 通过：%llu 项全部满足 va-pa == %#llx\n",
+                (unsigned long long)items, (unsigned long long)delta);
+    return true;
+}
+
+/*
+ * 判据②：va 值域。返回 true = 每个非哨兵项的 va 都落在 physmap 的虚拟覆盖范围
+ * [gVirtBase, gVirtBase + gPhysSize) 内。
+ *
+ * 上界用 gPhysSize 的理由与上游把 `pa - gPhysBase < gPhysSize` 写成 assert 是同一个：
+ * 合法的段是 DRAM 的子集，而 DRAM 全在 [gPhysBase, gPhysBase + gPhysSize) 里。
+ */
+static bool slide_ptov_va_in_range(const km_slide_run *run, km_slide_text *t)
+{
+    if (!slide_fallback_usable(run->virtBase, run->physBase, run->physSize)) {
+        text_append(t, "  [可信判据② va 值域] 无法评估：三个基准未同时可用（见上面各自的读数行）\n");
+        return false;
+    }
+    if (run->ptov[0].len == 0) {
+        text_append(t, "  [可信判据② va 值域] 无法评估：表首项 len=0，按 perf.h:240 这是一张空表\n");
+        return false;
+    }
+
+    /* physSize < 2^48 而 virtBase 在高位全 1 的内核域，两者相加不会回绕。 */
+    const uint64_t low = run->virtBase;
+    uint64_t items = 0;
+    for (uint64_t i = 0; i < KM_SLIDE_PTOV_COUNT; i++) {
+        if (run->ptov[i].len == 0) break;
+
+        items++;
+        const uint64_t va = run->ptov[i].va;
+        if (va < low || (va - low) >= run->physSize) {
+            text_append(t, "  [可信判据② va 值域] 不过：ptov[%llu] va=%#llx 不在 [%#llx, %#llx) 内（%s）\n",
+                        (unsigned long long)i,
+                        (unsigned long long)va,
+                        (unsigned long long)low,
+                        (unsigned long long)(low + run->physSize),
+                        (va < low) ? "低于下界" : "越过上界");
+            return false;
+        }
+    }
+
+    text_append(t, "  [可信判据② va 值域] 通过：%llu 项全部落在 [%#llx, %#llx) 内\n",
+                (unsigned long long)items,
+                (unsigned long long)low, (unsigned long long)(low + run->physSize));
+    return true;
+}
+
+/*
+ * 前向声明（必须在文件作用域，不能放进函数体内）：表的判据结论之后也要把独立锚点的
  * 校验结论写进诊断，而那个函数的定义在本文件靠后的位置。
  */
 static void slide_check_ptov_against_anchor(const km_slide_run *run, km_slide_text *t);
 
-static bool slide_read_ptov_table(uint64_t slide, km_slide_ptov_entry *out,
+/*
+ * 读回 ptov_table（8 项定长表），逐行对照 perf.h:150-151，然后判定它**可不可信**。
+ *
+ * 返回类型是 void，这是本轮改动的核心：**这张表读不到、或不可信，都不再是失败出口**。
+ * 以前这里是"任何一项不合法就整表拒绝、整条流水线失败"，真机后果是：表读到假数据
+ * ⇒ 整条 resolve 失败 ⇒ km_phystokv_ready() 恒 false ⇒ 依赖 PA→KVA 的建表路径
+ * 一步都走不了 —— 而**真正在用的兜底公式根本不需要这张表**。
+ * 现在两种情形都只记进 run->ptovTrusted 与诊断（哪一条判据不过、期望值与实测值）。
+ *
+ * 三道判据全过才置 run->ptovTrusted：
+ *   · 形态（③，原有）：每一项 va 是内核地址、pa 与 len 落在物理地址空间且 len 非 0，
+ *     至少 1 项有效。为什么这一条必须留着：半张表比没有表更危险 —— 缺的那一项会让
+ *     查表把段内地址算成段外（KernelMemory.m 记着的 bug_type 210 就是这一路）；
+ *   · ① 偏移恒定、② va 值域：对三个基准的代数关系，见本函数上方那段注释。
+ * 表按「len == 0 即结束」解释（perf.h:240 的循环条件原样继承）。
+ */
+static void slide_read_ptov_table(uint64_t slide, km_slide_ptov_entry *out,
                                   km_slide_run *run, km_slide_text *t)
 {
+    run->ptovTrusted = false;
+
     const uint64_t symbol = km_xpf_resolve_symbol(@"kernelSymbol.ptov_table");
     if (symbol == 0) {
-        text_append(t, "  XPF 取不到 kernelSymbol.ptov_table\n");
-        return slide_refuse(run, t, "⑥ ptov_table", "XPF 没解析出 ptov_table");
+        text_append(t, "  XPF 取不到 kernelSymbol.ptov_table（它的 finder 是已知会指错的那一条链：\n");
+        text_append(t, "  xpf_find_ptov_table 先 resolve phystokv，再从它的反汇编里找第 2 个 LDR）\n");
+        text_append(t, "  ⇒ ptov_table 不可信：符号都取不到；查表路径停用，PA→KVA 走兜底公式\n");
+        return;
     }
 
     const uint64_t tableAddr = symbol + slide;
@@ -1077,7 +1247,8 @@ static bool slide_read_ptov_table(uint64_t slide, km_slide_ptov_entry *out,
     if (!slide_read_bulk(tableAddr, table, tableSize)) {
         text_append(t, "  ptov_table=%#llx（符号 %#llx + slide）读失败\n",
                     (unsigned long long)tableAddr, (unsigned long long)symbol);
-        return slide_refuse(run, t, "⑥ ptov_table", "表读不出来");
+        text_append(t, "  ⇒ ptov_table 不可信：表读不出来；查表路径停用，PA→KVA 走兜底公式\n");
+        return;
     }
 
     /*
@@ -1220,54 +1391,76 @@ static bool slide_read_ptov_table(uint64_t slide, km_slide_ptov_entry *out,
         }
 
         /*
-         * ── 核心判据：gVirtBase 的**实测运行时值**是否等于「链接期 + slide」───────
+         * ── gVirtBase 的口径（旧版这一段是错的，本轮修正）──────────────────────
          *
-         * 这条为什么是关键：`run->virtBase` 是从内核内存里**读回来的**运行时值，
-         * 而 `gvirtSym + slide` 是由符号推出来的运行时值。两者必须逐位相等 ——
-         * 不相等就说明「读回来的那个值错了」或「slide/符号有一个不对」，
-         * 而这正是上一轮把整件事搅浑的那个点（当时只能靠人比对两个长十六进制串）。
+         * 旧版把两个**不同种类**的量放在一起"对账"：`gvirtSym + slide` 是 gVirtBase
+         * **这个变量的地址**，`run->virtBase` 是该地址上的**值** —— 两者本来就不该相等。
+         * 真机上它打出"两者相差 0x42d6198（实读偏小）"，那不是异常，是这行对账本身
+         * 没有意义，白烧一轮排查。
          *
-         * 这里由代码给结论，人只看一行。
+         * 有意义的问题是"读回来的这个值**像不像** physmap 的虚拟起点"：它必须落在
+         * 内核地址域里、且页对齐（16 KB）。符号地址只作为"我们从哪儿读的"列出来。
          */
         {
-            const uint64_t gvirtSym = km_xpf_resolve_symbol(@"kernelSymbol.gVirtBase");
-            const uint64_t expect   = (gvirtSym != 0) ? (gvirtSym + slide) : 0;
-            const uint64_t got      = run->virtBase;
+            const uint64_t gvirtSym  = km_xpf_resolve_symbol(@"kernelSymbol.gVirtBase");
+            const uint64_t at        = (gvirtSym != 0) ? (gvirtSym + slide) : 0;
+            const uint64_t got       = run->virtBase;
+            const bool     inDomain  = km_slide_kernel_ptr(got);
+            const bool     pageAlign = ((got & 0x3fffULL) == 0);
 
-            text_append(t, "  [gVirtBase 对账] 链接期+slide=%#llx  实读=%#llx  %s\n",
-                        (unsigned long long)expect,
-                        (unsigned long long)got,
-                        (expect != 0 && expect == got) ? "相等（读数可信）" : "不相等（读数或符号有问题）");
-            if (expect != 0 && expect != got) {
-                const uint64_t gap = (got > expect) ? (got - expect) : (expect - got);
-                text_append(t, "  [gVirtBase 对账] 两者相差 %#llx（%s）—— 这一项即上轮搅浑全场的那个数\n",
-                            (unsigned long long)gap,
-                            (got > expect) ? "实读偏大" : "实读偏小");
-            }
+            text_append(t, "  [gVirtBase] 读自 %#llx（符号+slide，这是变量地址不是值）→ 实读值 %#llx\n",
+                        (unsigned long long)at, (unsigned long long)got);
+            text_append(t, "  [gVirtBase 形态] 内核域=%s 16K 页对齐=%s ⇒ %s\n",
+                        inDomain ? "是" : "否",
+                        pageAlign ? "是" : "否",
+                        (inDomain && pageAlign) ? "可用" : "不可用");
         }
 
     }
 
+    /*
+     * ── 结论：整表形态（③，原有）+ 两条代数判据（①②）全过 = 可信 ─────────────
+     *
+     * 三道判据共用一个出口：不可信时**不**拒绝整条流水线（本函数已无失败出口），
+     * 只把"查表停用"这件事记下来 —— 兜底公式不依赖这张表（见本函数上方那段注释）。
+     */
+    const bool shapeOk = (valid > 0) && allValid;
     if (valid == 0) {
         text_append(t, "  上面 %llu 项没有一项通过形态检查（表是空的，或全部不合法）\n",
                     (unsigned long long)shown);
-        slide_check_ptov_against_anchor(run, t);
-        return slide_refuse(run, t, "⑥ ptov_table", "表是空的或全部不合法");
-    }
-    if (!allValid) {
-        text_append(t, "  上面 %llu 项里有形态不合法的项，整表拒绝 —— "
-                       "半张表比没有表更危险（段外换算）。\n",
+    } else if (!allValid) {
+        text_append(t, "  上面 %llu 项里有形态不合法的项：整表不可信 —— "
+                       "半张表比没有表更危险（缺的那一段会让段内地址被算成段外）。\n",
                     (unsigned long long)shown);
+    }
+
+    const bool deltaOk = slide_ptov_delta_invariant(run, t);
+    const bool rangeOk = slide_ptov_va_in_range(run, t);
+    run->ptovTrusted = shapeOk && deltaOk && rangeOk;
+
+    text_append(t, "  当前在用的基准：gVirtBase=%#llx gPhysBase=%#llx gPhysSize=%#llx\n",
+                (unsigned long long)run->virtBase,
+                (unsigned long long)run->physBase,
+                (unsigned long long)run->physSize);
+
+    if (!run->ptovTrusted) {
+        text_append(t, "⑥ ptov_table 不可信：整表形态=%s、判据① 偏移恒定=%s、判据② va 值域=%s\n",
+                    shapeOk ? "通过" : "不通过",
+                    deltaOk ? "通过" : "不通过",
+                    rangeOk ? "通过" : "不通过");
+        text_append(t, "  ⇒ km_phystokv 停用查表，直接走兜底公式 pa - gPhysBase + gVirtBase"
+                       "（它不需要 ptov_table）\n");
         slide_check_ptov_against_anchor(run, t);
-        return slide_refuse(run, t, "⑥ ptov_table", "表项形态不合法");
+        return;
     }
 
     /* out 已在函数开头拷过（那时表刚读进来），这里不再重复。 */
-    text_append(t, "⑥ ptov_table=%#llx（符号 %#llx + slide）有效项 %llu\n",
+    text_append(t, "⑥ ptov_table=%#llx（符号 %#llx + slide）可信：%llu 项三道判据全过，"
+                   "查表路径启用\n",
                 (unsigned long long)tableAddr, (unsigned long long)symbol,
                 (unsigned long long)valid);
+    text_append(t, "  ⇒ km_phystokv 先查这 8 段，落空再走兜底公式 pa - gPhysBase + gVirtBase\n");
     slide_check_ptov_against_anchor(run, t);
-    return true;
 }
 
 /*
@@ -1347,28 +1540,25 @@ static bool slide_read_bases(uint64_t slide, km_slide_run *run, km_slide_text *t
     };
 
     /*
-     * ── 这一步的判据是本轮才理清的，写清楚，免得又被带偏 ──────────────────
+     * ── 这一步的判据（口径本轮修正过，写清楚免得又被带偏）─────────────────
      *
      * `slide_read64()` 的 `*ok` 只说明"两次读到同一个值"，**不说明那个值是对的**：
-     * kread 打在一个仍然映射、但已被重定位改写成别的东西的地址上时，会稳定地
-     * 读回一个稳定但错误的值。本轮就撞上了这个形态 ——
+     * kread 打在一个仍然映射、但内容已被改成别的东西的地址上时，会稳定地读回一个
+     * 稳定但错误的值。所以判据落在"值本身是否可信"上：读回实读值之后，自己检查它
+     * 是否落在该有的域里、是否对齐（见下面每一行的【形态不合法】）。
      *
-     *     XPF 给的 gVirtBase 链接期值 + slide 算出的期望值  0xfffffe00293d2198
-     *     从内核里实读回来的值                            0xfffffe002457c000
-     *     两者相差                                        0x4E56198（非 16K 倍数）
-     *
-     * 而另外五个符号（cpu_ttep / phystokv / allproc / ptov_table / gPhysBase 的链接期值）
-     * 各自独立反推出的 slide 完全一致 —— 说明 slide 与符号定位都是对的，
-     * **只有 gVirtBase 这个"值"不对**。所以判据要落在"值本身是否可信"上：
-     * 代码读回实读值之后，自己检查它是否落在该有的域里、是否对齐，
-     * 并把它与"链接期 + slide"的期望值并排打出来对账。
+     * 明确一条**被做错过的口径**（真机上白烧过一轮排查，别再走回去）：不能拿
+     * "符号 + slide"当"期望值"去和实读值比 —— 前者是 gVirtBase **这个变量的地址**，
+     * 后者是该地址上的**值**，两者本来就不该相等。真机上那行打出"相差 0x4E56198
+     * （非 16K 倍数）"，于是被误读成"gVirtBase 的值不对"；本轮真机又读到
+     * gVirtBase=0xfffffe001e57c000 / gPhysBase=0x80257c000，两者页对齐、互相对得上，
+     * 是可信的。变量地址只用于回答"我们从哪儿读的"。
      *
      * 另外：**任何一个基准失败都不再中止流程**。以前一失败就 return，于是
      * "实读值到底能不能用"这个问题永远得不到回答 —— 而它才是真正决定
      * 下一步走哪条路的那一个。
      */
     bool okVirt = false, okPhys = false, okSize = false;
-    uint64_t expectVirt = 0, expectPhys = 0, expectSize = 0;
 
     for (size_t i = 0; i < 3; i++) {
         NSString *key = [NSString stringWithUTF8String:fields[i].key];
@@ -1381,10 +1571,6 @@ static bool slide_read_bases(uint64_t slide, km_slide_run *run, km_slide_text *t
         const uint64_t addr = symbol + slide;
         bool readOk = false;
         const uint64_t value = slide_read64(addr, &readOk);
-
-        if (i == 0)      expectVirt = addr;
-        else if (i == 1) expectPhys = addr;
-        else             expectSize = addr;
 
         if (!readOk) {
             text_append(t, "  %s：地址 %#llx（符号 %#llx + slide）读失败\n",
@@ -1406,11 +1592,10 @@ static bool slide_read_bases(uint64_t slide, km_slide_run *run, km_slide_text *t
             okSize = valid;
         }
 
-        text_append(t, "  %s：实读 %#llx  期望(链接期+slide) %#llx  %s%s\n",
+        text_append(t, "  %s：实读值 %#llx（读自 %#llx = 符号+slide，那是变量地址）%s\n",
                     fields[i].name,
                     (unsigned long long)value,
                     (unsigned long long)addr,
-                    (value == addr) ? "一致" : "不一致",
                     valid ? "" : "  【形态不合法】");
         if (!valid) {
             text_append(t, "      ↑ 读回来了，但这个值不满足 %s 该有的形态\n",
@@ -1421,23 +1606,24 @@ static bool slide_read_bases(uint64_t slide, km_slide_run *run, km_slide_text *t
     }
 
     /*
-     * 结论：三个基准里只要 **gVirtBase 与 gPhysBase 两项可用**，PA→KVA 的兜底支
-     * （`pa - gPhysBase + gVirtBase`）就能跑 —— 它覆盖内核线性映射段，够我们用。
-     * gPhysSize 只用于判 pa 是否落在该段内，缺它会让兜底支更保守，不致命。
+     * 结论：这一步只回答"每一个读数本身可不可信"（gVirtBase 在内核域且页对齐、
+     * gPhysBase 是页对齐的物理地址、gPhysSize 非 0 且在物理域里）—— 三项各自独立判，
+     * 任一项不过都写明是哪一项、读到的值是多少。
      *
-     * 所以这里按"够不够用"给结论，而不是"三个必须全对"：本轮已经证明
-     * gVirtBase 的**期望值**不可信（实读与期望差 0x4E56198、非 16K 倍数），
-     * 但实读值本身仍可能落在正确的内核域里 —— 那它就照样能用。
+     * 为什么 gPhysSize 也必须在：它是兜底公式范围检查的除数（
+     * `(pa - gPhysBase) >= gPhysSize` 即拒绝该 pa）。它为 0 时那个不等式恒真，
+     * 兜底支对任何 pa 都返回 0，等于 PA→KVA 全灭 —— 它不是"缺了也无所谓"的那一项。
+     * 三个值的**联合**判定不在这里做：交给提交点的 slide_fallback_usable()，
+     * 免得同一件事在两处有两条口径。
      */
     const bool usable = okVirt && okPhys;
     text_append(t, "  ⑦ 判定：gVirtBase 可用=%s、gPhysBase 可用=%s、gPhysSize 可用=%s ⇒ "
-                   "兜底换算%s\n",
+                   "三个基准%s（联合判据在提交点）\n",
                 okVirt ? "是" : "否", okPhys ? "是" : "否", okSize ? "是" : "否",
-                usable ? "可用（pa - gPhysBase + gVirtBase）" : "不可用");
+                (okVirt && okPhys && okSize) ? "齐了" : "不齐");
 
     if (!usable) {
-        text_append(t, "  基准不够用：实读值与期望值并列在上，"
-                       "两者相差多少即为该符号（或其读取位置）的可疑量\n");
+        text_append(t, "  基准不够用：上面每一行的【形态不合法】标出了是哪一项、读到的值是多少\n");
         return slide_refuse(run, t, "⑦ 全局基准",
                             okVirt ? "gPhysBase 不可用" : "gVirtBase 不可用");
     }
@@ -1452,7 +1638,25 @@ static bool slide_read_bases(uint64_t slide, km_slide_run *run, km_slide_text *t
 /// 把 8 项表与三个全局摊开写进诊断（成功路径专用）。
 static void slide_report_tables(const km_slide_run *run, km_slide_text *t)
 {
-    text_append(t, "== ptov_table（perf.h:232-248 的 8 段查表）==\n");
+    /*
+     * 先说结论：上层真正要知道的是两件事 —— "现在走哪条路"和"在用的是哪三个值"。
+     * 表本身是"可以不用"的东西（判据见 slide_read_ptov_table 上方那段注释），
+     * 所以它排在这两行之后。
+     */
+    text_append(t, "== PA → KVA 当前状态 ==\n");
+    text_append(t, "  ptov_table：%s\n",
+                run->ptovTrusted
+                    ? "可信 —— km_phystokv 先查它的 8 段，落空再走兜底"
+                    : "不可信 —— km_phystokv 不查表，直接走兜底公式（哪条判据不过见上面⑥）");
+    text_append(t, "  在用公式：兜底 pa - gPhysBase + gVirtBase，"
+                   "范围检查 [gPhysBase, gPhysBase + gPhysSize)\n");
+    text_append(t, "  gVirtBase=%#llx gPhysBase=%#llx gPhysSize=%#llx\n",
+                (unsigned long long)run->virtBase,
+                (unsigned long long)run->physBase,
+                (unsigned long long)run->physSize);
+
+    text_append(t, "== ptov_table（perf.h:232-248 的 8 段查表；%s）==\n",
+                run->ptovTrusted ? "本机已采信" : "本机未采信，仅供参考");
     for (uint64_t i = 0; i < KM_SLIDE_PTOV_COUNT; i++) {
         if (run->ptov[i].len == 0) break;
         text_append(t, "  [%llu] pa=%#llx va=%#llx len=%#llx\n",
@@ -1461,11 +1665,6 @@ static void slide_report_tables(const km_slide_run *run, km_slide_text *t)
                     (unsigned long long)run->ptov[i].va,
                     (unsigned long long)run->ptov[i].len);
     }
-    text_append(t, "== 全局基准 ==\n");
-    text_append(t, "  gVirtBase=%#llx gPhysBase=%#llx gPhysSize=%#llx\n",
-                (unsigned long long)run->virtBase,
-                (unsigned long long)run->physBase,
-                (unsigned long long)run->physSize);
 
     /*
      * 交叉对照：xnu 在 arm_vm_init 里把启动期的物理内存段写进 ptov_table，所以
@@ -1473,7 +1672,14 @@ static void slide_report_tables(const km_slide_run *run, km_slide_text *t)
      * 这里只**报告**有没有匹配，不当判据 —— 我没有目标机型（iPad14,3 /
      * iPadOS 16.4.1）的第一手证据证明这条恒成立，拿它当判据会让正确的表在某些
      * 机型上被拒。
+     *
+     * 表已被判为不可信时**不输出**这一段：那时表里每一项都可能来自别的全局，
+     * 打印"没有哪一项对得上"会被读成又一条证据，而它此刻什么也不说明。
      */
+    if (!run->ptovTrusted) {
+        text_append(t, "  交叉对照：表未采信，本段不输出（避免把噪音当证据）\n");
+        return;
+    }
     for (uint64_t i = 0; i < KM_SLIDE_PTOV_COUNT; i++) {
         if (run->ptov[i].len == 0) break;
         if (run->ptov[i].pa == run->physBase && run->ptov[i].va == run->virtBase) {
@@ -1514,7 +1720,10 @@ static void slide_report_phystokv_probe(const km_slide_run *run, km_slide_text *
     text_append(t, "  pa=%#llx → kva=%#llx", (unsigned long long)pa, (unsigned long long)kva);
 
     if (kva == 0) {
-        text_append(t, "（换算失败：既不在 8 段内，也不在 [gPhysBase, gPhysBase+gPhysSize) 内）\n");
+        text_append(t, "（换算失败：%s）\n",
+                    run->ptovTrusted
+                        ? "既不在 8 段内，也不在 [gPhysBase, gPhysBase+gPhysSize) 内"
+                        : "ptov_table 已停用（判据见上面⑥），且 pa 不在 [gPhysBase, gPhysBase+gPhysSize) 内");
         return;
     }
     if (!km_slide_kernel_ptr(kva)) {
@@ -1542,16 +1751,50 @@ static bool slide_run_load_tables(km_slide_run *run, km_slide_text *t)
      *
      * 两层脆弱推导叠在一起，`ptov_table` 的符号地址就有可能是错的。那三个值读得
      * 到的话，就有一个独立的锚去判断表对不对 —— 读不到它们，连判断的余地都没有。
+     *
+     * 本轮再给这个顺序加一条理由：表的**可信判据**（slide_ptov_delta_invariant /
+     * slide_ptov_va_in_range）就是用 `gVirtBase - gPhysBase` 做期望偏移、用
+     * `gVirtBase + gPhysSize` 做上界 —— 三个基准先到位，判据才有得比。
      */
     slide_read_bases(run->slide, run, t);
-    if (!slide_read_ptov_table(run->slide, run->ptov, run, t)) return false;
-    if (run->virtBase == 0 || run->physBase == 0 || run->physSize == 0) return false;
 
     /*
-     * 全部到位才提交：避免下游读到"slide 有了、表只读了一半"的中间状态。
-     * 提交点只有一个，也是这条流水线上唯一写全局的地方。
+     * 这一步**没有失败出口**（返回 void）：表读不到、或不可信，都只记进
+     * run->ptovTrusted 与诊断，不再让整条 resolve 失败。真机实测的理由见
+     * slide_read_ptov_table 上方那段判据注释：读到的是邻近的标量全局、整张表是假的，
+     * 而三个基准是可信的，兜底公式也不需要这张表。
      */
-    memcpy(g_ptov, run->ptov, sizeof(g_ptov));
+    slide_read_ptov_table(run->slide, run->ptov, run, t);
+
+    /*
+     * 提交前的联合判据：只有它成立才允许置 g_convertReady。三个基准缺任何一个，
+     * 兜底公式都算不出可用地址（physSize 为 0 时范围检查恒真，见
+     * slide_fallback_usable 的注释）—— 那时如实报失败，不提交半个状态。
+     */
+    const bool fallbackUsable = slide_fallback_usable(run->virtBase, run->physBase, run->physSize);
+    text_append(t, "  ⑧ 提交判定：兜底公式（pa - gPhysBase + gVirtBase）%s；ptov_table %s\n",
+                fallbackUsable ? "可用" : "不可用",
+                run->ptovTrusted ? "可信（查表启用）" : "不可信（查表停用）");
+    if (!fallbackUsable) {
+        text_append(t, "  三个基准没有同时可用 ⇒ 兜底公式用不了（见上面每一行的读数与形态判定）\n");
+        /* ⑦ 那一步给出的原因更具体（是哪一项不可用），不要用更笼统的话盖掉它。 */
+        if (run->failure[0] != '\0') return false;
+        return slide_refuse(run, t, "⑦ 换算基准", "兜底公式不可用：三个基准未同时到位");
+    }
+
+    /*
+     * 提交：唯一写全局的地方，避免下游读到"slide 有了、基准只读了一半"的中间状态。
+     *
+     * 表按可信与否分别处理 —— 不可信时提交一张**空表**（memset 0，而不是把假数据
+     * 落进全局）：这样即使将来有人在别处漏判了 g_ptovTrusted 就去查表，
+     * 空表（len 全 0）也只会查不到，而不是算出一个段外地址。
+     */
+    if (run->ptovTrusted) {
+        memcpy(g_ptov, run->ptov, sizeof(g_ptov));
+    } else {
+        memset(g_ptov, 0, sizeof(g_ptov));
+    }
+    g_ptovTrusted = run->ptovTrusted;
     g_virtBase = run->virtBase;
     g_physBase = run->physBase;
     g_physSize = run->physSize;
@@ -1597,13 +1840,20 @@ static bool slide_run_locked(km_slide_text *t)
     }
 
     if (ok) {
-        char summary[192];
+        /*
+         * 摘要一句话要说清"现在走哪条路"：ptov_table 可信与否决定查表是否启用，
+         * 两种情况都算成功（兜底公式不依赖那张表）。缓冲区扩到 256 ——
+         * 中文摘要按 UTF-8 三字节/字算，192 字节会把后半个括注截掉。
+         */
+        char summary[256];
         snprintf(summary, sizeof(summary),
                  "slide=%#llx kernel_base=%#llx（链接基址 %#llx，来源 %s）"
-                 "换算表=ready（8 段查表 + 兜底支可用）",
+                 "PA→KVA=ready（%s）",
                  (unsigned long long)run.slide, (unsigned long long)run.kernelBase,
                  (unsigned long long)run.linkBase.addr,
-                 run.linkBase.fromXPF ? "XPF" : "常量");
+                 run.linkBase.fromXPF ? "XPF" : "常量",
+                 run.ptovTrusted ? "8 段查表 + 兜底支"
+                                 : "兜底支；ptov_table 不可信，查表已停用");
         slide_diag_finalize(summary);
         g_slideSettled = true;
         return true;
@@ -1612,7 +1862,9 @@ static bool slide_run_locked(km_slide_text *t)
     char summary[256];
     snprintf(summary, sizeof(summary), "未完成 @%s%s",
              run.failure[0] ? run.failure : "（未知步骤）",
-             run.slideVerified ? "；slide 已通过自检，换算表未就绪" : "");
+             run.slideVerified
+                 ? "；slide 已通过自检，但 PA→KVA 未建立（三个基准未同时到位，见⑦⑧）"
+                 : "");
     slide_diag_finalize(summary);
     return false;
 }
@@ -1695,8 +1947,19 @@ uint64_t km_slide_kernel_base(void)
 
 bool km_phystokv_ready(void)
 {
+    /*
+     * 判据是"兜底公式可用"，而不再是"整条 slide 流水线成功"（旧语义）。
+     *
+     * 两件事分开看：
+     *   · g_convertReady —— 三个基准已经在同一个临界区里提交过（防中间状态）；
+     *   · slide_fallback_usable(g_virtBase, g_physBase, g_physSize) —— 提交出去的
+     *     那三个值此刻仍满足公式的前置（非 0、各在自己的域里）。在锁内复算一遍是
+     *     刻意的："就绪"这个词要落在**真正被使用的公式**上，而不是某个标志的时序上。
+     * ptov_table 不参与这个判据：它不可信只让查表停用，兜底照跑（真机就是这样）。
+     */
     pthread_mutex_lock(&g_slideLock);
-    const bool ready = g_convertReady;
+    const bool ready = g_convertReady &&
+                       slide_fallback_usable(g_virtBase, g_physBase, g_physSize);
     pthread_mutex_unlock(&g_slideLock);
     return ready;
 }
@@ -1718,14 +1981,18 @@ bool km_phystokv_ensure(void)
     if (!km_ready()) return false;
 
     /*
-     * 判据**只看换算表**，不看 km_slide_resolve() 的返回值。
+     * 判据**只看 PA→KVA 能不能用**，不看 km_slide_resolve() 的返回值。
      *
      * 这不是造型问题：`km_slide_resolve()` 的 true/false 是"整条流水线（slide +
-     * 换算表）是否都成立"，而本函数承诺的是"PA→KVA 可不可用"。在当前实现下两者
-     * 同真同假（理由见 KernelSlide.h 的说明），但判据落在被使用的那一件东西上，
-     * 下游才不必跟着上游的合并语义走。
+     * PA→KVA 基准）是否都成立"，而本函数承诺的是"PA→KVA 可不可用"。改动之后两者
+     * 仍同真同假（提交点与 g_slideSettled 在同一个临界区里前后脚置位），但判据落在
+     * 被使用的那一件东西上（见 km_phystokv_ready 的定义），下游才不必跟着上游的
+     * 合并语义走 —— 以后哪一边的判据松了，这里自动跟上。
      *
-     * km_slide_resolve 内部会按需调 km_xpf_init()（KernelSlide.m:1652）。
+     * 特别注意**不算失败**的一种情形：ptov_table 不可信（真机上就撞上了）。
+     * 那时查表路径停用、兜底支照跑，本函数返回 true —— 这正是本轮改动的目的。
+     *
+     * km_slide_resolve 内部会按需调 km_xpf_init()（KernelSlide.m:1904）。
      *
      * 关于"失败之后可以重来"，这里要划边界（KernelSlide.h 写了完整理由）：
      * 重跑这条路只有在 **kread 那一侧**才有意义。XPF 的 finder 返回值（包括 0）
@@ -1747,10 +2014,19 @@ static uint64_t slide_phystokv_locked(uint64_t pa)
 {
     if (!g_convertReady) return 0;
 
-    /* ① 逐段查表，条件与判据逐字对照 perf.h:240-244。 */
-    for (uint64_t i = 0; i < KM_SLIDE_PTOV_COUNT && g_ptov[i].len != 0; i++) {
-        if (pa >= g_ptov[i].pa && pa < (g_ptov[i].pa + g_ptov[i].len)) {
-            return pa - g_ptov[i].pa + g_ptov[i].va;
+    /*
+     * ① 逐段查表，条件与判据逐字对照 perf.h:240-244。
+     *
+     * **只在表被判据认定为可信时才查**（g_ptovTrusted，判据见 slide_read_ptov_table
+     * 上方那段注释）：不可信的表里每一项都可能来自邻近的标量全局，拿它的 (pa, va)
+     * 命中去算，得到的是一个"形态合法"的**段外**地址 —— 那正是 KernelMemory.m
+     * 记着的 bug_type 210 那一路。表不可信时，兜底支就是唯一路径。
+     */
+    if (g_ptovTrusted) {
+        for (uint64_t i = 0; i < KM_SLIDE_PTOV_COUNT && g_ptov[i].len != 0; i++) {
+            if (pa >= g_ptov[i].pa && pa < (g_ptov[i].pa + g_ptov[i].len)) {
+                return pa - g_ptov[i].pa + g_ptov[i].va;
+            }
         }
     }
 
@@ -1763,9 +2039,21 @@ static uint64_t slide_phystokv_locked(uint64_t pa)
      *
      * 为什么这条判据值得留着（而不是"有就得给个值"）：段外换算算出来的是
      * **别处**的地址，它既不是目标页、也未必落在内核映射区里。宁可报"换算不出来"。
+     * 本轮**没有**放宽它 —— 表被停用之后它成了唯一的守门人，更不该放。
      */
     if (pa < g_physBase || (pa - g_physBase) >= g_physSize) return 0;
-    return pa - g_physBase + g_virtBase;
+
+    /*
+     * ③ 输出再过一次形态检查。本文件头部那条纪律是"每一条送进 km_read* 的地址，
+     *    使用前都要过形态检查"，而本函数的返回值正是 km_read64 的输入
+     *    （那边只判 `(addr >> 48) == 0xFFFF`，比这一道松）。
+     *    多这一道不会挡掉正确结果：pa 落在 [gPhysBase, +gPhysSize) 且三个基准可信时，
+     *    结果必然落在 [gVirtBase, gVirtBase + gPhysSize) 内，也就是内核域。
+     *    它挡的是"某个基准被读成一个巨大的错值"这一类 —— 那种情况下算出来的数
+     *    会跌出内核域，而下一个动作就是拿它去解引用。
+     */
+    const uint64_t kva = pa - g_physBase + g_virtBase;
+    return km_slide_kernel_ptr(kva) ? kva : 0;
 }
 
 uint64_t km_phystokv(uint64_t pa)
